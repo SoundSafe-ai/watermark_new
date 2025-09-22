@@ -1,0 +1,22 @@
+{
+  "experiment_name": "imperceptibility_training",
+  "data_dir": "./data",
+  "batch_size": 16,
+  "num_workers": 4,
+  "epochs": 100,
+  "inn_blocks": 8,
+  "phm_emb_dim": 192,
+  "inn_lr": 0.0001,
+  "phm_lr": 0.0005,
+  "weight_decay": 1e-05,
+  "warmup_epochs": 10,
+  "decay_epochs": 50,
+  "impercept_weight": 1.0,
+  "message_weight": 0.5,
+  "phm_weight": 0.3,
+  "sample_rate": 22050,
+  "n_fft": 1024,
+  "hop_length": 512,
+  "duration": 1.0,
+  "payload_size": 125
+}

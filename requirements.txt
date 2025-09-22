@@ -1,0 +1,29 @@
+# SoundSafe Audio Watermarking System Dependencies
+# Core deep learning framework
+torch>=2.0.0
+
+# Numerical computing
+numpy>=1.21.0
+
+# Error correction for Reed-Solomon encoding/decoding
+reedsolo>=1.7.0
+
+# Optional: For enhanced audio processing (if needed for future extensions)
+# librosa>=0.10.0
+# soundfile>=0.12.0
+
+# For development and testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+black>=23.0.0
+flake8>=6.0.0
+
+# For audio processing and testing
+librosa>=0.10.0
+soundfile>=0.12.0
+
+# For training and monitoring
+tensorboard>=2.10.0
+tqdm>=4.64.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
