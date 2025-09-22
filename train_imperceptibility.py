@@ -28,6 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+import warnings
 import torchaudio
 from torchaudio.transforms import Resample
 from tqdm import tqdm
@@ -38,6 +39,23 @@ from phm.perceptual_frontend import PerceptualFrontend
 from phm.technical_frontend import TechnicalFrontend
 from phm.fusion_head import FusionHead
 from phm.telemetry import TechnicalTelemetry
+
+# Silence specific torchaudio warnings mentioned by the user
+warnings.filterwarnings(
+    "ignore",
+    message=r".*implementation will be changed to use torchaudio.load_with_torchcodec.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*StreamingMediaDecoder has been deprecated.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torch.cuda.amp.autocast\(.*\) is deprecated.*",
+    category=FutureWarning,
+)
 
 
 TARGET_SR = 22050
@@ -92,8 +110,8 @@ class AudioChunkDataset(Dataset):
 
 @dataclass
 class TrainConfig:
-    data_dir: str = "data"
-    val_dir: str = "val"
+    data_dir: str = "data/train"
+    val_dir: str = "data/val"
     batch_size: int = 8
     num_workers: int = 2
     epochs: int = 20
@@ -123,6 +141,20 @@ def build_message_like_spec(x_wave: torch.Tensor, stft: STFT) -> torch.Tensor:
     return noise
 
 
+def match_length(y: torch.Tensor, target_T: int) -> torch.Tensor:
+    """
+    Ensure waveform y has time dimension == target_T by cropping or right-padding with zeros.
+    y: [B,1,T'] -> [B,1,target_T]
+    """
+    T = y.size(-1)
+    if T == target_T:
+        return y
+    if T > target_T:
+        return y[..., :target_T]
+    pad = target_T - T
+    return F.pad(y, (0, pad))
+
+
 def validate(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, loader: DataLoader, device: str) -> dict:
     model.eval()
     metrics = {"total": 0.0, "mrstft": 0.0, "mfcc": 0.0, "snr": 0.0,
@@ -138,6 +170,7 @@ def validate(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, loader: Dat
             x = batch.to(device)  # [B,1,T]
             m = build_message_like_spec(x, model.stft).to(device)
             x_wm, _ = model.encode(x, m)
+            x_wm = match_length(x_wm, x.size(-1))
             L = loss_fn(x, x_wm)
             metrics["total"] += float(L["total_perceptual_loss"]) * x.size(0)
             metrics["mrstft"] += float(L["mrstft_total"]) * x.size(0)
@@ -188,8 +221,10 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
         m = build_message_like_spec(x, model.stft).to(device)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=(scaler is not None)):
+        # Use new torch.amp.autocast API to avoid deprecation warnings
+        with torch.amp.autocast(device_type='cuda', enabled=(scaler is not None)):
             x_wm, _ = model.encode(x, m)
+            x_wm = match_length(x_wm, x.size(-1))
             # Imperceptibility
             Lp = loss_fn(x, x_wm)
             # Message self-consistency (decode should match the injected message)
@@ -257,8 +292,15 @@ def main(cfg: TrainConfig) -> None:
     train_ds = AudioChunkDataset(cfg.data_dir)
     val_ds = AudioChunkDataset(cfg.val_dir)
 
+    # Report dataset stats
+    print(f"Found {len(train_ds)} training files in '{cfg.data_dir}'")
+    print(f"Found {len(val_ds)} validation files in '{cfg.val_dir}'")
+
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
+
+    print(f"Device: {cfg.device} | Batch size: {cfg.batch_size} | Workers: {cfg.num_workers}")
+    print(f"Train steps/epoch: {len(train_loader)} | Val steps: {len(val_loader)}")
 
     # Model & loss
     model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": cfg.n_fft, "hop_length": cfg.hop, "win_length": cfg.n_fft}).to(cfg.device)
@@ -266,7 +308,12 @@ def main(cfg: TrainConfig) -> None:
 
     # Optimizer & scaler
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=(cfg.mixed_precision and torch.cuda.is_available()))
+    # Prefer torch.amp.GradScaler when available
+    try:
+        GradScaler = torch.amp.GradScaler  # type: ignore[attr-defined]
+    except Exception:
+        from torch.cuda.amp import GradScaler  # type: ignore
+    scaler = GradScaler(enabled=(cfg.mixed_precision and torch.cuda.is_available()))
 
     best_val = math.inf
     for epoch in range(1, cfg.epochs + 1):
