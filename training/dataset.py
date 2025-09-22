@@ -76,27 +76,29 @@ class AudioWatermarkDataset(Dataset):
             n_mels=64
         ).to(self.device)
         
-    def _load_audio_cpu(self, file_path: Path) -> torch.Tensor:
-        """Load audio file on CPU (multiprocessing safe)"""
+    def _load_audio_gpu(self, file_path: Path) -> torch.Tensor:
+        """Load audio file directly to GPU"""
         try:
             # Load audio (this happens on CPU)
             waveform, orig_sr = torchaudio.load(str(file_path))
-            
-            # Resample if needed (on CPU)
+
+            # Move to GPU immediately
+            waveform = waveform.to(self.device)
+
+            # Resample if needed (on GPU)
             if orig_sr != self.sample_rate:
-                resampler = T.Resample(orig_sr, self.sample_rate)
-                waveform = resampler(waveform)
-            
+                waveform = self.resample(waveform)
+
             # Convert to mono if stereo
             if waveform.shape[0] > 1:
                 waveform = waveform.mean(dim=0, keepdim=True)
-            
+
             return waveform.squeeze(0)  # [T]
-            
+
         except Exception as e:
             print(f"Error loading {file_path}: {e}")
             # Return silence if loading fails
-            return torch.zeros(int(self.sample_rate * self.duration))
+            return torch.zeros(int(self.sample_rate * self.duration), device=self.device)
     
     def _augment_audio_gpu(self, audio: torch.Tensor) -> torch.Tensor:
         """Apply audio augmentation on GPU"""
@@ -176,19 +178,22 @@ class AudioWatermarkDataset(Dataset):
         # Select random audio file
         file_idx = idx % len(self.audio_files)
         audio_file = self.audio_files[file_idx]
-        
-        # Load audio on CPU (multiprocessing safe)
-        audio = self._load_audio_cpu(audio_file)
-        
+
+        # Load audio to GPU
+        audio = self._load_audio_gpu(audio_file)
+
         # Extract segment
         audio = self._extract_segment(audio)
-        
+
+        # Apply augmentation
+        audio = self._augment_audio_gpu(audio)
+
         # Generate payload
         payload = self._generate_payload()
-        
+
         # Ensure audio is [1, T] for model input
         audio = audio.unsqueeze(0)  # [1, T]
-        
+
         return audio, payload
 
 def create_dataloaders(
@@ -229,26 +234,23 @@ def create_dataloaders(
         **kwargs
     )
     
-    # Create dataloaders with custom collate function
-    # Note: pin_memory=False because we're moving to GPU in collate_fn
+    # Create dataloaders - disable multiprocessing for CUDA compatibility
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=False,  # Disable pin_memory since we move to GPU in collate_fn
-        drop_last=True,
-        collate_fn=gpu_collate_fn
+        num_workers=0,  # Disable multiprocessing for CUDA
+        pin_memory=False,
+        drop_last=True
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=False,  # Disable pin_memory since we move to GPU in collate_fn
-        drop_last=False,
-        collate_fn=gpu_collate_fn
+        num_workers=0,  # Disable multiprocessing for CUDA
+        pin_memory=False,
+        drop_last=False
     )
     
     return train_loader, val_loader

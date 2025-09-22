@@ -31,34 +31,12 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
 warnings.filterwarnings("ignore", category=FutureWarning, module="torchaudio")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="torchaudio")
 
-# Suppress CUDA/GPU warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="torch")
-warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+# Suppress warnings
+warnings.filterwarnings("ignore")
 
-# Suppress TensorFlow/XLA warnings (if using TensorBoard)
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow warnings
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use only first GPU if multiple available
-
-# Suppress specific CUDA warnings
-os.environ['TF_CPP_MIN_VLOG_LEVEL'] = '3'  # Suppress verbose logging
-os.environ['XLA_FLAGS'] = '--xla_gpu_enable_fast_min_max=false'  # Suppress XLA warnings
-
-# Suppress CUDA library warnings
-os.environ['CUDA_LAUNCH_BLOCKING'] = '0'  # Disable CUDA launch blocking
-os.environ['TORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'  # Optimize CUDA memory
-
-# Suppress absl logging warnings
-os.environ['ABSL_MIN_LOG_LEVEL'] = '3'
-
-import logging
-logging.getLogger('torch').setLevel(logging.ERROR)
-logging.getLogger('torch.cuda').setLevel(logging.ERROR)
-logging.getLogger('absl').setLevel(logging.ERROR)
-
-# Redirect stderr to suppress CUDA warnings
-import sys
-from contextlib import redirect_stderr
-import io
+# Disable CUDA warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
 # Optional tensorboard import
@@ -594,27 +572,8 @@ class WatermarkingTrainer:
         print('\nTraining completed!')
         self.writer.close()
 
-def suppress_cuda_warnings():
-    """Suppress CUDA and other warnings during training"""
-    # Create a null device to redirect stderr
-    null_device = io.StringIO()
-    
-    # Redirect stderr to suppress warnings
-    original_stderr = sys.stderr
-    sys.stderr = null_device
-    
-    return original_stderr
-
-def restore_stderr(original_stderr):
-    """Restore stderr after training"""
-    sys.stderr = original_stderr
-
 def main():
-    # Suppress warnings at the start
-    original_stderr = suppress_cuda_warnings()
-    
-    try:
-        parser = argparse.ArgumentParser(description='Train SoundSafe Watermarking - Imperceptibility')
+    parser = argparse.ArgumentParser(description='Train SoundSafe Watermarking - Imperceptibility')
         
         # Data arguments
         parser.add_argument('--data_dir', type=str, default='./data',
@@ -734,18 +693,10 @@ def main():
         print("\n🏗️  Initializing trainer...")
         trainer = WatermarkingTrainer(config)
         
-        # Start training
-        print("\n🚀 Starting training...")
-        print("=" * 60)
-        trainer.train(train_loader, val_loader)
-        
-    except Exception as e:
-        print(f"\n❌ Training failed: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        # Restore stderr
-        restore_stderr(original_stderr)
+    # Start training
+    print("\n🚀 Starting training...")
+    print("=" * 60)
+    trainer.train(train_loader, val_loader)
 
 if __name__ == '__main__':
     main()
