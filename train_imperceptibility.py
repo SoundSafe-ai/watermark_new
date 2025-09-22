@@ -162,7 +162,7 @@ def validate(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, loader: Dat
 
     # PHM assessors (inference-only; not trained here)
     perc_model = PerceptualFrontend().to(device)
-    tech_model = TechnicalFrontend().to(device)
+    tech_model = TechnicalFrontend(feat_dim=8).to(device)
     fusion_head = FusionHead().to(device)
     perc_model.eval(); tech_model.eval(); fusion_head.eval()
     with torch.no_grad():
@@ -172,32 +172,33 @@ def validate(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, loader: Dat
             x_wm, _ = model.encode(x, m)
             x_wm = match_length(x_wm, x.size(-1))
             L = loss_fn(x, x_wm)
-            metrics["total"] += float(L["total_perceptual_loss"]) * x.size(0)
-            metrics["mrstft"] += float(L["mrstft_total"]) * x.size(0)
-            metrics["mfcc"] += float(L["mfcc_cos"]) * x.size(0)
-            metrics["snr"] += float(L["snr"]) * x.size(0)
+            metrics["total"] += L["total_perceptual_loss"].detach().item() * x.size(0)
+            metrics["mrstft"] += L["mrstft_total"].detach().item() * x.size(0)
+            metrics["mfcc"] += L["mfcc_cos"].detach().item() * x.size(0)
+            metrics["snr"] += L["snr"].detach().item() * x.size(0)
 
             # PHM metrics (no grad)
             X_ri = model.stft(x_wm)  # [B,2,F,T]
             M_rec = model.decode(x_wm)  # [B,2,F,T]
-            # Build lightweight telemetry proxies from recovered message
+            # Build 8-feature telemetry sequence [B,T,8]
             mag = torch.sqrt(torch.clamp(X_ri[:,0]**2 + X_ri[:,1]**2, min=1e-9))  # [B,F,T]
             conf = torch.sigmoid(torch.abs(M_rec[:,0]))  # [B,F,T]
-            softbit_conf = conf.mean(dim=1, keepdim=True).permute(0,2,1)  # [B,T,1]
-            snr_proxy = (torch.abs(M_rec[:,0]) / (mag + 1e-9)).clamp(0, 10.0).mean(dim=1, keepdim=True).permute(0,2,1)
+            softbit_conf = conf.mean(dim=1).unsqueeze(-1)                     # [B,T,1]
+            snr_proxy = (torch.abs(M_rec[:,0]) / (mag + 1e-9)).clamp(0, 10.0).mean(dim=1).unsqueeze(-1)
             frames = X_ri.size(-1)
             slot_fill = torch.ones(x.size(0), frames, 1, device=device)
             sync_drift = torch.zeros_like(slot_fill)
             rs_errata = torch.zeros_like(slot_fill)
-            rs_success = torch.ones(x.size(0), 1, device=device)
-            tech = TechnicalTelemetry(softbit_conf=softbit_conf, slot_snr=snr_proxy, slot_fill=slot_fill, sync_drift=sync_drift, rs_errata=rs_errata, rs_success=rs_success)
-            tech_seq = tech.as_sequence()
+            conf_max = conf.max(dim=1).values.unsqueeze(-1)
+            conf_std = conf.std(dim=1, unbiased=False).unsqueeze(-1)
+            mag_mean = mag.mean(dim=1).unsqueeze(-1)
+            tech_seq = torch.cat([softbit_conf, snr_proxy, slot_fill, sync_drift, rs_errata, conf_max, conf_std, mag_mean], dim=-1)
             perc_vec, _ = perc_model.infer_features(x_wm)
             tech_vec, _ = tech_model.infer_features(tech_seq)
             fused = fusion_head(perc_vec, tech_vec)
-            metrics["presence"] += float(fused["presence_p"].mean()) * x.size(0)
-            metrics["reliability"] += float(fused["decode_reliability"].mean()) * x.size(0)
-            metrics["artifact"] += float(fused["artifact_risk"].mean()) * x.size(0)
+            metrics["presence"] += fused["presence_p"].mean().detach().item() * x.size(0)
+            metrics["reliability"] += fused["decode_reliability"].mean().detach().item() * x.size(0)
+            metrics["artifact"] += fused["artifact_risk"].mean().detach().item() * x.size(0)
 
     for k in metrics.keys():
         metrics[k] = metrics[k] / len(loader.dataset)
@@ -211,7 +212,7 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
 
     # PHM assessors (inference only)
     perc_model = PerceptualFrontend().to(device)
-    tech_model = TechnicalFrontend().to(device)
+    tech_model = TechnicalFrontend(feat_dim=8).to(device)
     fusion_head = FusionHead().to(device)
     perc_model.eval(); tech_model.eval(); fusion_head.eval()
 
@@ -243,31 +244,32 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
             loss.backward()
             optimizer.step()
 
-        running["total"] += float(Lp["total_perceptual_loss"]) * x.size(0)
-        running["mrstft"] += float(Lp["mrstft_total"]) * x.size(0)
-        running["mfcc"] += float(Lp["mfcc_cos"]) * x.size(0)
-        running["snr"] += float(Lp["snr"]) * x.size(0)
+        running["total"] += Lp["total_perceptual_loss"].detach().item() * x.size(0)
+        running["mrstft"] += Lp["mrstft_total"].detach().item() * x.size(0)
+        running["mfcc"] += Lp["mfcc_cos"].detach().item() * x.size(0)
+        running["snr"] += Lp["snr"].detach().item() * x.size(0)
 
         # PHM telemetry + metrics for logging
         with torch.no_grad():
             X_ri = model.stft(x_wm)
             mag = torch.sqrt(torch.clamp(X_ri[:,0]**2 + X_ri[:,1]**2, min=1e-9))
             conf = torch.sigmoid(torch.abs(M_rec[:,0]))
-            softbit_conf = conf.mean(dim=1, keepdim=True).permute(0,2,1)
-            snr_proxy = (torch.abs(M_rec[:,0]) / (mag + 1e-9)).clamp(0, 10.0).mean(dim=1, keepdim=True).permute(0,2,1)
+            softbit_conf = conf.mean(dim=1).unsqueeze(-1)
+            snr_proxy = (torch.abs(M_rec[:,0]) / (mag + 1e-9)).clamp(0, 10.0).mean(dim=1).unsqueeze(-1)
             frames = X_ri.size(-1)
             slot_fill = torch.ones(x.size(0), frames, 1, device=device)
             sync_drift = torch.zeros_like(slot_fill)
             rs_errata = torch.zeros_like(slot_fill)
-            rs_success = torch.ones(x.size(0), 1, device=device)
-            tech = TechnicalTelemetry(softbit_conf=softbit_conf, slot_snr=snr_proxy, slot_fill=slot_fill, sync_drift=sync_drift, rs_errata=rs_errata, rs_success=rs_success)
-            tech_seq = tech.as_sequence()
+            conf_max = conf.max(dim=1).values.unsqueeze(-1)
+            conf_std = conf.std(dim=1, unbiased=False).unsqueeze(-1)
+            mag_mean = mag.mean(dim=1).unsqueeze(-1)
+            tech_seq = torch.cat([softbit_conf, snr_proxy, slot_fill, sync_drift, rs_errata, conf_max, conf_std, mag_mean], dim=-1)
             perc_vec, _ = perc_model.infer_features(x_wm)
             tech_vec, _ = tech_model.infer_features(tech_seq)
             fused = fusion_head(perc_vec, tech_vec)
-            running["presence"] += float(fused["presence_p"].mean()) * x.size(0)
-            running["reliability"] += float(fused["decode_reliability"].mean()) * x.size(0)
-            running["artifact"] += float(fused["artifact_risk"].mean()) * x.size(0)
+            running["presence"] += fused["presence_p"].mean().detach().item() * x.size(0)
+            running["reliability"] += fused["decode_reliability"].mean().detach().item() * x.size(0)
+            running["artifact"] += fused["artifact_risk"].mean().detach().item() * x.size(0)
 
         if (step + 1) % log_interval == 0:
             pbar.set_postfix({
