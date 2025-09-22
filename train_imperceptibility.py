@@ -226,13 +226,16 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
         with torch.amp.autocast(device_type='cuda', enabled=(scaler is not None)):
             x_wm, _ = model.encode(x, m)
             x_wm = match_length(x_wm, x.size(-1))
-            # Imperceptibility
-            Lp = loss_fn(x, x_wm)
-            # Message self-consistency (decode should match the injected message)
+            # Decode in AMP for speed
             M_rec = model.decode(x_wm)
-            L_msg_rec = F.mse_loss(M_rec, m)
+        # Compute losses in full precision to avoid NaNs from fp16 logs/trigs
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            # Imperceptibility (MRSTFT + MFCC + SNR)
+            Lp = loss_fn(x.float(), x_wm.float())
+            # Message self-consistency (decode should match the injected message)
+            L_msg_rec = F.mse_loss(M_rec.float(), m.float())
             # Message energy regularizer (keep message small)
-            L_msg_amp = m.abs().mean()
+            L_msg_amp = m.float().abs().mean()
             # Total
             loss = cfg.w_perc * Lp["total_perceptual_loss"] + cfg.w_msg_rec * L_msg_rec + cfg.w_msg_amp * L_msg_amp
 
@@ -252,10 +255,10 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
         # PHM telemetry + metrics for logging
         with torch.no_grad():
             X_ri = model.stft(x_wm)
-            mag = torch.sqrt(torch.clamp(X_ri[:,0]**2 + X_ri[:,1]**2, min=1e-9))
+            mag = torch.sqrt(torch.clamp(X_ri[:,0]**2 + X_ri[:,1]**2, min=1e-6))
             conf = torch.sigmoid(torch.abs(M_rec[:,0]))
             softbit_conf = conf.mean(dim=1).unsqueeze(-1)
-            snr_proxy = (torch.abs(M_rec[:,0]) / (mag + 1e-9)).clamp(0, 10.0).mean(dim=1).unsqueeze(-1)
+            snr_proxy = (torch.abs(M_rec[:,0]) / (mag + 1e-6)).clamp(0, 10.0).mean(dim=1).unsqueeze(-1)
             frames = X_ri.size(-1)
             slot_fill = torch.ones(x.size(0), frames, 1, device=device)
             sync_drift = torch.zeros_like(slot_fill)
