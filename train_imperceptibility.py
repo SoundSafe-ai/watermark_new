@@ -218,7 +218,7 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
 
     pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
     for step, batch in pbar:
-        x = batch.to(device)
+        x = batch.to(device, non_blocking=True)
         m = build_message_like_spec(x, model.stft).to(device)
 
         optimizer.zero_grad(set_to_none=True)
@@ -252,24 +252,26 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
         running["mfcc"] += Lp["mfcc_cos"].detach().item() * x.size(0)
         running["snr"] += Lp["snr"].detach().item() * x.size(0)
 
-        # PHM telemetry + metrics for logging
-        with torch.no_grad():
-            X_ri = model.stft(x_wm)
-            mag = torch.sqrt(torch.clamp(X_ri[:,0]**2 + X_ri[:,1]**2, min=1e-6))
-            conf = torch.sigmoid(torch.abs(M_rec[:,0]))
-            softbit_conf = conf.mean(dim=1).unsqueeze(-1)
-            snr_proxy = (torch.abs(M_rec[:,0]) / (mag + 1e-6)).clamp(0, 10.0).mean(dim=1).unsqueeze(-1)
-            frames = X_ri.size(-1)
-            slot_fill = torch.ones(x.size(0), frames, 1, device=device)
-            sync_drift = torch.zeros_like(slot_fill)
-            rs_errata = torch.zeros_like(slot_fill)
-            conf_max = conf.max(dim=1).values.unsqueeze(-1)
-            conf_std = conf.std(dim=1, unbiased=False).unsqueeze(-1)
-            mag_mean = mag.mean(dim=1).unsqueeze(-1)
-            tech_seq = torch.cat([softbit_conf, snr_proxy, slot_fill, sync_drift, rs_errata, conf_max, conf_std, mag_mean], dim=-1)
-            perc_vec, _ = perc_model.infer_features(x_wm)
-            tech_vec, _ = tech_model.infer_features(tech_seq)
-            fused = fusion_head(perc_vec, tech_vec)
+        # PHM telemetry + metrics for logging (compute every k steps to save time)
+        phm_every = 5
+        if (step % phm_every) == 0:
+            with torch.no_grad():
+                X_ri = model.stft(x_wm)
+                mag = torch.sqrt(torch.clamp(X_ri[:,0]**2 + X_ri[:,1]**2, min=1e-6))
+                conf = torch.sigmoid(torch.abs(M_rec[:,0]))
+                softbit_conf = conf.mean(dim=1).unsqueeze(-1)
+                snr_proxy = (torch.abs(M_rec[:,0]) / (mag + 1e-6)).clamp(0, 10.0).mean(dim=1).unsqueeze(-1)
+                frames = X_ri.size(-1)
+                slot_fill = torch.ones(x.size(0), frames, 1, device=device)
+                sync_drift = torch.zeros_like(slot_fill)
+                rs_errata = torch.zeros_like(slot_fill)
+                conf_max = conf.max(dim=1).values.unsqueeze(-1)
+                conf_std = conf.std(dim=1, unbiased=False).unsqueeze(-1)
+                mag_mean = mag.mean(dim=1).unsqueeze(-1)
+                tech_seq = torch.cat([softbit_conf, snr_proxy, slot_fill, sync_drift, rs_errata, conf_max, conf_std, mag_mean], dim=-1)
+                perc_vec, _ = perc_model.infer_features(x_wm)
+                tech_vec, _ = tech_model.infer_features(tech_seq)
+                fused = fusion_head(perc_vec, tech_vec)
             running["presence"] += fused["presence_p"].mean().detach().item() * x.size(0)
             running["reliability"] += fused["decode_reliability"].mean().detach().item() * x.size(0)
             running["artifact"] += fused["artifact_risk"].mean().detach().item() * x.size(0)
@@ -301,8 +303,26 @@ def main(cfg: TrainConfig) -> None:
     print(f"Found {len(train_ds)} training files in '{cfg.data_dir}'")
     print(f"Found {len(val_ds)} validation files in '{cfg.val_dir}'")
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
+    pin = (cfg.device == "cuda")
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        drop_last=True,
+        pin_memory=pin,
+        persistent_workers=True if cfg.num_workers > 0 else False,
+        prefetch_factor=2 if cfg.num_workers > 0 else None,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=pin,
+        persistent_workers=True if cfg.num_workers > 0 else False,
+        prefetch_factor=2 if cfg.num_workers > 0 else None,
+    )
 
     print(f"Device: {cfg.device} | Batch size: {cfg.batch_size} | Workers: {cfg.num_workers}")
     print(f"Train steps/epoch: {len(train_loader)} | Val steps: {len(val_loader)}")

@@ -94,17 +94,27 @@ class MFCCCosineLoss:
     n_mels: int = 64
     n_ceps: int = 20
     weight: float = 1.0
+    # Caches to avoid rebuilding mel filterbank and DCT every call
+    _fb: torch.Tensor = None  # type: ignore[assignment]
+    _D: torch.Tensor = None   # type: ignore[assignment]
+    _cache_device: torch.device | None = None
 
     def __call__(self, x: torch.Tensor, y: torch.Tensor) -> Dict[str, torch.Tensor]:
         x_ = x.squeeze(1); y_ = y.squeeze(1)
         X = stft_mag(x_, self.n_fft, self.hop_length, self.n_fft)
         Y = stft_mag(y_, self.n_fft, self.hop_length, self.n_fft)
-        fb = build_mel_filter(self.sample_rate, self.n_fft, self.n_mels, device=x.device)  # [M,F]
+        device = x.device
+        # Reuse cached filterbank and DCT if device unchanged; else rebuild once
+        if self._fb is None or self._cache_device != device:
+            self._fb = build_mel_filter(self.sample_rate, self.n_fft, self.n_mels, device=device)
+            self._D = dct_mat(self.n_mels, self.n_ceps, device)
+            self._cache_device = device
+        fb = self._fb
+        D = self._D
         Xmel = torch.matmul(fb, X) + 1e-9
         Ymel = torch.matmul(fb, Y) + 1e-9
         Xlog = torch.log(Xmel)
         Ylog = torch.log(Ymel)
-        D = dct_mat(self.n_mels, self.n_ceps, x.device)  # [C, M]
         Xmfcc = torch.matmul(D, Xlog)  # [C, T]
         Ymfcc = torch.matmul(D, Ylog)
         # Cosine distance averaged
