@@ -11,12 +11,29 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from pathlib import Path
 import time
 import json
 import random
+
+# Optional tensorboard import
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    print("⚠️  TensorBoard not available - logging will be limited")
+    TENSORBOARD_AVAILABLE = False
+    # Create a dummy SummaryWriter class
+    class SummaryWriter:
+        def __init__(self, *args, **kwargs):
+            pass
+        def add_scalar(self, *args, **kwargs):
+            pass
+        def add_audio(self, *args, **kwargs):
+            pass
+        def close(self):
+            pass
 
 # Add current directory to path
 sys.path.insert(0, '.')
