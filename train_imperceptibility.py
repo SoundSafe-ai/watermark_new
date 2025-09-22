@@ -31,6 +31,35 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
 warnings.filterwarnings("ignore", category=FutureWarning, module="torchaudio")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="torchaudio")
 
+# Suppress CUDA/GPU warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+
+# Suppress TensorFlow/XLA warnings (if using TensorBoard)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow warnings
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use only first GPU if multiple available
+
+# Suppress specific CUDA warnings
+os.environ['TF_CPP_MIN_VLOG_LEVEL'] = '3'  # Suppress verbose logging
+os.environ['XLA_FLAGS'] = '--xla_gpu_enable_fast_min_max=false'  # Suppress XLA warnings
+
+# Suppress CUDA library warnings
+os.environ['CUDA_LAUNCH_BLOCKING'] = '0'  # Disable CUDA launch blocking
+os.environ['TORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'  # Optimize CUDA memory
+
+# Suppress absl logging warnings
+os.environ['ABSL_MIN_LOG_LEVEL'] = '3'
+
+import logging
+logging.getLogger('torch').setLevel(logging.ERROR)
+logging.getLogger('torch.cuda').setLevel(logging.ERROR)
+logging.getLogger('absl').setLevel(logging.ERROR)
+
+# Redirect stderr to suppress CUDA warnings
+import sys
+from contextlib import redirect_stderr
+import io
+
 
 # Optional tensorboard import
 try:
@@ -565,131 +594,158 @@ class WatermarkingTrainer:
         print('\nTraining completed!')
         self.writer.close()
 
+def suppress_cuda_warnings():
+    """Suppress CUDA and other warnings during training"""
+    # Create a null device to redirect stderr
+    null_device = io.StringIO()
+    
+    # Redirect stderr to suppress warnings
+    original_stderr = sys.stderr
+    sys.stderr = null_device
+    
+    return original_stderr
+
+def restore_stderr(original_stderr):
+    """Restore stderr after training"""
+    sys.stderr = original_stderr
+
 def main():
-    parser = argparse.ArgumentParser(description='Train SoundSafe Watermarking - Imperceptibility')
+    # Suppress warnings at the start
+    original_stderr = suppress_cuda_warnings()
     
-    # Data arguments
-    parser.add_argument('--data_dir', type=str, default='./data',
-                       help='Path to dataset directory (should contain train/ and val/ subdirs)')
-    parser.add_argument('--batch_size', type=int, default=16,
-                       help='Batch size for training')
-    parser.add_argument('--num_workers', type=int, default=4,
-                       help='Number of data loading workers')
-    parser.add_argument('--create_samples', action='store_true',
-                       help='Create sample audio files if data directory is empty')
-    parser.add_argument('--num_samples', type=int, default=20,
-                       help='Number of sample files to create (if --create_samples)')
-    
-    # Model arguments
-    parser.add_argument('--inn_blocks', type=int, default=8,
-                       help='Number of INN blocks')
-    parser.add_argument('--phm_emb_dim', type=int, default=192,
-                       help='PHM embedding dimension')
-    
-    # Training arguments
-    parser.add_argument('--epochs', type=int, default=100,
-                       help='Number of training epochs')
-    parser.add_argument('--inn_lr', type=float, default=1e-4,
-                       help='Learning rate for INN model')
-    parser.add_argument('--phm_lr', type=float, default=5e-4,
-                       help='Learning rate for PHM components')
-    parser.add_argument('--weight_decay', type=float, default=1e-5,
-                       help='Weight decay')
-    parser.add_argument('--warmup_epochs', type=int, default=10,
-                       help='Warmup epochs for learning rate')
-    parser.add_argument('--decay_epochs', type=int, default=50,
-                       help='Decay epochs for learning rate')
-    
-    # Loss weights
-    parser.add_argument('--impercept_weight', type=float, default=1.0,
-                       help='Weight for imperceptibility loss')
-    parser.add_argument('--message_weight', type=float, default=0.5,
-                       help='Weight for message loss')
-    parser.add_argument('--phm_weight', type=float, default=0.3,
-                       help='Weight for PHM loss')
-    
-    # Other arguments
-    parser.add_argument('--experiment_dir', type=str, default='./experiments',
-                       help='Directory to save experiments')
-    parser.add_argument('--experiment_name', type=str, default='imperceptibility_training',
-                       help='Name of the experiment')
-    parser.add_argument('--resume', action='store_true',
-                       help='Resume training from checkpoint')
-    parser.add_argument('--log_interval', type=int, default=10,
-                       help='Log interval for training progress')
-    
-    args = parser.parse_args()
-    
-    # Setup training environment
-    print("=" * 60)
-    print("SoundSafe Watermarking Training - Imperceptibility Focus")
-    print("=" * 60)
-    
-    if not setup_training_environment(args.data_dir, args.create_samples, args.num_samples):
-        print("\n❌ Setup failed. Please check the errors above and try again.")
-        return
-    
-    # Create config
-    config = {
-        'data_dir': args.data_dir,
-        'batch_size': args.batch_size,
-        'num_workers': args.num_workers,
-        'inn_blocks': args.inn_blocks,
-        'phm_emb_dim': args.phm_emb_dim,
-        'epochs': args.epochs,
-        'inn_lr': args.inn_lr,
-        'phm_lr': args.phm_lr,
-        'weight_decay': args.weight_decay,
-        'warmup_epochs': args.warmup_epochs,
-        'decay_epochs': args.decay_epochs,
-        'impercept_weight': args.impercept_weight,
-        'message_weight': args.message_weight,
-        'phm_weight': args.phm_weight,
-        'experiment_dir': args.experiment_dir,
-        'experiment_name': args.experiment_name,
-        'resume': args.resume,
-        'log_interval': args.log_interval,
-        'sample_rate': 22050,
-        'n_fft': 1024,
-        'hop_length': 512,
-        'duration': 1.0,
-        'payload_size': 125
-    }
-    
-    # Create data loaders
-    print("\n📊 Creating data loaders...")
-    
-    # Adjust num_workers based on CUDA availability
-    num_workers = config['num_workers']
-    if torch.cuda.is_available() and num_workers > 0:
-        # Use multiprocessing with CUDA
-        print(f"Using {num_workers} workers with CUDA multiprocessing")
-    else:
-        # Fallback to single-threaded loading
-        num_workers = 0
-        print("Using single-threaded data loading")
-    
-    train_loader, val_loader = create_dataloaders(
-        data_dir=config['data_dir'],
-        batch_size=config['batch_size'],
-        num_workers=num_workers,
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        sample_rate=config['sample_rate'],
-        duration=config['duration'],
-        payload_size=config['payload_size']
-    )
-    
-    print(f"✓ Train batches: {len(train_loader)}")
-    print(f"✓ Val batches: {len(val_loader)}")
-    
-    # Create trainer
-    print("\n🏗️  Initializing trainer...")
-    trainer = WatermarkingTrainer(config)
-    
-    # Start training
-    print("\n🚀 Starting training...")
-    print("=" * 60)
-    trainer.train(train_loader, val_loader)
+    try:
+        parser = argparse.ArgumentParser(description='Train SoundSafe Watermarking - Imperceptibility')
+        
+        # Data arguments
+        parser.add_argument('--data_dir', type=str, default='./data',
+                           help='Path to dataset directory (should contain train/ and val/ subdirs)')
+        parser.add_argument('--batch_size', type=int, default=16,
+                           help='Batch size for training')
+        parser.add_argument('--num_workers', type=int, default=4,
+                           help='Number of data loading workers')
+        parser.add_argument('--create_samples', action='store_true',
+                           help='Create sample audio files if data directory is empty')
+        parser.add_argument('--num_samples', type=int, default=20,
+                           help='Number of sample files to create (if --create_samples)')
+        
+        # Model arguments
+        parser.add_argument('--inn_blocks', type=int, default=8,
+                           help='Number of INN blocks')
+        parser.add_argument('--phm_emb_dim', type=int, default=192,
+                           help='PHM embedding dimension')
+        
+        # Training arguments
+        parser.add_argument('--epochs', type=int, default=100,
+                           help='Number of training epochs')
+        parser.add_argument('--inn_lr', type=float, default=1e-4,
+                           help='Learning rate for INN model')
+        parser.add_argument('--phm_lr', type=float, default=5e-4,
+                           help='Learning rate for PHM components')
+        parser.add_argument('--weight_decay', type=float, default=1e-5,
+                           help='Weight decay')
+        parser.add_argument('--warmup_epochs', type=int, default=10,
+                           help='Warmup epochs for learning rate')
+        parser.add_argument('--decay_epochs', type=int, default=50,
+                           help='Decay epochs for learning rate')
+        
+        # Loss weights
+        parser.add_argument('--impercept_weight', type=float, default=1.0,
+                           help='Weight for imperceptibility loss')
+        parser.add_argument('--message_weight', type=float, default=0.5,
+                           help='Weight for message loss')
+        parser.add_argument('--phm_weight', type=float, default=0.3,
+                           help='Weight for PHM loss')
+        
+        # Other arguments
+        parser.add_argument('--experiment_dir', type=str, default='./experiments',
+                           help='Directory to save experiments')
+        parser.add_argument('--experiment_name', type=str, default='imperceptibility_training',
+                           help='Name of the experiment')
+        parser.add_argument('--resume', action='store_true',
+                           help='Resume training from checkpoint')
+        parser.add_argument('--log_interval', type=int, default=10,
+                           help='Log interval for training progress')
+        
+        args = parser.parse_args()
+        
+        # Setup training environment
+        print("=" * 60)
+        print("SoundSafe Watermarking Training - Imperceptibility Focus")
+        print("=" * 60)
+        
+        if not setup_training_environment(args.data_dir, args.create_samples, args.num_samples):
+            print("\n❌ Setup failed. Please check the errors above and try again.")
+            return
+        
+        # Create config
+        config = {
+            'data_dir': args.data_dir,
+            'batch_size': args.batch_size,
+            'num_workers': args.num_workers,
+            'inn_blocks': args.inn_blocks,
+            'phm_emb_dim': args.phm_emb_dim,
+            'epochs': args.epochs,
+            'inn_lr': args.inn_lr,
+            'phm_lr': args.phm_lr,
+            'weight_decay': args.weight_decay,
+            'warmup_epochs': args.warmup_epochs,
+            'decay_epochs': args.decay_epochs,
+            'impercept_weight': args.impercept_weight,
+            'message_weight': args.message_weight,
+            'phm_weight': args.phm_weight,
+            'experiment_dir': args.experiment_dir,
+            'experiment_name': args.experiment_name,
+            'resume': args.resume,
+            'log_interval': args.log_interval,
+            'sample_rate': 22050,
+            'n_fft': 1024,
+            'hop_length': 512,
+            'duration': 1.0,
+            'payload_size': 125
+        }
+        
+        # Create data loaders
+        print("\n📊 Creating data loaders...")
+        
+        # Adjust num_workers based on CUDA availability
+        num_workers = config['num_workers']
+        if torch.cuda.is_available() and num_workers > 0:
+            # Use multiprocessing with CUDA
+            print(f"Using {num_workers} workers with CUDA multiprocessing")
+        else:
+            # Fallback to single-threaded loading
+            num_workers = 0
+            print("Using single-threaded data loading")
+        
+        train_loader, val_loader = create_dataloaders(
+            data_dir=config['data_dir'],
+            batch_size=config['batch_size'],
+            num_workers=num_workers,
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            sample_rate=config['sample_rate'],
+            duration=config['duration'],
+            payload_size=config['payload_size']
+        )
+        
+        print(f"✓ Train batches: {len(train_loader)}")
+        print(f"✓ Val batches: {len(val_loader)}")
+        
+        # Create trainer
+        print("\n🏗️  Initializing trainer...")
+        trainer = WatermarkingTrainer(config)
+        
+        # Start training
+        print("\n🚀 Starting training...")
+        print("=" * 60)
+        trainer.train(train_loader, val_loader)
+        
+    except Exception as e:
+        print(f"\n❌ Training failed: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Restore stderr
+        restore_stderr(original_stderr)
 
 if __name__ == '__main__':
     main()

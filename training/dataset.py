@@ -230,12 +230,13 @@ def create_dataloaders(
     )
     
     # Create dataloaders with custom collate function
+    # Note: pin_memory=False because we're moving to GPU in collate_fn
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,  # Disable pin_memory since we move to GPU in collate_fn
         drop_last=True,
         collate_fn=gpu_collate_fn
     )
@@ -245,7 +246,7 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,  # Disable pin_memory since we move to GPU in collate_fn
         drop_last=False,
         collate_fn=gpu_collate_fn
     )
