@@ -7,6 +7,7 @@ Focuses on imperceptibility training with audio augmentation
 import os
 import random
 import torch
+import warnings
 import torch.nn.functional as F
 import torchaudio
 import torchaudio.transforms as T
@@ -14,6 +15,12 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, List, Optional
 import numpy as np
 from pathlib import Path
+
+# Suppress TorchAudio warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
+warnings.filterwarnings("ignore", category=FutureWarning, module="torchaudio")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="torchaudio")
+
 
 class AudioWatermarkDataset(Dataset):
     """

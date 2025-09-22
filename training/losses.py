@@ -7,10 +7,17 @@ Focus on imperceptibility training
 
 import torch
 import torch.nn as nn
+import warnings
 import torch.nn.functional as F
 import torchaudio.transforms as T
 from typing import Dict, Tuple
 import math
+
+# Suppress TorchAudio warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
+warnings.filterwarnings("ignore", category=FutureWarning, module="torchaudio")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="torchaudio")
+
 
 class ImperceptibilityLoss(nn.Module):
     """

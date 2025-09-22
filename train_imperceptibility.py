@@ -8,6 +8,7 @@ Standalone script with built-in setup and validation
 import os
 import sys
 import argparse
+import warnings
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,6 +17,12 @@ from pathlib import Path
 import time
 import json
 import random
+
+# Suppress specific warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
+warnings.filterwarnings("ignore", category=FutureWarning, module="torchaudio")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="torchaudio")
+
 
 # Optional tensorboard import
 try:

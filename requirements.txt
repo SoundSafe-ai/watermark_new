@@ -3,7 +3,7 @@
 torch>=2.0.0
 
 # Numerical computing
-numpy>=1.21.0
+numpy<1.25.0
 
 # Error correction for Reed-Solomon encoding/decoding
 reedsolo>=1.7.0
@@ -24,6 +24,7 @@ soundfile>=0.12.0
 
 # For training and monitoring
 tensorboard>=2.10.0
+torchaudio
 tqdm>=4.64.0
 matplotlib>=3.5.0
 seaborn>=0.11.0
