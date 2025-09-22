@@ -76,18 +76,16 @@ class AudioWatermarkDataset(Dataset):
             n_mels=64
         ).to(self.device)
         
-    def _load_audio_gpu(self, file_path: Path) -> torch.Tensor:
-        """Load audio file directly to GPU"""
+    def _load_audio_cpu(self, file_path: Path) -> torch.Tensor:
+        """Load audio file on CPU (multiprocessing safe)"""
         try:
             # Load audio (this happens on CPU)
             waveform, orig_sr = torchaudio.load(str(file_path))
             
-            # Move to GPU immediately
-            waveform = waveform.to(self.device)
-            
-            # Resample if needed (on GPU)
+            # Resample if needed (on CPU)
             if orig_sr != self.sample_rate:
-                waveform = self.resample(waveform)
+                resampler = T.Resample(orig_sr, self.sample_rate)
+                waveform = resampler(waveform)
             
             # Convert to mono if stereo
             if waveform.shape[0] > 1:
@@ -98,7 +96,7 @@ class AudioWatermarkDataset(Dataset):
         except Exception as e:
             print(f"Error loading {file_path}: {e}")
             # Return silence if loading fails
-            return torch.zeros(int(self.sample_rate * self.duration), device=self.device)
+            return torch.zeros(int(self.sample_rate * self.duration))
     
     def _augment_audio_gpu(self, audio: torch.Tensor) -> torch.Tensor:
         """Apply audio augmentation on GPU"""
@@ -179,14 +177,11 @@ class AudioWatermarkDataset(Dataset):
         file_idx = idx % len(self.audio_files)
         audio_file = self.audio_files[file_idx]
         
-        # Load audio to GPU
-        audio = self._load_audio_gpu(audio_file)
+        # Load audio on CPU (multiprocessing safe)
+        audio = self._load_audio_cpu(audio_file)
         
         # Extract segment
         audio = self._extract_segment(audio)
-        
-        # Apply augmentation
-        audio = self._augment_audio_gpu(audio)
         
         # Generate payload
         payload = self._generate_payload()
@@ -206,33 +201,43 @@ def create_dataloaders(
     """
     Create training and validation dataloaders
     """
+    import multiprocessing as mp
+    
+    # Set multiprocessing start method to 'spawn' for CUDA compatibility
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # Already set, ignore
+        pass
+    
     train_dir = os.path.join(data_dir, 'train')
     val_dir = os.path.join(data_dir, 'val')
     
-    # Training dataset with augmentation
+    # Training dataset with augmentation (CPU-only for multiprocessing)
     train_dataset = AudioWatermarkDataset(
         data_dir=train_dir,
-        device=device,
+        device='cpu',  # Use CPU for multiprocessing
         augment=True,
         **kwargs
     )
     
-    # Validation dataset without augmentation
+    # Validation dataset without augmentation (CPU-only for multiprocessing)
     val_dataset = AudioWatermarkDataset(
         data_dir=val_dir,
-        device=device,
+        device='cpu',  # Use CPU for multiprocessing
         augment=False,
         **kwargs
     )
     
-    # Create dataloaders
+    # Create dataloaders with custom collate function
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        collate_fn=gpu_collate_fn
     )
     
     val_loader = DataLoader(
@@ -241,10 +246,23 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=False
+        drop_last=False,
+        collate_fn=gpu_collate_fn
     )
     
     return train_loader, val_loader
+
+def gpu_collate_fn(batch):
+    """
+    Custom collate function to move data to GPU in main process
+    """
+    audio_batch, payload_batch = zip(*batch)
+    
+    # Stack tensors and move to GPU
+    audio_batch = torch.stack(audio_batch).to('cuda' if torch.cuda.is_available() else 'cpu')
+    payload_batch = torch.stack(payload_batch).to('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    return audio_batch, payload_batch
 
 # Test the dataset
 if __name__ == "__main__":

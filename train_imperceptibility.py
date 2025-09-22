@@ -17,6 +17,14 @@ from pathlib import Path
 import time
 import json
 import random
+import multiprocessing as mp
+
+# Set multiprocessing start method for CUDA compatibility
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    # Already set, ignore
+    pass
 
 # Suppress specific warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
@@ -650,10 +658,21 @@ def main():
     
     # Create data loaders
     print("\n📊 Creating data loaders...")
+    
+    # Adjust num_workers based on CUDA availability
+    num_workers = config['num_workers']
+    if torch.cuda.is_available() and num_workers > 0:
+        # Use multiprocessing with CUDA
+        print(f"Using {num_workers} workers with CUDA multiprocessing")
+    else:
+        # Fallback to single-threaded loading
+        num_workers = 0
+        print("Using single-threaded data loading")
+    
     train_loader, val_loader = create_dataloaders(
         data_dir=config['data_dir'],
         batch_size=config['batch_size'],
-        num_workers=config['num_workers'],
+        num_workers=num_workers,
         device='cuda' if torch.cuda.is_available() else 'cpu',
         sample_rate=config['sample_rate'],
         duration=config['duration'],
