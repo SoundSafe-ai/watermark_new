@@ -33,6 +33,8 @@ import warnings
 import torchaudio
 from torchaudio.transforms import Resample
 from tqdm import tqdm
+import torch.backends.cudnn as cudnn
+import torchaudio.functional as AF
 
 from models.inn_encoder_decoder import INNWatermarker, STFT
 from pipeline.perceptual_losses import CombinedPerceptualLoss
@@ -71,23 +73,26 @@ def list_audio_files(root: str) -> List[str]:
 
 
 class AudioChunkDataset(Dataset):
-    def __init__(self, root: str, target_sr: int = TARGET_SR):
+    def __init__(self, root: str, target_sr: int = TARGET_SR, gpu_resample: bool = False):
         self.files = list_audio_files(root)
         if len(self.files) == 0:
             raise RuntimeError(f"No audio files found in {root}")
         self.target_sr = target_sr
+        self.gpu_resample = gpu_resample
 
     def __len__(self) -> int:
         return len(self.files)
 
-    def _load_audio(self, path: str) -> torch.Tensor:
+    def _load_audio(self, path: str) -> Tuple[torch.Tensor, int]:
         wav, sr = torchaudio.load(path)  # [C, T]
         if wav.size(0) > 1:
             wav = wav.mean(dim=0, keepdim=True)
-        if sr != self.target_sr:
+        # If we plan to resample on GPU, skip CPU resample
+        if not self.gpu_resample and sr != self.target_sr:
             wav = Resample(orig_freq=sr, new_freq=self.target_sr)(wav)
+            sr = self.target_sr
         wav = wav / (wav.abs().max() + 1e-9)
-        return wav  # [1,T]
+        return wav, sr  # [1,T], sr
 
     def _random_1s_chunk(self, wav: torch.Tensor) -> torch.Tensor:
         T = wav.size(-1)
@@ -98,10 +103,10 @@ class AudioChunkDataset(Dataset):
         start = random.randint(0, max(0, T - CHUNK_SAMPLES))
         return wav[:, start:start + CHUNK_SAMPLES]
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         path = self.files[idx]
-        wav = self._load_audio(path)
-        return self._random_1s_chunk(wav)
+        wav, sr = self._load_audio(path)
+        return self._random_1s_chunk(wav), sr
 
 
 def match_length(y: torch.Tensor, target_T: int) -> torch.Tensor:
@@ -128,6 +133,7 @@ class TrainConfig:
     n_fft: int = 1024
     hop: int = 512
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    gpu_resample: bool = True
     # Loss weights
     w_bits: float = 1.0
     w_mse: float = 0.25
@@ -165,12 +171,28 @@ def plan_slots_and_amp(model: INNWatermarker, x_wave: torch.Tensor, sr: int, n_f
     return slots, amp_per_slot
 
 
+def _maybe_resample_gpu(x: torch.Tensor, sr: torch.Tensor, target_sr: int) -> torch.Tensor:
+    # x: [B,1,T], sr: [B]
+    out = []
+    for i in range(x.size(0)):
+        xi = x[i:i+1]
+        sri = int(sr[i].item()) if isinstance(sr, torch.Tensor) else int(sr[i])
+        if sri != target_sr:
+            xi = AF.resample(xi, orig_freq=sri, new_freq=target_sr)
+        out.append(xi)
+    return torch.cat(out, dim=0) if len(out) > 0 else x
+
+
 def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptualLoss, cfg: TrainConfig, loader: DataLoader) -> dict:
     model.eval()
     metrics = {"ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0}
     with torch.no_grad():
         for batch in loader:
-            x = batch.to(cfg.device, non_blocking=True)
+            x, sr = batch
+            x = x.to(cfg.device, non_blocking=True)
+            sr = sr.to(cfg.device) if isinstance(sr, torch.Tensor) else torch.tensor(sr, device=cfg.device)
+            if cfg.gpu_resample:
+                x = _maybe_resample_gpu(x, sr, TARGET_SR)
             B = x.size(0)
             # Plan slots on a per-item basis
             bers = []
@@ -224,7 +246,11 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
     running = {"obj": 0.0, "ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0}
     pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
     for step, batch in pbar:
-        x = batch.to(cfg.device, non_blocking=True)
+        x, sr = batch
+        x = x.to(cfg.device, non_blocking=True)
+        sr = sr.to(cfg.device) if isinstance(sr, torch.Tensor) else torch.tensor(sr, device=cfg.device)
+        if cfg.gpu_resample:
+            x = _maybe_resample_gpu(x, sr, TARGET_SR)
         B = x.size(0)
         obj_sum = 0.0; ber_sum = 0.0; ce_sum = 0.0; mse_sum = 0.0; perc_sum = 0.0
 
@@ -296,8 +322,15 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
 
 def main(cfg: TrainConfig) -> None:
     os.makedirs(cfg.save_dir, exist_ok=True)
-    train_ds = AudioChunkDataset(cfg.data_dir)
-    val_ds = AudioChunkDataset(cfg.val_dir)
+    # Enable cuDNN autotune and high-precision matmul
+    cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+    train_ds = AudioChunkDataset(cfg.data_dir, gpu_resample=(cfg.device=="cuda" and cfg.gpu_resample))
+    val_ds = AudioChunkDataset(cfg.val_dir, gpu_resample=(cfg.device=="cuda" and cfg.gpu_resample))
     print(f"Found {len(train_ds)} training files | {len(val_ds)} validation files")
 
     pin = (cfg.device == "cuda")
