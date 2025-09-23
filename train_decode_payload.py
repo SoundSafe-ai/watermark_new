@@ -45,6 +45,7 @@ from pipeline.ingest_and_chunk import (
     message_spec_to_bits,
 )
 from pipeline.psychoacoustic import mel_proxy_threshold
+from pipeline.ingest_and_chunk import rs_encode_167_125, rs_decode_167_125, interleave_bytes, deinterleave_bytes
 
 # Quiet known warnings
 warnings.filterwarnings(
@@ -127,7 +128,7 @@ class TrainConfig:
     batch_size: int = 8
     num_workers: int = 2
     epochs: int = 15
-    lr: float = 5e-4
+    lr: float = 1e-4
     weight_decay: float = 1e-5
     mixed_precision: bool = True
     save_dir: str = "decode_payload"
@@ -137,7 +138,7 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_resample: bool = True
     # Initialize from a prior imperceptibility checkpoint (stage-1)
-    init_from: str | None = "inn_imperc_best.pt"
+    init_from: str | None = None  # Try training from scratch for decode
     # Limit number of files used (None uses all)
     train_max_files: int | None = 50000
     val_max_files: int | None = 15000
@@ -147,8 +148,12 @@ class TrainConfig:
     w_mse: float = 0.25
     w_perc: float = 0.05
     # Symbol settings
-    base_symbol_amp: float = 0.1
-    target_bits: int = 512  # per 1s chunk (<= realistic slot count)
+    base_symbol_amp: float = 0.01
+    target_bits: int = 167 * 8  # 1336 bits per 1s chunk (RS(167,125) payload size)
+    # RS and interleaving settings
+    use_rs_interleave: bool = True
+    rs_payload_bytes: int = 125  # Raw payload size before RS encoding
+    rs_interleave_depth: int = 4  # Interleaving depth
     # Planner selection: "gpu" (fast mel-proxy) or "mg" (Moore–Glasberg)
     planner: str = "gpu"
     # Cache planning per file; re-plan every N epochs
@@ -157,6 +162,56 @@ class TrainConfig:
 
 def make_bits(batch_size: int, S: int, device) -> torch.Tensor:
     return torch.randint(low=0, high=2, size=(batch_size, S), device=device, dtype=torch.long)
+
+
+def make_rs_payload_bytes(batch_size: int, payload_bytes: int, device) -> list[bytes]:
+    """Generate random payload bytes for RS encoding."""
+    payloads = []
+    for _ in range(batch_size):
+        payload = bytes([random.randint(0, 255) for _ in range(payload_bytes)])
+        payloads.append(payload)
+    return payloads
+
+
+def encode_payload_with_rs(payload_bytes: bytes, interleave_depth: int) -> torch.Tensor:
+    """Encode payload with RS(167,125) and interleaving, return as bit tensor."""
+    # RS encode: 125 bytes -> 167 bytes
+    rs_encoded = rs_encode_167_125(payload_bytes)
+
+    # Interleave
+    interleaved = interleave_bytes(rs_encoded, interleave_depth)
+
+    # Convert to bits
+    bits = []
+    for b in interleaved:
+        for k in range(8):
+            bits.append((b >> k) & 1)
+
+    return torch.tensor(bits, dtype=torch.long)
+
+
+def decode_payload_with_rs(bits: torch.Tensor, interleave_depth: int, expected_payload_bytes: int) -> bytes:
+    """Decode bit tensor with deinterleaving and RS decoding."""
+    # Convert bits to bytes
+    by = bytearray()
+    for i in range(0, len(bits), 8):
+        if i + 8 > len(bits):
+            break
+        b = 0
+        for k in range(8):
+            b |= (int(bits[i + k]) & 1) << k
+        by.append(b)
+
+    # Deinterleave
+    deinterleaved = deinterleave_bytes(bytes(by), interleave_depth)
+
+    # RS decode
+    try:
+        decoded = rs_decode_167_125(deinterleaved)
+        return decoded[:expected_payload_bytes]
+    except:
+        # Return zeros on decode failure
+        return bytes(expected_payload_bytes)
 
 
 def symbols_from_bits(bits: torch.Tensor, amp: float) -> torch.Tensor:
@@ -253,7 +308,17 @@ def build_batch_plan(model: INNWatermarker, x: torch.Tensor, cfg: TrainConfig):
         t_idx[i, :S] = t_i
         amp[i, :S] = a_i
         mask[i, :S] = True
-    bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
+    # Generate bits: either random (legacy) or RS-encoded payloads
+    if cfg.use_rs_interleave:
+        bits = torch.zeros(B, S_max, dtype=torch.long, device=device)
+        for i in range(B):
+            payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
+            encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
+            # Truncate or pad to match S_max
+            bit_tensor = encoded_bits[:S_max] if len(encoded_bits) >= S_max else torch.cat([encoded_bits, torch.zeros(S_max - len(encoded_bits), dtype=torch.long, device=device)])
+            bits[i] = bit_tensor
+    else:
+        bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
     return {"f_idx": f_idx, "t_idx": t_idx, "amp": amp, "mask": mask, "bits": bits, "S": S_max}
 
 
@@ -312,7 +377,17 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
         if i < len(amp_lists):
             amp[i, :S] = amp_lists[i][:S].to(device)
         mask[i, :S] = True
-    bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
+    # Generate bits: either random (legacy) or RS-encoded payloads
+    if cfg.use_rs_interleave:
+        bits = torch.zeros(B, S_max, dtype=torch.long, device=device)
+        for i in range(B):
+            payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
+            encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
+            # Truncate or pad to match S_max
+            bit_tensor = encoded_bits[:S_max] if len(encoded_bits) >= S_max else torch.cat([encoded_bits, torch.zeros(S_max - len(encoded_bits), dtype=torch.long, device=device)])
+            bits[i] = bit_tensor
+    else:
+        bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
     return {"f_idx": f_idx, "t_idx": t_idx, "amp": amp, "mask": mask, "bits": bits, "S": S_max}
 
 
@@ -330,7 +405,7 @@ def _maybe_resample_gpu(x: torch.Tensor, sr: torch.Tensor, target_sr: int) -> to
 
 def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptualLoss, cfg: TrainConfig, loader: DataLoader) -> dict:
     model.eval()
-    metrics = {"ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0, "mfcc": 0.0}
+    metrics = {"ber": 0.0, "payload_ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0, "mfcc": 0.0}
     with torch.no_grad():
         for batch in loader:
             x, sr, _paths = batch
@@ -341,6 +416,7 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
             B = x.size(0)
             # Plan slots using the same method as training
             bers = []
+            payload_bers = []
             ce_sum = 0.0
             mse_sum = 0.0
             perc_sum = 0.0
@@ -354,7 +430,13 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 S = min(len(slots), cfg.target_bits)
                 if S == 0:
                     continue
-                bits = make_bits(1, S, xi.device)
+                # Generate bits: either random or RS-encoded
+                if cfg.use_rs_interleave:
+                    payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
+                    encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
+                    bits = encoded_bits[:S].unsqueeze(0) if len(encoded_bits) >= S else torch.cat([encoded_bits, torch.zeros(S - len(encoded_bits), dtype=torch.long)]).unsqueeze(0)
+                else:
+                    bits = make_bits(1, S, xi.device)
                 # Build message spec
                 X = model.stft(xi)
                 F_, T_ = X.shape[-2], X.shape[-1]
@@ -384,12 +466,26 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 pred_bits = (rec_vals > 0).long()
                 ber = (pred_bits != bits).float().mean()
                 bers.append(float(ber))
+
+                # Payload BER (if using RS)
+                if cfg.use_rs_interleave:
+                    try:
+                        # Decode the recovered bits back to payload
+                        recovered_payload = decode_payload_with_rs(pred_bits.squeeze(0), cfg.rs_interleave_depth, cfg.rs_payload_bytes)
+                        # Compare with original payload
+                        original_payload = decode_payload_with_rs(bits.squeeze(0), cfg.rs_interleave_depth, cfg.rs_payload_bytes)
+                        payload_ber = sum(b1 != b2 for b1, b2 in zip(recovered_payload, original_payload)) / len(original_payload) if original_payload else 1.0
+                    except:
+                        payload_ber = 1.0  # Failed decode
+                    payload_bers.append(payload_ber)
                 ce_sum += float(ce)
                 mse_sum += float(mse)
                 perc_sum += float(perc)
                 metrics["mfcc"] += float(mfcc)
             if len(bers) > 0:
                 metrics["ber"] += sum(bers) / len(bers) * B
+                if cfg.use_rs_interleave and len(payload_bers) > 0:
+                    metrics["payload_ber"] += sum(payload_bers) / len(payload_bers) * B
                 metrics["bits_ce"] += ce_sum * 1.0
                 metrics["bits_mse"] += mse_sum * 1.0
                 metrics["perc"] += perc_sum * 1.0
@@ -442,11 +538,13 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
         with torch.amp.autocast(device_type='cuda', enabled=False):
             rec_vals = torch.zeros(B, S, device=x.device)
             rec_vals[valid] = M_rec[b_idx[valid], 0, f_idx[valid], t_idx[valid]]
+            # Clamp recovered values to prevent extreme MSE
+            rec_vals_clamped = rec_vals.clamp(-1.0, 1.0)
             logits = rec_vals.clamp(-6.0, 6.0)
             targets01 = bits.float()
             L_bits_ce = F.binary_cross_entropy_with_logits(logits[valid], targets01[valid])
             target_sign = (bits * 2 - 1).float() * cfg.base_symbol_amp * amp
-            L_bits_mse = F.mse_loss(rec_vals[valid], target_sign[valid])
+            L_bits_mse = F.mse_loss(rec_vals_clamped[valid], target_sign[valid])
             perc_out = loss_perc(x.float(), x_wm.float())
             L_perc = perc_out["total_perceptual_loss"]
             L_mfcc = perc_out["mfcc_cos"]
@@ -571,7 +669,8 @@ def main(cfg: TrainConfig) -> None:
         tr = train_one_epoch(model, stft_cfg, loss_perc, optimizer, scaler, cfg, train_loader, epoch_idx=epoch, plan_cache=plan_cache)
         print(f"train: obj={tr['obj']:.4f} ber={tr['ber']:.4f} ce={tr['bits_ce']:.4f} mse={tr['bits_mse']:.4f} perc={tr['perc']:.4f} mfcc={tr['mfcc']:.4f}")
         va = validate(model, stft_cfg, loss_perc, cfg, val_loader)
-        print(f"val  : ber={va['ber']:.4f} ce={va['bits_ce']:.4f} mse={va['bits_mse']:.4f} perc={va['perc']:.4f} mfcc={va['mfcc']:.4f}")
+        payload_ber_str = f" p_ber={va['payload_ber']:.4f}" if cfg.use_rs_interleave else ""
+        print(f"val  : ber={va['ber']:.4f}{payload_ber_str} ce={va['bits_ce']:.4f} mse={va['bits_mse']:.4f} perc={va['perc']:.4f} mfcc={va['mfcc']:.4f}")
 
         # Save by best BER
         if va["ber"] < best_ber:

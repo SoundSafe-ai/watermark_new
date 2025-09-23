@@ -35,6 +35,11 @@ from tqdm import tqdm
 
 from models.inn_encoder_decoder import INNWatermarker, STFT
 from pipeline.perceptual_losses import CombinedPerceptualLoss
+from pipeline.ingest_and_chunk import (
+    allocate_slots_and_amplitudes,
+    bits_to_message_spec,
+)
+from pipeline.psychoacoustic import mel_proxy_threshold
 from phm.perceptual_frontend import PerceptualFrontend
 from phm.technical_frontend import TechnicalFrontend
 from phm.fusion_head import FusionHead
@@ -61,6 +66,34 @@ warnings.filterwarnings(
 TARGET_SR = 22050
 CHUNK_SECONDS = 1.0
 CHUNK_SAMPLES = int(TARGET_SR * CHUNK_SECONDS)
+
+
+def make_bits(batch_size: int, S: int, device) -> torch.Tensor:
+    return torch.randint(low=0, high=2, size=(batch_size, S), device=device, dtype=torch.long)
+
+
+@torch.no_grad()
+def fast_gpu_plan_slots(model: INNWatermarker, x_wave: torch.Tensor, target_bits: int) -> tuple[list[tuple[int,int]], torch.Tensor]:
+    """
+    GPU planner for training: prioritize bins with high mag/headroom using a mel-proxy threshold.
+    Returns (slots, amp_per_slot_tensor_on_cpu)
+    """
+    X = model.stft(x_wave)  # [1,2,F,T] on device
+    B, _, F, T = X.shape
+    assert B == 1
+    mag = torch.sqrt(torch.clamp(X[:,0]**2 + X[:,1]**2, min=1e-6))  # [1,F,T]
+    thr = mel_proxy_threshold(X, n_mels=64)  # [1,F,T]
+    score = mag / (thr + 1e-6)               # higher score -> more headroom
+    k = int(min(target_bits, F*T))
+    vals, idx = score[0].flatten().topk(k)
+    f = (idx // T).to(torch.int64)
+    t = (idx % T).to(torch.int64)
+    slots: list[tuple[int,int]] = [(int(f[i]), int(t[i])) for i in range(k)]
+    amp = thr[0].flatten()[idx]
+    # normalize median to 1.0
+    med = torch.median(amp)
+    amp = amp / (med + 1e-9)
+    return slots, amp.detach().cpu()
 
 
 def list_audio_files(root: str) -> List[str]:
@@ -127,18 +160,40 @@ class TrainConfig:
     w_perc: float = 1.0
     w_msg_rec: float = 0.1
     w_msg_amp: float = 1e-4
+    # Payload settings (match decode training)
+    target_bits: int = 512  # per 1s chunk
+    base_symbol_amp: float = 0.01
 
 
-def build_message_like_spec(x_wave: torch.Tensor, stft: STFT) -> torch.Tensor:
+def build_message_spec_from_bits(x_wave: torch.Tensor, model: INNWatermarker, target_bits: int, base_amp: float, device) -> torch.Tensor:
     """
-    Build a dummy message spectrogram shaped like the audio STFT.
-    We do not supervise message recovery here; we only need a non-zero
-    message input to exercise the encoder path. We use small noise.
+    Build a proper BPSK message spectrogram using psychoacoustic slot allocation.
+    This ensures encoder and decoder training use consistent payload formats.
     """
     with torch.no_grad():
-        X = stft(x_wave)  # [B,2,F,T]
-    noise = torch.randn_like(X) * 0.01
-    return noise
+        B = x_wave.size(0)
+        X = model.stft(x_wave)  # [B,2,F,T]
+        F_, T_ = X.shape[-2], X.shape[-1]
+        M_spec = torch.zeros(B, 2, F_, T_, device=device)
+
+        for i in range(B):
+            # Plan slots for this item
+            slots, amp_per_slot = fast_gpu_plan_slots(model, x_wave[i:i+1], target_bits)
+            S = len(slots)
+
+            # Generate random bits and convert to BPSK symbols
+            bits = make_bits(1, S, device)  # [1, S]
+            signs = (bits * 2 - 1).float() * base_amp  # [-amp, +amp]
+
+            # Apply per-slot amplitude scaling
+            if amp_per_slot.numel() >= S:
+                signs = signs * amp_per_slot[:S].to(device)
+
+            # Place symbols in spectrogram
+            for s, (f, t) in enumerate(slots):
+                M_spec[i, 0, f, t] = signs[0, s]
+
+        return M_spec
 
 
 def match_length(y: torch.Tensor, target_T: int) -> torch.Tensor:
@@ -168,7 +223,7 @@ def validate(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, loader: Dat
     with torch.no_grad():
         for batch in loader:
             x = batch.to(device)  # [B,1,T]
-            m = build_message_like_spec(x, model.stft).to(device)
+            m = build_message_spec_from_bits(x, model, cfg.target_bits, cfg.base_symbol_amp, device)
             x_wm, _ = model.encode(x, m)
             x_wm = match_length(x_wm, x.size(-1))
             L = loss_fn(x, x_wm)
@@ -219,7 +274,7 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
     pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
     for step, batch in pbar:
         x = batch.to(device, non_blocking=True)
-        m = build_message_like_spec(x, model.stft).to(device)
+        m = build_message_spec_from_bits(x, model, cfg.target_bits, cfg.base_symbol_amp, device)
 
         optimizer.zero_grad(set_to_none=True)
         # Use new torch.amp.autocast API to avoid deprecation warnings

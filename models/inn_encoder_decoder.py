@@ -142,8 +142,8 @@ class INNWatermarker(nn.Module):
     # ----- Decoder: watermarked waveform -> recovered message spec -----
     def decode(self, x_wm_wave: torch.Tensor) -> torch.Tensor:
         Xn = self.stft(x_wm_wave)
-        # Initialize m_n with small random noise for better convergence
-        m = torch.randn_like(Xn) * 0.01
+        # Initialize m_n with zeros (standard INN initialization)
+        m = torch.zeros_like(Xn)
         x = Xn
         for blk in reversed(self.blocks):
             x, m = blk.forward_dec(x, m)
