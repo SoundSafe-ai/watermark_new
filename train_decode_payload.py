@@ -462,7 +462,11 @@ def main(cfg: TrainConfig) -> None:
     if cfg.init_from:
         if os.path.isfile(cfg.init_from):
             try:
-                ckpt = torch.load(cfg.init_from, map_location=cfg.device)
+                # In PyTorch 2.6+, weights_only=True is default and safer but may fail
+                try:
+                    ckpt = torch.load(cfg.init_from, map_location=cfg.device)
+                except TypeError:
+                    ckpt = torch.load(cfg.init_from, map_location=cfg.device, weights_only=False)
                 state = ckpt.get("model_state", ckpt)
                 model.load_state_dict(state, strict=True)
                 print(f"Loaded init weights from '{cfg.init_from}' (epoch={ckpt.get('epoch','?')})")

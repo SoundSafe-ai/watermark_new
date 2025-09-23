@@ -52,6 +52,6 @@ def mel_proxy_threshold(X_ri: torch.Tensor, n_mels: int = 64) -> torch.Tensor:
     B, _, Fbins, T = X_ri.shape
     mag = mag_from_ri(X_ri)  # [B,F,T]
     pool_k = max(1, Fbins // n_mels)
-    mel = F.avg_pool2d(mag.unsqueeze(1), kernel_size=(pool_k,1), stride=(pool_k,1)).squeeze(1)  # [B, n_mels, T]
-    up = F.interpolate(mel, size=(Fbins,T), mode='nearest')
+    mel_map = F.avg_pool2d(mag.unsqueeze(1), kernel_size=(pool_k,1), stride=(pool_k,1))  # [B,1,n_mels,T]
+    up = F.interpolate(mel_map, size=(Fbins,T), mode='nearest').squeeze(1)  # [B,F,T]
     return 0.5 * up  # allow ~50% of mel energy per bin by default
