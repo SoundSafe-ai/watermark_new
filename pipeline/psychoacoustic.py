@@ -34,14 +34,14 @@ def masking_threshold(X_ri: torch.Tensor, sr: int, n_fft: int) -> torch.Tensor:
     - spread in Bark domain
     Returns: threshold linear magnitude [B, F, T]
     """
-    B, _, F, T = X_ri.shape
+    B, _, Fbins, T = X_ri.shape
     mag = mag_from_ri(X_ri)  # [B, F, T]
     psd_db = 20.0 * torch.log10(torch.clamp(mag, min=1e-9))
     # crude peak emphasis for tonal maskers
     peak_db = F.max_pool2d(psd_db.unsqueeze(1), kernel_size=(5,3), stride=1, padding=(2,1)).squeeze(1)
     tonal = torch.maximum(psd_db, peak_db - 3.0)  # tonal enhancement
     # Bark mapping
-    freqs = torch.linspace(0, sr/2, F, device=X_ri.device)
+    freqs = torch.linspace(0, sr/2, Fbins, device=X_ri.device)
     bark = bark_scale(freqs)
     spread_db = spreading_function(tonal, bark) - 24.0  # global offset
     thr_lin = torch.pow(10.0, spread_db / 20.0)  # back to linear
@@ -49,8 +49,9 @@ def masking_threshold(X_ri: torch.Tensor, sr: int, n_fft: int) -> torch.Tensor:
 
 def mel_proxy_threshold(X_ri: torch.Tensor, n_mels: int = 64) -> torch.Tensor:
     # Fast proxy: gate by mel energy; produce per-bin threshold by upsampling
-    B, _, F, T = X_ri.shape
+    B, _, Fbins, T = X_ri.shape
     mag = mag_from_ri(X_ri)  # [B,F,T]
-    mel = F.avg_pool2d(mag.unsqueeze(1), kernel_size=(F//n_mels,1), stride=(F//n_mels,1)).squeeze(1)  # [B, n_mels, T]
-    up = F.interpolate(mel, size=(F,T), mode='nearest')
+    pool_k = max(1, Fbins // n_mels)
+    mel = F.avg_pool2d(mag.unsqueeze(1), kernel_size=(pool_k,1), stride=(pool_k,1)).squeeze(1)  # [B, n_mels, T]
+    up = F.interpolate(mel, size=(Fbins,T), mode='nearest')
     return 0.5 * up  # allow ~50% of mel energy per bin by default

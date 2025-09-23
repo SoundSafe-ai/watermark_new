@@ -136,7 +136,7 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_resample: bool = True
     # Initialize from a prior imperceptibility checkpoint (stage-1)
-    init_from: str | None = "FMA/checkpoints/inn_imperc_best.pt"
+    init_from: str | None = "watermark_new/checkpoints/inn_imperc_best.pt"
     # Limit number of files used (None uses all)
     train_max_files: int | None = 50000
     val_max_files: int | None = 15000
