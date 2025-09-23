@@ -435,6 +435,7 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                     payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
                     encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
                     bits = encoded_bits[:S].unsqueeze(0) if len(encoded_bits) >= S else torch.cat([encoded_bits, torch.zeros(S - len(encoded_bits), dtype=torch.long)]).unsqueeze(0)
+                    bits = bits.to(xi.device)
                 else:
                     bits = make_bits(1, S, xi.device)
                 # Build message spec
