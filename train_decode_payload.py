@@ -104,10 +104,10 @@ class AudioChunkDataset(Dataset):
         start = random.randint(0, max(0, T - CHUNK_SAMPLES))
         return wav[:, start:start + CHUNK_SAMPLES]
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, str]:
         path = self.files[idx]
         wav, sr = self._load_audio(path)
-        return self._random_1s_chunk(wav), sr
+        return self._random_1s_chunk(wav), sr, path
 
 
 def match_length(y: torch.Tensor, target_T: int) -> torch.Tensor:
@@ -150,6 +150,8 @@ class TrainConfig:
     target_bits: int = 512  # per 1s chunk (<= realistic slot count)
     # Planner selection: "gpu" (fast mel-proxy) or "mg" (Moore–Glasberg)
     planner: str = "gpu"
+    # Cache planning per file; re-plan every N epochs
+    replan_every: int = 3
 
 
 def make_bits(batch_size: int, S: int, device) -> torch.Tensor:
@@ -254,6 +256,58 @@ def build_batch_plan(model: INNWatermarker, x: torch.Tensor, cfg: TrainConfig):
     return {"f_idx": f_idx, "t_idx": t_idx, "amp": amp, "mask": mask, "bits": bits, "S": S_max}
 
 
+@torch.no_grad()
+def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: list[str], cfg: TrainConfig, epoch_idx: int, plan_cache: dict):
+    B = x.size(0)
+    f_lists: list[list[int]] = []
+    t_lists: list[list[int]] = []
+    S_list: list[int] = []
+    for i in range(B):
+        key = (paths[i], cfg.target_bits)
+        cached = plan_cache.get(key)
+        need_replan = (cached is None) or ((epoch_idx % max(1, cfg.replan_every)) == 0)
+        if cfg.planner == "gpu":
+            if need_replan:
+                slots, _ = fast_gpu_plan_slots(model, x[i:i+1], cfg.target_bits)
+                plan_cache[key] = {"slots": slots}
+            else:
+                slots = cached["slots"]
+        else:
+            # fallback to CPU MG if requested (not recommended for speed)
+            if need_replan:
+                slots, _ = plan_slots_and_amp(model, x[i:i+1], TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
+                plan_cache[key] = {"slots": slots}
+            else:
+                slots = cached["slots"]
+        S = min(len(slots), cfg.target_bits)
+        f_lists.append([slots[s][0] for s in range(S)])
+        t_lists.append([slots[s][1] for s in range(S)])
+        S_list.append(S)
+
+    S_max = int(max(S_list) if len(S_list) > 0 else 0)
+    device = x.device
+    if S_max == 0:
+        return {
+            "f_idx": torch.zeros(B, 0, dtype=torch.long, device=device),
+            "t_idx": torch.zeros(B, 0, dtype=torch.long, device=device),
+            "mask": torch.zeros(B, 0, dtype=torch.bool, device=device),
+            "bits": torch.zeros(B, 0, dtype=torch.long, device=device),
+            "S": 0,
+        }
+    f_idx = torch.full((B, S_max), -1, dtype=torch.long, device=device)
+    t_idx = torch.full((B, S_max), -1, dtype=torch.long, device=device)
+    mask = torch.zeros(B, S_max, dtype=torch.bool, device=device)
+    for i in range(B):
+        S = S_list[i]
+        if S == 0:
+            continue
+        f_idx[i, :S] = torch.tensor(f_lists[i], dtype=torch.long, device=device)
+        t_idx[i, :S] = torch.tensor(t_lists[i], dtype=torch.long, device=device)
+        mask[i, :S] = True
+    bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
+    return {"f_idx": f_idx, "t_idx": t_idx, "mask": mask, "bits": bits, "S": S_max}
+
+
 def _maybe_resample_gpu(x: torch.Tensor, sr: torch.Tensor, target_sr: int) -> torch.Tensor:
     # x: [B,1,T], sr: [B]
     out = []
@@ -271,7 +325,7 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
     metrics = {"ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0}
     with torch.no_grad():
         for batch in loader:
-            x, sr = batch
+            x, sr, _paths = batch
             x = x.to(cfg.device, non_blocking=True)
             sr = sr.to(cfg.device) if isinstance(sr, torch.Tensor) else torch.tensor(sr, device=cfg.device)
             if cfg.gpu_resample:
@@ -326,77 +380,74 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
     return metrics
 
 
-def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptualLoss, optimizer: torch.optim.Optimizer, scaler, cfg: TrainConfig, loader: DataLoader) -> dict:
+def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptualLoss, optimizer: torch.optim.Optimizer, scaler, cfg: TrainConfig, loader: DataLoader, *, epoch_idx: int, plan_cache: dict) -> dict:
     model.train()
     running = {"obj": 0.0, "ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0}
     pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
     for step, batch in pbar:
-        x, sr = batch
+        x, sr, paths = batch
         x = x.to(cfg.device, non_blocking=True)
         sr = sr.to(cfg.device) if isinstance(sr, torch.Tensor) else torch.tensor(sr, device=cfg.device)
         if cfg.gpu_resample:
             x = _maybe_resample_gpu(x, sr, TARGET_SR)
         B = x.size(0)
-        obj_sum = 0.0; ber_sum = 0.0; ce_sum = 0.0; mse_sum = 0.0; perc_sum = 0.0
 
-        for i in range(B):
-            xi = x[i:i+1]
-            if cfg.planner == "gpu":
-                slots, amp_scale = fast_gpu_plan_slots(model, xi, cfg.target_bits)
-            else:
-                slots, amp_scale = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
-            S = min(len(slots), cfg.target_bits)
-            if S == 0:
-                continue
-            bits = make_bits(1, S, xi.device)
-            X = model.stft(xi)
-            F_, T_ = X.shape[-2], X.shape[-1]
-            amp_vec = amp_scale[:S] if len(amp_scale) >= S else None
-            M_spec = bits_to_message_spec(bits, slots[:S], F_, T_, base_amp=cfg.base_symbol_amp, amp_per_slot=amp_vec)
+        # Batch plan (collated tensors for vector ops) with cache reuse
+        plan = build_batch_plan_with_cache(model, x, paths, cfg, epoch_idx, plan_cache)
+        S = plan["S"]
+        if S == 0:
+            continue
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type='cuda', enabled=(scaler is not None)):
-                x_wm, _ = model.encode(xi, M_spec)
-                x_wm = match_length(x_wm, xi.size(-1))
-                x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0)
-                M_rec = model.decode(x_wm)
-                M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
-            with torch.amp.autocast(device_type='cuda', enabled=False):
-                logits = gather_slots(M_rec, slots[:S]).clamp(-6.0, 6.0)
-                targets01 = bits.float()
-                L_bits_ce = F.binary_cross_entropy_with_logits(logits, targets01)
-                target_sign = symbols_from_bits(bits, amp=cfg.base_symbol_amp)
-                rec_vals = gather_slots(M_rec, slots[:S])
-                L_bits_mse = F.mse_loss(rec_vals, target_sign)
-                L_perc = loss_perc(xi.float(), x_wm.float())["total_perceptual_loss"]
-                L_obj = cfg.w_bits * L_bits_ce + cfg.w_mse * L_bits_mse + cfg.w_perc * L_perc
+        bits = plan["bits"]              # [B,S]
+        f_idx = plan["f_idx"]            # [B,S]
+        t_idx = plan["t_idx"]            # [B,S]
+        mask = plan["mask"]              # [B,S]
 
-            if scaler is not None:
-                scaler.scale(L_obj).backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                L_obj.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+        # Build message spectrogram in batch
+        X = model.stft(x)
+        F_, T_ = X.shape[-2], X.shape[-1]
+        M_spec = torch.zeros(B, 2, F_, T_, device=x.device)
+        b_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(B, S)
+        signs = (bits * 2 - 1).float() * cfg.base_symbol_amp
+        valid = mask
+        M_spec[b_idx[valid], 0, f_idx[valid], t_idx[valid]] = signs[valid]
 
-            # logging
-            with torch.no_grad():
-                pred_bits = (rec_vals > 0).long()
-                ber = (pred_bits != bits).float().mean()
-                obj_sum += float(L_obj)
-                ber_sum += float(ber)
-                ce_sum += float(L_bits_ce)
-                mse_sum += float(L_bits_mse)
-                perc_sum += float(L_perc)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast(device_type='cuda', enabled=(scaler is not None)):
+            x_wm, _ = model.encode(x, M_spec)
+            x_wm = match_length(x_wm, x.size(-1))
+            x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0)
+            M_rec = model.decode(x_wm)
+            M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            rec_vals = torch.zeros(B, S, device=x.device)
+            rec_vals[valid] = M_rec[b_idx[valid], 0, f_idx[valid], t_idx[valid]]
+            logits = rec_vals.clamp(-6.0, 6.0)
+            targets01 = bits.float()
+            L_bits_ce = F.binary_cross_entropy_with_logits(logits[valid], targets01[valid])
+            target_sign = (bits * 2 - 1).float() * cfg.base_symbol_amp
+            L_bits_mse = F.mse_loss(rec_vals[valid], target_sign[valid])
+            L_perc = loss_perc(x.float(), x_wm.float())["total_perceptual_loss"]
+            L_obj = cfg.w_bits * L_bits_ce + cfg.w_mse * L_bits_mse + cfg.w_perc * L_perc
 
-        denom = max(1, B)
-        running["obj"] += obj_sum / denom * B
-        running["ber"] += ber_sum / denom * B
-        running["bits_ce"] += ce_sum / denom * B
-        running["bits_mse"] += mse_sum / denom * B
-        running["perc"] += perc_sum / denom * B
+        if scaler is not None:
+            scaler.scale(L_obj).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            L_obj.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        with torch.no_grad():
+            pred_bits = (rec_vals > 0).long()
+            ber = (pred_bits[valid] != bits[valid]).float().mean()
+            running["obj"] += float(L_obj) * B
+            running["ber"] += float(ber) * B
+            running["bits_ce"] += float(L_bits_ce) * B
+            running["bits_mse"] += float(L_bits_mse) * B
+            running["perc"] += float(L_perc) * B
 
         if (step + 1) % cfg.log_interval == 0:
             pbar.set_postfix({
@@ -461,17 +512,24 @@ def main(cfg: TrainConfig) -> None:
     # Warm-start from Stage-1 (imperceptibility) checkpoint if provided
     if cfg.init_from:
         if os.path.isfile(cfg.init_from):
+            # Try weights_only=True first (PyTorch 2.6 default). If it fails for this file,
+            # fall back to weights_only=False (only if the file is trusted).
+            ckpt = None
             try:
-                # In PyTorch 2.6+, weights_only=True is default and safer but may fail
+                ckpt = torch.load(cfg.init_from, map_location=cfg.device)
+            except Exception:
                 try:
-                    ckpt = torch.load(cfg.init_from, map_location=cfg.device)
-                except TypeError:
                     ckpt = torch.load(cfg.init_from, map_location=cfg.device, weights_only=False)
-                state = ckpt.get("model_state", ckpt)
-                model.load_state_dict(state, strict=True)
-                print(f"Loaded init weights from '{cfg.init_from}' (epoch={ckpt.get('epoch','?')})")
-            except Exception as e:
-                print(f"Warning: failed to load init_from '{cfg.init_from}': {e}\nTraining from scratch.")
+                except Exception as e:
+                    print(f"Warning: failed to load init_from '{cfg.init_from}': {e}\nTraining from scratch.")
+            if ckpt is not None:
+                state = ckpt["model_state"] if isinstance(ckpt, dict) and "model_state" in ckpt else ckpt
+                try:
+                    model.load_state_dict(state, strict=True)
+                    ep = ckpt.get("epoch", "?") if isinstance(ckpt, dict) else "?"
+                    print(f"Loaded init weights from '{cfg.init_from}' (epoch={ep})")
+                except Exception as e:
+                    print(f"Warning: checkpoint state load failed: {e}\nTraining from scratch.")
         else:
             print(f"Init checkpoint not found: '{cfg.init_from}'. Training from scratch.")
     loss_perc = CombinedPerceptualLoss()
@@ -483,9 +541,10 @@ def main(cfg: TrainConfig) -> None:
     scaler = GradScaler(enabled=(cfg.mixed_precision and torch.cuda.is_available()))
 
     best_ber = math.inf
+    plan_cache: dict = {}
     for epoch in range(1, cfg.epochs + 1):
         print(f"\nEpoch {epoch}/{cfg.epochs}")
-        tr = train_one_epoch(model, stft_cfg, loss_perc, optimizer, scaler, cfg, train_loader)
+        tr = train_one_epoch(model, stft_cfg, loss_perc, optimizer, scaler, cfg, train_loader, epoch_idx=epoch, plan_cache=plan_cache)
         print(f"train: obj={tr['obj']:.4f} ber={tr['ber']:.4f} ce={tr['bits_ce']:.4f} mse={tr['bits_mse']:.4f} perc={tr['perc']:.4f}")
         va = validate(model, stft_cfg, loss_perc, cfg, val_loader)
         print(f"val  : ber={va['ber']:.4f} ce={va['bits_ce']:.4f} mse={va['bits_mse']:.4f} perc={va['perc']:.4f}")
