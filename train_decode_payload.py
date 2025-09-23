@@ -137,7 +137,7 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_resample: bool = True
     # Initialize from a prior imperceptibility checkpoint (stage-1)
-    init_from: str | None = "checkpoints/inn_imperc_best.pt"
+    init_from: str | None = "inn_imperc_best.pt"
     # Limit number of files used (None uses all)
     train_max_files: int | None = 50000
     val_max_files: int | None = 15000
@@ -262,27 +262,30 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
     B = x.size(0)
     f_lists: list[list[int]] = []
     t_lists: list[list[int]] = []
+    amp_lists: list[torch.Tensor] = []
     S_list: list[int] = []
     for i in range(B):
         key = (paths[i], cfg.target_bits)
         cached = plan_cache.get(key)
         need_replan = (cached is None) or ((epoch_idx % max(1, cfg.replan_every)) == 0)
         if cfg.planner == "gpu":
+            slots, amp = fast_gpu_plan_slots(model, x[i:i+1], cfg.target_bits)
             if need_replan:
-                slots, _ = fast_gpu_plan_slots(model, x[i:i+1], cfg.target_bits)
                 plan_cache[key] = {"slots": slots}
-            else:
-                slots = cached["slots"]
         else:
             # fallback to CPU MG if requested (not recommended for speed)
+            slots, amp = plan_slots_and_amp(model, x[i:i+1], TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
             if need_replan:
-                slots, _ = plan_slots_and_amp(model, x[i:i+1], TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
                 plan_cache[key] = {"slots": slots}
-            else:
-                slots = cached["slots"]
         S = min(len(slots), cfg.target_bits)
         f_lists.append([slots[s][0] for s in range(S)])
         t_lists.append([slots[s][1] for s in range(S)])
+        # Ensure amp is a torch.Tensor
+        if isinstance(amp, np.ndarray):
+            amp_tensor = torch.from_numpy(amp[:S] if len(amp) >= S else np.ones(S, dtype=np.float32))
+        else:
+            amp_tensor = amp[:S] if amp.numel() >= S else torch.ones(S, dtype=torch.float32)
+        amp_lists.append(amp_tensor)
         S_list.append(S)
 
     S_max = int(max(S_list) if len(S_list) > 0 else 0)
