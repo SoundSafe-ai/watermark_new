@@ -23,6 +23,7 @@ import math
 import random
 from dataclasses import dataclass
 from typing import List, Tuple
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -136,7 +137,7 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_resample: bool = True
     # Initialize from a prior imperceptibility checkpoint (stage-1)
-    init_from: str | None = "watermark_new/checkpoints/inn_imperc_best.pt"
+    init_from: str | None = "checkpoints/inn_imperc_best.pt"
     # Limit number of files used (None uses all)
     train_max_files: int | None = 50000
     val_max_files: int | None = 15000
@@ -290,12 +291,14 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
         return {
             "f_idx": torch.zeros(B, 0, dtype=torch.long, device=device),
             "t_idx": torch.zeros(B, 0, dtype=torch.long, device=device),
+            "amp": torch.zeros(B, 0, dtype=torch.float32, device=device),
             "mask": torch.zeros(B, 0, dtype=torch.bool, device=device),
             "bits": torch.zeros(B, 0, dtype=torch.long, device=device),
             "S": 0,
         }
     f_idx = torch.full((B, S_max), -1, dtype=torch.long, device=device)
     t_idx = torch.full((B, S_max), -1, dtype=torch.long, device=device)
+    amp = torch.ones(B, S_max, dtype=torch.float32, device=device)
     mask = torch.zeros(B, S_max, dtype=torch.bool, device=device)
     for i in range(B):
         S = S_list[i]
@@ -303,9 +306,11 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
             continue
         f_idx[i, :S] = torch.tensor(f_lists[i], dtype=torch.long, device=device)
         t_idx[i, :S] = torch.tensor(t_lists[i], dtype=torch.long, device=device)
+        if i < len(amp_lists):
+            amp[i, :S] = amp_lists[i][:S].to(device)
         mask[i, :S] = True
     bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
-    return {"f_idx": f_idx, "t_idx": t_idx, "mask": mask, "bits": bits, "S": S_max}
+    return {"f_idx": f_idx, "t_idx": t_idx, "amp": amp, "mask": mask, "bits": bits, "S": S_max}
 
 
 def _maybe_resample_gpu(x: torch.Tensor, sr: torch.Tensor, target_sr: int) -> torch.Tensor:
@@ -322,7 +327,7 @@ def _maybe_resample_gpu(x: torch.Tensor, sr: torch.Tensor, target_sr: int) -> to
 
 def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptualLoss, cfg: TrainConfig, loader: DataLoader) -> dict:
     model.eval()
-    metrics = {"ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0}
+    metrics = {"ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0, "mfcc": 0.0}
     with torch.no_grad():
         for batch in loader:
             x, sr, _paths = batch
@@ -331,14 +336,18 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
             if cfg.gpu_resample:
                 x = _maybe_resample_gpu(x, sr, TARGET_SR)
             B = x.size(0)
-            # Plan slots on a per-item basis
+            # Plan slots using the same method as training
             bers = []
             ce_sum = 0.0
             mse_sum = 0.0
             perc_sum = 0.0
             for i in range(B):
                 xi = x[i:i+1]
-                slots, amp_scale = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
+                # Use same planning method as training
+                if cfg.planner == "gpu":
+                    slots, amp_scale = fast_gpu_plan_slots(model, xi, cfg.target_bits)
+                else:
+                    slots, amp_scale = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
                 S = min(len(slots), cfg.target_bits)
                 if S == 0:
                     continue
@@ -346,7 +355,11 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 # Build message spec
                 X = model.stft(xi)
                 F_, T_ = X.shape[-2], X.shape[-1]
-                amp_vec = amp_scale[:S] if len(amp_scale) >= S else None
+                # For validation, we don't have per-slot amplitude tensor, so use the scale vector directly
+                if isinstance(amp_scale, torch.Tensor):
+                    amp_vec = amp_scale[:S].cpu().numpy() if amp_scale.numel() >= S else np.ones(S, dtype=np.float32)
+                else:
+                    amp_vec = amp_scale[:S] if len(amp_scale) >= S else np.ones(S, dtype=np.float32)
                 M_spec = bits_to_message_spec(bits, slots[:S], F_, T_, base_amp=cfg.base_symbol_amp, amp_per_slot=amp_vec)
                 # Encode -> Decode
                 x_wm, _ = model.encode(xi, M_spec)
@@ -361,7 +374,9 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 target_sign = symbols_from_bits(bits, amp=cfg.base_symbol_amp)
                 rec_vals = gather_slots(M_rec, slots[:S])
                 mse = F.mse_loss(rec_vals, target_sign)
-                perc = loss_perc(xi, x_wm)["total_perceptual_loss"]
+                perc_out = loss_perc(xi, x_wm)
+                perc = perc_out["total_perceptual_loss"]
+                mfcc = perc_out["mfcc_cos"]
                 # BER
                 pred_bits = (rec_vals > 0).long()
                 ber = (pred_bits != bits).float().mean()
@@ -369,6 +384,7 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 ce_sum += float(ce)
                 mse_sum += float(mse)
                 perc_sum += float(perc)
+                metrics["mfcc"] += float(mfcc)
             if len(bers) > 0:
                 metrics["ber"] += sum(bers) / len(bers) * B
                 metrics["bits_ce"] += ce_sum * 1.0
@@ -382,7 +398,7 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
 
 def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptualLoss, optimizer: torch.optim.Optimizer, scaler, cfg: TrainConfig, loader: DataLoader, *, epoch_idx: int, plan_cache: dict) -> dict:
     model.train()
-    running = {"obj": 0.0, "ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0}
+    running = {"obj": 0.0, "ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0, "mfcc": 0.0}
     pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
     for step, batch in pbar:
         x, sr, paths = batch
@@ -401,6 +417,7 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
         bits = plan["bits"]              # [B,S]
         f_idx = plan["f_idx"]            # [B,S]
         t_idx = plan["t_idx"]            # [B,S]
+        amp = plan["amp"]                # [B,S] per-slot amplitude scaling
         mask = plan["mask"]              # [B,S]
 
         # Build message spectrogram in batch
@@ -408,7 +425,7 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
         F_, T_ = X.shape[-2], X.shape[-1]
         M_spec = torch.zeros(B, 2, F_, T_, device=x.device)
         b_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(B, S)
-        signs = (bits * 2 - 1).float() * cfg.base_symbol_amp
+        signs = (bits * 2 - 1).float() * cfg.base_symbol_amp * amp
         valid = mask
         M_spec[b_idx[valid], 0, f_idx[valid], t_idx[valid]] = signs[valid]
 
@@ -425,9 +442,11 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
             logits = rec_vals.clamp(-6.0, 6.0)
             targets01 = bits.float()
             L_bits_ce = F.binary_cross_entropy_with_logits(logits[valid], targets01[valid])
-            target_sign = (bits * 2 - 1).float() * cfg.base_symbol_amp
+            target_sign = (bits * 2 - 1).float() * cfg.base_symbol_amp * amp
             L_bits_mse = F.mse_loss(rec_vals[valid], target_sign[valid])
-            L_perc = loss_perc(x.float(), x_wm.float())["total_perceptual_loss"]
+            perc_out = loss_perc(x.float(), x_wm.float())
+            L_perc = perc_out["total_perceptual_loss"]
+            L_mfcc = perc_out["mfcc_cos"]
             L_obj = cfg.w_bits * L_bits_ce + cfg.w_mse * L_bits_mse + cfg.w_perc * L_perc
 
         if scaler is not None:
@@ -448,6 +467,7 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
             running["bits_ce"] += float(L_bits_ce) * B
             running["bits_mse"] += float(L_bits_mse) * B
             running["perc"] += float(L_perc) * B
+            running["mfcc"] += float(L_mfcc) * B
 
         if (step + 1) % cfg.log_interval == 0:
             pbar.set_postfix({
@@ -456,6 +476,7 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
                 "ce": f"{running['bits_ce'] / ((step+1)*loader.batch_size):.4f}",
                 "mse": f"{running['bits_mse'] / ((step+1)*loader.batch_size):.4f}",
                 "perc": f"{running['perc'] / ((step+1)*loader.batch_size):.4f}",
+                "mfcc": f"{running['mfcc'] / ((step+1)*loader.batch_size):.4f}",
             })
 
     for k in running:
@@ -545,9 +566,9 @@ def main(cfg: TrainConfig) -> None:
     for epoch in range(1, cfg.epochs + 1):
         print(f"\nEpoch {epoch}/{cfg.epochs}")
         tr = train_one_epoch(model, stft_cfg, loss_perc, optimizer, scaler, cfg, train_loader, epoch_idx=epoch, plan_cache=plan_cache)
-        print(f"train: obj={tr['obj']:.4f} ber={tr['ber']:.4f} ce={tr['bits_ce']:.4f} mse={tr['bits_mse']:.4f} perc={tr['perc']:.4f}")
+        print(f"train: obj={tr['obj']:.4f} ber={tr['ber']:.4f} ce={tr['bits_ce']:.4f} mse={tr['bits_mse']:.4f} perc={tr['perc']:.4f} mfcc={tr['mfcc']:.4f}")
         va = validate(model, stft_cfg, loss_perc, cfg, val_loader)
-        print(f"val  : ber={va['ber']:.4f} ce={va['bits_ce']:.4f} mse={va['bits_mse']:.4f} perc={va['perc']:.4f}")
+        print(f"val  : ber={va['ber']:.4f} ce={va['bits_ce']:.4f} mse={va['bits_mse']:.4f} perc={va['perc']:.4f} mfcc={va['mfcc']:.4f}")
 
         # Save by best BER
         if va["ber"] < best_ber:
