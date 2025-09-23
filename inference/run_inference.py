@@ -19,6 +19,13 @@ if REPO_ROOT not in sys.path:
 from models.inn_encoder_decoder import INNWatermarker, STFT
 from pipeline.payload_codec import pack_fields, unpack_fields
 from pipeline.psychoacoustic import mel_proxy_threshold
+from pipeline.ingest_and_chunk import (
+    EULDriver,
+    rs_encode_167_125,
+    rs_decode_167_125,
+    interleave_bytes,
+    deinterleave_bytes,
+)
 
 
 warnings.filterwarnings(
@@ -48,7 +55,7 @@ def load_audio_mono(path: str, target_sr: int = TARGET_SR) -> torch.Tensor:
 
 def save_audio(path: str, wav: torch.Tensor, sr: int = TARGET_SR) -> None:
     wav = wav.clamp(-1.0, 1.0)
-    torchaudio.save(path, wav.cpu(), sr)
+    torchaudio.save(path, wav.detach().cpu(), sr)
 
 
 def save_spectrogram_png(path: str, X_ri: torch.Tensor) -> None:
@@ -58,7 +65,7 @@ def save_spectrogram_png(path: str, X_ri: torch.Tensor) -> None:
     """
     import matplotlib.pyplot as plt
     import numpy as np
-    mag = torch.sqrt(torch.clamp(X_ri[:,0]**2 + X_ri[:,1]**2, min=1e-9))[0].cpu().numpy()
+    mag = torch.sqrt(torch.clamp(X_ri[:,0]**2 + X_ri[:,1]**2, min=1e-9))[0].detach().cpu().numpy()
     plt.figure(figsize=(10, 4))
     plt.imshow(20 * np.log10(mag + 1e-9), origin='lower', aspect='auto', cmap='magma')
     plt.colorbar(label='dB')
@@ -88,8 +95,8 @@ def save_combined_spectrogram_png(path: str, X_orig: torch.Tensor, X_wm: torch.T
     """
     import matplotlib.pyplot as plt
     import numpy as np
-    mag_o = torch.sqrt(torch.clamp(X_orig[:,0]**2 + X_orig[:,1]**2, min=1e-9))[0].cpu().numpy()
-    mag_w = torch.sqrt(torch.clamp(X_wm[:,0]**2 + X_wm[:,1]**2, min=1e-9))[0].cpu().numpy()
+    mag_o = torch.sqrt(torch.clamp(X_orig[:,0]**2 + X_orig[:,1]**2, min=1e-9))[0].detach().cpu().numpy()
+    mag_w = torch.sqrt(torch.clamp(X_wm[:,0]**2 + X_wm[:,1]**2, min=1e-9))[0].detach().cpu().numpy()
     db_o = 20 * np.log10(mag_o + 1e-9)
     db_w = 20 * np.log10(mag_w + 1e-9)
     max_db = max(db_o.max(), db_w.max())
@@ -167,6 +174,97 @@ def build_message_spec_for_slots(model: INNWatermarker, x_wave: torch.Tensor, sl
     return M
 
 
+def encode_full_audio_eul_driver(model: INNWatermarker, x_full: torch.Tensor, sr: int, payload_bytes: bytes, eul_driver: EULDriver) -> tuple[torch.Tensor, list[list[tuple[int,int]]], int]:
+    """
+    Encode watermark over entire audio using EULDriver (includes RS encoding and full psychoacoustic allocation).
+    Returns (x_wm_full [1,1,T], slots_per_chunk, num_bytes_embedded).
+    """
+    B, C, T = x_full.shape
+    assert B == 1 and C == 1
+    out_chunks = []
+    slots_per_chunk: list[list[tuple[int,int]]] = []
+    bytes_cursor = 0
+    payload_size = len(payload_bytes)
+
+    for (s, e) in chunk_indices(T, sr, eul_seconds=1.0):
+        x_seg = x_full[:, :, s:e]
+        x_seg_eul = match_length(x_seg, int(sr * 1.0))
+
+        # Use EULDriver for this chunk
+        if bytes_cursor < payload_size:
+            # Take next 125 bytes for this EUL
+            chunk_bytes = payload_bytes[bytes_cursor:bytes_cursor+125]
+            if len(chunk_bytes) < 125:
+                # Pad with zeros if needed
+                chunk_bytes = chunk_bytes + b'\x00' * (125 - len(chunk_bytes))
+
+            x_wm_seg = eul_driver.encode_eul(model, x_seg_eul, chunk_bytes)
+            bytes_cursor += 125
+
+            # Get slots used by EULDriver (need to recompute for consistency)
+            X = model.stft(x_seg_eul)
+            from pipeline.ingest_and_chunk import allocate_slots_and_amplitudes
+            slots, _ = allocate_slots_and_amplitudes(
+                X, sr, 1024, target_bits=eul_driver.per_eul_bits_target, amp_safety=1.0
+            )
+            slots_per_chunk.append(slots[:eul_driver.per_eul_bits_target])
+        else:
+            # No payload left, pass through
+            x_wm_seg = x_seg_eul
+            slots_per_chunk.append([])
+
+        x_wm_seg = match_length(x_wm_seg, x_seg_eul.size(-1))
+        x_wm_seg = x_wm_seg[:, :, : (e - s)]
+        out_chunks.append(x_wm_seg)
+
+    x_wm_full = torch.cat(out_chunks, dim=-1)
+    x_wm_full = x_wm_full[:, :, :T]
+    return x_wm_full, slots_per_chunk, min(bytes_cursor, payload_size)
+
+
+def decode_full_audio_eul_driver(model: INNWatermarker, x_wm_full: torch.Tensor, sr: int, eul_driver: EULDriver, num_bytes_embedded: int) -> bytes:
+    """
+    Decode watermark from entire audio using EULDriver (includes RS decoding and full psychoacoustic allocation).
+    Returns recovered payload bytes.
+    """
+    B, C, T = x_wm_full.shape
+    assert B == 1 and C == 1
+
+    recovered_chunks = []
+    bytes_cursor = 0
+
+    # Calculate how many chunks we need to process
+    # RS encoding expands payload, so we need ceil(num_bytes_embedded / 125) chunks
+    chunks_needed = (num_bytes_embedded + 124) // 125  # Ceiling division
+
+    chunk_idx = 0
+    for (s, e) in chunk_indices(T, sr, eul_seconds=1.0):
+        if chunk_idx >= chunks_needed:
+            break
+
+        x_wm_seg = match_length(x_wm_full[:, :, s:e], int(sr * 1.0))
+
+        # Use EULDriver for this chunk
+        try:
+            chunk_bytes = eul_driver.decode_eul(model, x_wm_seg, expected_bytes=125)
+            recovered_chunks.append(chunk_bytes)
+            bytes_cursor += len(chunk_bytes)
+            chunk_idx += 1
+            print(f"Successfully decoded chunk {chunk_idx}/{chunks_needed} at {s}-{e}s: {len(chunk_bytes)} bytes")
+            if all(b == 0 for b in chunk_bytes):
+                print("WARNING: All decoded bytes are zero - bit recovery likely failed!")
+        except Exception as e:
+            print(f"Warning: Failed to decode chunk {chunk_idx+1} at {s}-{e}s: {e}")
+            # For failed chunks, add zero bytes as fallback
+            recovered_chunks.append(b'\x00' * 125)
+            bytes_cursor += 125
+            chunk_idx += 1
+
+    # Concatenate recovered chunks and trim to original payload size
+    recovered_payload = b''.join(recovered_chunks)
+    return recovered_payload[:num_bytes_embedded]
+
+
 def encode_full_audio(model: INNWatermarker, x_full: torch.Tensor, sr: int, payload_bits: list[int], *, target_bits_per_eul: int, base_symbol_amp: float) -> tuple[torch.Tensor, list[list[tuple[int,int]]], int]:
     """
     Encode watermark over entire audio by splitting into 1s EULs and concatenating.
@@ -227,8 +325,7 @@ def main() -> None:
     parser.add_argument("--sr", type=int, default=TARGET_SR, help="Target sample rate")
     parser.add_argument("--out_dir", type=str, default="inference_outputs", help="Directory to save outputs")
     parser.add_argument("--device", type=str, default=None, help="cuda or cpu (auto if None)")
-    parser.add_argument("--bits_per_eul", type=int, default=512, help="Target number of bits per 1s chunk (as in training)")
-    parser.add_argument("--base_symbol_amp", type=float, default=0.1, help="Symbol amplitude used for BPSK embed (training default)")
+    parser.add_argument("--base_symbol_amp", type=float, default=0.2, help="Symbol amplitude used for BPSK embed (increased for better recovery)")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -244,15 +341,25 @@ def main() -> None:
     # Original spectrogram (full audio)
     X_orig = model.stft(x)  # [1,2,F,T]
 
-    # Build payload bytes and convert to bitstream
+    # Build payload bytes using proper encoding pipeline
     payload_bytes = make_payload_bytes(args.payload)
-    payload_bits = bytes_to_bits(payload_bytes)
+    print(f"Original payload: {len(payload_bytes)} bytes")
 
-    # Encode (embed) over entire file via 1s EUL chunks (mirror training, no RS)
-    x_wm, slots_per_chunk, num_bits_embedded = encode_full_audio(
-        model, x, args.sr, payload_bits,
-        target_bits_per_eul=args.bits_per_eul,
+    # Use EULDriver for proper RS encoding/decoding pipeline
+    eul_driver = EULDriver(
+        sr=args.sr,
+        n_fft=1024,
+        hop=512,
+        rs_interleave=4,
+        per_eul_bits_target=167 * 8,  # 1336 bits for RS(167,125)
         base_symbol_amp=args.base_symbol_amp,
+        amp_safety=1.0,
+    )
+
+    # Encode using EULDriver (includes RS encoding and full psychoacoustic allocation)
+    print("Encoding with RS(167,125) + interleaving + full psychoacoustic allocation...")
+    x_wm, slots_per_chunk, num_bits_embedded = encode_full_audio_eul_driver(
+        model, x, args.sr, payload_bytes, eul_driver
     )
 
     # Save watermarked audio
@@ -263,45 +370,17 @@ def main() -> None:
         X_wm = model.stft(x_wm)
     save_combined_spectrogram_png(os.path.join(args.out_dir, "spectrograms.png"), X_orig, X_wm)
 
-    # Decode by mirroring training: recover message spectrogram and read bits at the same planned slots
-    with torch.no_grad():
-        M_rec_full = model.decode(x_wm)
-    recovered_bits: list[int] = []
-    bit_goal = num_bits_embedded
-    cursor = 0
-    for chunk_i, (s, e) in enumerate(chunk_indices(x.size(-1), args.sr, eul_seconds=1.0)):
-        if cursor >= bit_goal:
-            break
-        slots = slots_per_chunk[chunk_i]
-        for (f, t) in slots:
-            if cursor >= bit_goal:
-                break
-            # Map chunk-local t to global frame index: since we padded to full EUL in encode, STFT frames align per-second
-            # Simpler approach: recompute decode per chunk to avoid frame indexing mismatch
-            pass
-    # To avoid global frame mapping complexity, decode per chunk like encode
-    recovered_bits = []
-    bit_cursor = 0
-    for (s, e), slots in zip(chunk_indices(x.size(-1), args.sr, eul_seconds=1.0), slots_per_chunk):
-        if bit_cursor >= bit_goal:
-            break
-        x_wm_seg = match_length(x_wm[:, :, s:e], int(args.sr * 1.0))
-        with torch.no_grad():
-            M_rec = model.decode(x_wm_seg)
-        for (f, t) in slots:
-            if bit_cursor >= bit_goal:
-                break
-            val = M_rec[:, 0, f, t]  # [1]
-            recovered_bits.append(int((val > 0).item()))
-            bit_cursor += 1
-    recovered_bytes = bits_to_bytes(recovered_bits)
+    # Decode using EULDriver (includes RS decoding and full psychoacoustic allocation)
+    print("Decoding with RS(167,125) + deinterleaving + full psychoacoustic allocation...")
+    recovered_payload = decode_full_audio_eul_driver(model, x_wm, args.sr, eul_driver, num_bits_embedded)
 
     # Try to unpack assuming same field order
     try:
-        rec_fields = unpack_fields(recovered_bytes, ["msg"])  # type: ignore[arg-type]
+        rec_fields = unpack_fields(recovered_payload, ["msg"])  # type: ignore[arg-type]
         rec_msg = rec_fields.get("msg", "")
-    except Exception:
-        rec_msg = "<decode/parse failed>"
+    except Exception as e:
+        rec_msg = f"<decode/parse failed: {e}>"
+        recovered_payload = b""
 
     # Save small report
     report_path = os.path.join(args.out_dir, "report.txt")
@@ -309,10 +388,10 @@ def main() -> None:
         f.write(f"Input: {args.audio}\n")
         f.write(f"Payload (text): {args.payload}\n")
         f.write(f"Recovered (text): {rec_msg}\n")
-        f.write(f"Embedded bits: {num_bits_embedded}\n")
-        f.write(f"Recovered bytes (hex): {recovered_bytes.hex()}\n")
+        f.write(f"Embedded bytes: {num_bits_embedded}\n")
+        f.write(f"Recovered bytes (hex): {recovered_payload.hex() if recovered_payload else 'N/A'}\n")
         f.write("Files: spectrograms.png, watermarked.wav\n")
-        f.write("Decode note: mirrored training (no RS), planned per 1s EUL on clean audio.\n")
+        f.write("Pipeline: RS(167,125) + interleaving + full psychoacoustic allocation + INN encoding/decoding\n")
 
     print(f"Saved outputs to {args.out_dir}")
     print(f"Recovered text: {rec_msg}")

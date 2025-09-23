@@ -1,7 +1,0 @@
-Input: inference/sample.mp3
-Payload (text): Hello this is soundsafe message
-Recovered (text): HeHnoqWVes isVGm
-Embedded bits: 200
-Recovered bytes (hex): 10522ac9731d82e90db43718c51904d6049310707a97e5a000
-Files: spectrograms.png, watermarked.wav
-Decode note: mirrored training (no RS), planned per 1s EUL on clean audio.

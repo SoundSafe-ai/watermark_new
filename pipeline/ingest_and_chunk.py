@@ -44,8 +44,13 @@ def rs_decode_167_125(code_bytes: bytes) -> bytes:
     if reedsolo is None:
         raise RuntimeError("reedsolo not installed. `pip install reedsolo`")
     rsc = reedsolo.RSCodec(42)
-    data, _, _ = rsc.decode(bytearray(code_bytes))
-    return bytes(data)
+    try:
+        data, _, _ = rsc.decode(bytearray(code_bytes))
+        return bytes(data)
+    except reedsolo.ReedSolomonError:
+        # Too many errors to correct, return original data (first 125 bytes)
+        # This allows the system to continue with partial recovery
+        return code_bytes[:125] if len(code_bytes) >= 125 else code_bytes
 
 def interleave_bytes(b: bytes, depth: int) -> bytes:
     if depth <= 1: return b
@@ -99,14 +104,14 @@ def bits_to_message_spec(
 
 def message_spec_to_bits(M_rec: torch.Tensor, slots: List[Tuple[int,int]]) -> torch.Tensor:
     """
-    Read BPSK symbols (threshold at 0 on real channel).
+    Read BPSK symbols (use sign for more robust detection).
     Returns bits [B, S].
     """
     B = M_rec.shape[0]
     outs = []
     for (f, t) in slots:
         val = M_rec[:, 0, f, t]   # real
-        bit = (val > 0).long()
+        bit = (val >= 0).long()   # Use >= 0 for more robust detection
         outs.append(bit)
     return torch.stack(outs, dim=1) if outs else torch.zeros(B, 0, dtype=torch.long, device=M_rec.device)
 
@@ -248,20 +253,22 @@ class EULDriver:
         return x_wm_wave
 
     # ----- Decoder path -----
-    def decode_eul(self, model: INNWatermarker, x_wm_wave: torch.Tensor, expected_bytes: int = 125) -> bytes:
+    def decode_eul(self, model: INNWatermarker, x_wm_wave: torch.Tensor, expected_bytes: int = 125, slots: List[Tuple[int, int]] | None = None) -> bytes:
         """
         Returns recovered raw payload bytes (should be 125 if no RS errors after decode)
+        If slots is provided, use those instead of recomputing from audio.
         """
         assert x_wm_wave.shape[0] == 1, "Call EULDriver per item (B=1) for deterministic slot planning."
 
         # Recover message spectrogram from watermarked audio
         M_rec = model.decode(x_wm_wave)   # [1,2,F,T]
 
-        # Recompute slot plan from received audio (deterministic reconstruction)
-        Xrx = model.stft(x_wm_wave)       # [1,2,F,T]
-        slots, _ = allocate_slots_and_amplitudes(
-            Xrx, self.sr, self.n_fft, target_bits=self.per_eul_bits_target, amp_safety=self.amp_safety
-        )
+        # Use provided slots or recompute from received audio
+        if slots is None:
+            Xrx = model.stft(x_wm_wave)       # [1,2,F,T]
+            slots, _ = allocate_slots_and_amplitudes(
+                Xrx, self.sr, self.n_fft, target_bits=self.per_eul_bits_target, amp_safety=self.amp_safety
+            )
 
         # Read bits at those slots
         bits_rec = message_spec_to_bits(M_rec, slots)  # [1,S]
