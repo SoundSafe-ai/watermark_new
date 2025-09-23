@@ -136,7 +136,7 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_resample: bool = True
     # Initialize from a prior imperceptibility checkpoint (stage-1)
-    init_from: str | None = "checkpoints/inn_imperc_best.pt"
+    init_from: str | None = "FMA/checkpoints/inn_imperc_best.pt"
     # Limit number of files used (None uses all)
     train_max_files: int | None = 50000
     val_max_files: int | None = 15000
@@ -342,11 +342,7 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
         for i in range(B):
             xi = x[i:i+1]
             if cfg.planner == "gpu":
-                slots, amp_scale = fast_gpu_plan_slots(model, xi)
-            else:
-                slots, amp_scale = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
-            if cfg.planner == "gpu":
-                slots, amp_scale = fast_gpu_plan_slots(model, xi)
+                slots, amp_scale = fast_gpu_plan_slots(model, xi, cfg.target_bits)
             else:
                 slots, amp_scale = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
             S = min(len(slots), cfg.target_bits)
