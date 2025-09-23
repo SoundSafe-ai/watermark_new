@@ -148,14 +148,14 @@ class TrainConfig:
     w_mse: float = 0.25
     w_perc: float = 0.05
     # Symbol settings
-    base_symbol_amp: float = 0.01
-    target_bits: int = 167 * 8  # 1336 bits per 1s chunk (RS(167,125) payload size)
+    base_symbol_amp: float = 0.09  # Will be annealed during training
+    target_bits: int = 1336  # Will be annealed during training (starts at 512)
     # RS and interleaving settings
     use_rs_interleave: bool = True
     rs_payload_bytes: int = 125  # Raw payload size before RS encoding
     rs_interleave_depth: int = 4  # Interleaving depth
     # Planner selection: "gpu" (fast mel-proxy) or "mg" (Moore–Glasberg)
-    planner: str = "gpu"
+    planner: str = "mg"
     # Cache planning per file; re-plan every N epochs
     replan_every: int = 3
 
@@ -539,13 +539,12 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
         with torch.amp.autocast(device_type='cuda', enabled=False):
             rec_vals = torch.zeros(B, S, device=x.device)
             rec_vals[valid] = M_rec[b_idx[valid], 0, f_idx[valid], t_idx[valid]]
-            # Clamp recovered values to prevent extreme MSE
-            rec_vals_clamped = rec_vals.clamp(-1.0, 1.0)
-            logits = rec_vals.clamp(-6.0, 6.0)
+            # Keep unclamped rec_vals for MSE to reflect scale gaps
+            logits = rec_vals.clamp(-6.0, 6.0)  # Clamp only for BCE
             targets01 = bits.float()
             L_bits_ce = F.binary_cross_entropy_with_logits(logits[valid], targets01[valid])
             target_sign = (bits * 2 - 1).float() * cfg.base_symbol_amp * amp
-            L_bits_mse = F.mse_loss(rec_vals_clamped[valid], target_sign[valid])
+            L_bits_mse = F.mse_loss(rec_vals[valid], target_sign[valid])
             perc_out = loss_perc(x.float(), x_wm.float())
             L_perc = perc_out["total_perceptual_loss"]
             L_mfcc = perc_out["mfcc_cos"]
@@ -662,11 +661,52 @@ def main(cfg: TrainConfig) -> None:
     except Exception:
         from torch.cuda.amp import GradScaler  # type: ignore
     scaler = GradScaler(enabled=(cfg.mixed_precision and torch.cuda.is_available()))
+    amp_enabled = cfg.mixed_precision and torch.cuda.is_available()
 
     best_ber = math.inf
     plan_cache: dict = {}
+    prev_amp = cfg.base_symbol_amp  # Track amplitude changes for logging
+    prev_target_bits = cfg.target_bits  # Track target_bits changes for logging
     for epoch in range(1, cfg.epochs + 1):
-        print(f"\nEpoch {epoch}/{cfg.epochs}")
+        # Curriculum learning: anneal symbol amplitude
+        if epoch <= 2:
+            cfg.base_symbol_amp = 0.09
+        elif epoch <= 4:
+            cfg.base_symbol_amp = 0.06
+        else:
+            cfg.base_symbol_amp = 0.03
+
+        # Density curriculum: start with fewer slots, ramp up
+        if epoch == 1:
+            cfg.target_bits = 512
+        elif epoch == 2:
+            cfg.target_bits = 768
+        else:
+            cfg.target_bits = 1336
+
+        # AMP control: disable for first 1-2 epochs, re-enable if BER < 0.3
+        if epoch <= 2:
+            amp_enabled = False
+            scaler = GradScaler(enabled=False)
+        elif epoch >= 3:
+            # Check if we should re-enable AMP based on previous best BER
+            if best_ber < 0.3 and not amp_enabled:
+                amp_enabled = cfg.mixed_precision and torch.cuda.is_available()
+                scaler = GradScaler(enabled=amp_enabled)
+                if amp_enabled:
+                    print(f"Epoch {epoch}: Re-enabling mixed precision (BER={best_ber:.4f} < 0.3)")
+
+        # Log amplitude changes
+        if cfg.base_symbol_amp != prev_amp:
+            print(f"Epoch {epoch}: Symbol amplitude changed to {cfg.base_symbol_amp}")
+            prev_amp = cfg.base_symbol_amp
+
+        # Log target_bits changes
+        if cfg.target_bits != prev_target_bits:
+            print(f"Epoch {epoch}: Target bits changed to {cfg.target_bits}")
+            prev_target_bits = cfg.target_bits
+
+        print(f"\nEpoch {epoch}/{cfg.epochs}" + (" [AMP OFF]" if not amp_enabled else ""))
         tr = train_one_epoch(model, stft_cfg, loss_perc, optimizer, scaler, cfg, train_loader, epoch_idx=epoch, plan_cache=plan_cache)
         print(f"train: obj={tr['obj']:.4f} ber={tr['ber']:.4f} ce={tr['bits_ce']:.4f} mse={tr['bits_mse']:.4f} perc={tr['perc']:.4f} mfcc={tr['mfcc']:.4f}")
         va = validate(model, stft_cfg, loss_perc, cfg, val_loader)
