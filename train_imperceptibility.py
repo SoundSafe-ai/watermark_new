@@ -226,8 +226,11 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
         with torch.amp.autocast(device_type='cuda', enabled=(scaler is not None)):
             x_wm, _ = model.encode(x, m)
             x_wm = match_length(x_wm, x.size(-1))
+            # sanitize to avoid NaNs/Infs propagating into losses
+            x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
             # Decode in AMP for speed
             M_rec = model.decode(x_wm)
+            M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
         # Compute losses in full precision to avoid NaNs from fp16 logs/trigs
         with torch.amp.autocast(device_type='cuda', enabled=False):
             # Imperceptibility (MRSTFT + MFCC + SNR)
@@ -239,12 +242,20 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
             # Total
             loss = cfg.w_perc * Lp["total_perceptual_loss"] + cfg.w_msg_rec * L_msg_rec + cfg.w_msg_amp * L_msg_amp
 
+        # Skip bad batches
+        if not torch.isfinite(loss):
+            continue
+
         if scaler is not None:
             scaler.scale(loss).backward()
+            # unscale before clipping, then clip to stabilize
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         running["total"] += Lp["total_perceptual_loss"].detach().item() * x.size(0)

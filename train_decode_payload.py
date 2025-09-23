@@ -43,6 +43,7 @@ from pipeline.ingest_and_chunk import (
     bits_to_message_spec,
     message_spec_to_bits,
 )
+from pipeline.psychoacoustic import mel_proxy_threshold
 
 # Quiet known warnings
 warnings.filterwarnings(
@@ -134,6 +135,12 @@ class TrainConfig:
     hop: int = 512
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_resample: bool = True
+    # Initialize from a prior imperceptibility checkpoint (stage-1)
+    init_from: str | None = "checkpoints/inn_imperc_best.pt"
+    # Limit number of files used (None uses all)
+    train_max_files: int | None = None
+    val_max_files: int | None = None
+    file_seed: int = 42
     # Loss weights
     w_bits: float = 1.0
     w_mse: float = 0.25
@@ -141,6 +148,8 @@ class TrainConfig:
     # Symbol settings
     base_symbol_amp: float = 0.1
     target_bits: int = 512  # per 1s chunk (<= realistic slot count)
+    # Planner selection: "gpu" (fast mel-proxy) or "mg" (Moore–Glasberg)
+    planner: str = "gpu"
 
 
 def make_bits(batch_size: int, S: int, device) -> torch.Tensor:
@@ -169,6 +178,80 @@ def plan_slots_and_amp(model: INNWatermarker, x_wave: torch.Tensor, sr: int, n_f
     slots, amp_per_slot = allocate_slots_and_amplitudes(X, sr, n_fft, target_bits, amp_safety=1.0)
     # Normalize per-slot amplitude scaling around 1.0 (handled inside allocator)
     return slots, amp_per_slot
+
+
+@torch.no_grad()
+def fast_gpu_plan_slots(model: INNWatermarker, x_wave: torch.Tensor, target_bits: int) -> tuple[list[tuple[int,int]], torch.Tensor]:
+    """
+    GPU planner for training: prioritize bins with high mag/headroom using a mel-proxy threshold.
+    Returns (slots, amp_per_slot_tensor_on_cpu)
+    """
+    X = model.stft(x_wave)  # [1,2,F,T] on device
+    B, _, F, T = X.shape
+    assert B == 1
+    mag = torch.sqrt(torch.clamp(X[:,0]**2 + X[:,1]**2, min=1e-6))  # [1,F,T]
+    thr = mel_proxy_threshold(X, n_mels=64)  # [1,F,T]
+    score = mag / (thr + 1e-6)               # higher score -> more headroom
+    k = int(min(target_bits, F*T))
+    vals, idx = score[0].flatten().topk(k)
+    f = (idx // T).to(torch.int64)
+    t = (idx % T).to(torch.int64)
+    slots: list[tuple[int,int]] = [(int(f[i]), int(t[i])) for i in range(k)]
+    amp = thr[0].flatten()[idx]
+    # normalize median to 1.0
+    med = torch.median(amp)
+    amp = amp / (med + 1e-9)
+    return slots, amp.detach().cpu()
+
+
+@torch.no_grad()
+def build_batch_plan(model: INNWatermarker, x: torch.Tensor, cfg: TrainConfig):
+    """
+    Per-item GPU planning but collated into batch tensors for vectorized loss.
+    Returns dict with f_idx [B,S], t_idx [B,S], amp [B,S], mask [B,S], bits [B,S], S.
+    """
+    B = x.size(0)
+    f_lists: list[list[int]] = []
+    t_lists: list[list[int]] = []
+    amp_lists: list[torch.Tensor] = []
+    S_list: list[int] = []
+    for i in range(B):
+        slots, amp = fast_gpu_plan_slots(model, x[i:i+1], cfg.target_bits)
+        S = min(len(slots), cfg.target_bits)
+        f = [slots[s][0] for s in range(S)]
+        t = [slots[s][1] for s in range(S)]
+        f_lists.append(f)
+        t_lists.append(t)
+        amp_lists.append(amp[:S] if amp.numel() >= S else torch.ones(S, dtype=torch.float32))
+        S_list.append(S)
+    S_max = int(max(S_list) if len(S_list) > 0 else 0)
+    device = x.device
+    if S_max == 0:
+        return {
+            "f_idx": torch.zeros(B, 0, dtype=torch.long, device=device),
+            "t_idx": torch.zeros(B, 0, dtype=torch.long, device=device),
+            "amp": torch.zeros(B, 0, dtype=torch.float32, device=device),
+            "mask": torch.zeros(B, 0, dtype=torch.bool, device=device),
+            "bits": torch.zeros(B, 0, dtype=torch.long, device=device),
+            "S": 0,
+        }
+    f_idx = torch.full((B, S_max), -1, dtype=torch.long, device=device)
+    t_idx = torch.full((B, S_max), -1, dtype=torch.long, device=device)
+    amp = torch.ones(B, S_max, dtype=torch.float32, device=device)
+    mask = torch.zeros(B, S_max, dtype=torch.bool, device=device)
+    for i in range(B):
+        S = S_list[i]
+        if S == 0:
+            continue
+        f_i = torch.tensor(f_lists[i], dtype=torch.long, device=device)
+        t_i = torch.tensor(t_lists[i], dtype=torch.long, device=device)
+        a_i = amp_lists[i].to(device)
+        f_idx[i, :S] = f_i
+        t_idx[i, :S] = t_i
+        amp[i, :S] = a_i
+        mask[i, :S] = True
+    bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
+    return {"f_idx": f_idx, "t_idx": t_idx, "amp": amp, "mask": mask, "bits": bits, "S": S_max}
 
 
 def _maybe_resample_gpu(x: torch.Tensor, sr: torch.Tensor, target_sr: int) -> torch.Tensor:
@@ -201,7 +284,7 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
             perc_sum = 0.0
             for i in range(B):
                 xi = x[i:i+1]
-                slots, amp_scale = plan_slots_and_amp(model, xi, cfg.n_fft, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
+                slots, amp_scale = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
                 S = min(len(slots), cfg.target_bits)
                 if S == 0:
                     continue
@@ -214,9 +297,11 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 # Encode -> Decode
                 x_wm, _ = model.encode(xi, M_spec)
                 x_wm = match_length(x_wm, xi.size(-1))
+                x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0)
                 M_rec = model.decode(x_wm)
+                M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
                 # Loss terms
-                logits = gather_slots(M_rec, slots[:S]) * 8.0
+                logits = gather_slots(M_rec, slots[:S]).clamp(-6.0, 6.0)
                 targets01 = bits.float()
                 ce = F.binary_cross_entropy_with_logits(logits, targets01)
                 target_sign = symbols_from_bits(bits, amp=cfg.base_symbol_amp)
@@ -256,7 +341,14 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
 
         for i in range(B):
             xi = x[i:i+1]
-            slots, amp_scale = plan_slots_and_amp(model, xi, cfg.n_fft, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
+            if cfg.planner == "gpu":
+                slots, amp_scale = fast_gpu_plan_slots(model, xi)
+            else:
+                slots, amp_scale = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
+            if cfg.planner == "gpu":
+                slots, amp_scale = fast_gpu_plan_slots(model, xi)
+            else:
+                slots, amp_scale = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
             S = min(len(slots), cfg.target_bits)
             if S == 0:
                 continue
@@ -270,9 +362,11 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
             with torch.amp.autocast(device_type='cuda', enabled=(scaler is not None)):
                 x_wm, _ = model.encode(xi, M_spec)
                 x_wm = match_length(x_wm, xi.size(-1))
+                x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0)
                 M_rec = model.decode(x_wm)
+                M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
             with torch.amp.autocast(device_type='cuda', enabled=False):
-                logits = gather_slots(M_rec, slots[:S]) * 8.0
+                logits = gather_slots(M_rec, slots[:S]).clamp(-6.0, 6.0)
                 targets01 = bits.float()
                 L_bits_ce = F.binary_cross_entropy_with_logits(logits, targets01)
                 target_sign = symbols_from_bits(bits, amp=cfg.base_symbol_amp)
@@ -283,10 +377,12 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
 
             if scaler is not None:
                 scaler.scale(L_obj).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 L_obj.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
             # logging
@@ -331,6 +427,15 @@ def main(cfg: TrainConfig) -> None:
 
     train_ds = AudioChunkDataset(cfg.data_dir, gpu_resample=(cfg.device=="cuda" and cfg.gpu_resample))
     val_ds = AudioChunkDataset(cfg.val_dir, gpu_resample=(cfg.device=="cuda" and cfg.gpu_resample))
+    # Optionally limit number of files for faster runs
+    if cfg.train_max_files is not None and cfg.train_max_files > 0 and len(train_ds.files) > cfg.train_max_files:
+        rnd = random.Random(cfg.file_seed)
+        rnd.shuffle(train_ds.files)
+        train_ds.files = train_ds.files[:cfg.train_max_files]
+    if cfg.val_max_files is not None and cfg.val_max_files > 0 and len(val_ds.files) > cfg.val_max_files:
+        rnd = random.Random(cfg.file_seed + 1)
+        rnd.shuffle(val_ds.files)
+        val_ds.files = val_ds.files[:cfg.val_max_files]
     print(f"Found {len(train_ds)} training files | {len(val_ds)} validation files")
 
     pin = (cfg.device == "cuda")
@@ -357,6 +462,18 @@ def main(cfg: TrainConfig) -> None:
 
     stft_cfg = {"n_fft": cfg.n_fft, "hop_length": cfg.hop, "win_length": cfg.n_fft}
     model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg=stft_cfg).to(cfg.device)
+    # Warm-start from Stage-1 (imperceptibility) checkpoint if provided
+    if cfg.init_from:
+        if os.path.isfile(cfg.init_from):
+            try:
+                ckpt = torch.load(cfg.init_from, map_location=cfg.device)
+                state = ckpt.get("model_state", ckpt)
+                model.load_state_dict(state, strict=True)
+                print(f"Loaded init weights from '{cfg.init_from}' (epoch={ckpt.get('epoch','?')})")
+            except Exception as e:
+                print(f"Warning: failed to load init_from '{cfg.init_from}': {e}\nTraining from scratch.")
+        else:
+            print(f"Init checkpoint not found: '{cfg.init_from}'. Training from scratch.")
     loss_perc = CombinedPerceptualLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     try:
