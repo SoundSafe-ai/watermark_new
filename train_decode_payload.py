@@ -123,13 +123,13 @@ def match_length(y: torch.Tensor, target_T: int) -> torch.Tensor:
 class TrainConfig:
     data_dir: str = "data/train"
     val_dir: str = "data/val"
-    batch_size: int = 6
+    batch_size: int = 8
     num_workers: int = 2
     epochs: int = 15
-    lr: float = 1e-4
+    lr: float = 5e-4
     weight_decay: float = 1e-5
     mixed_precision: bool = True
-    save_dir: str = "checkpoints"
+    save_dir: str = "decode_payload"
     log_interval: int = 50
     n_fft: int = 1024
     hop: int = 512
@@ -138,11 +138,11 @@ class TrainConfig:
     # Initialize from a prior imperceptibility checkpoint (stage-1)
     init_from: str | None = "checkpoints/inn_imperc_best.pt"
     # Limit number of files used (None uses all)
-    train_max_files: int | None = None
-    val_max_files: int | None = None
+    train_max_files: int | None = 50000
+    val_max_files: int | None = 15000
     file_seed: int = 42
     # Loss weights
-    w_bits: float = 1.0
+    w_bits: float = 0.9
     w_mse: float = 0.25
     w_perc: float = 0.05
     # Symbol settings
