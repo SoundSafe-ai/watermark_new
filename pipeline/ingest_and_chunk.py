@@ -25,6 +25,12 @@ from pipeline.adaptive_bit_allocation import (
     AdaptiveBitAllocator,
     expand_allocation_to_slots,
 )
+from pipeline.acoustic_dna import (
+    seed_from_anchors,
+    permute_slots_with_seed,
+    generate_pn_bits,
+    pilot_correlation,
+)
 
 # -----------------------------
 # Reed–Solomon (RS) helpers
@@ -199,6 +205,8 @@ class EULDriver:
         per_eul_bits_target: int = 167 * 8,  # 1336 bits to match RS(167,125)
         base_symbol_amp: float = 0.1,
         amp_safety: float = 1.0,
+        pilot_fraction: float = 0.08,  # fraction of data budget reserved for pilots (DNA)
+        dna_enabled: bool = True,
     ):
         self.sr = sr
         self.stft = STFT(n_fft=n_fft, hop_length=hop, win_length=n_fft)
@@ -209,6 +217,9 @@ class EULDriver:
         self.per_eul_bits_target = per_eul_bits_target
         self.base_symbol_amp = base_symbol_amp
         self.amp_safety = amp_safety
+        # Pilot configuration (reserve a small budget for pilots)
+        self.pilot_fraction = max(0.0, min(0.25, float(pilot_fraction)))
+        self.dna_enabled = bool(dna_enabled)
 
     # ----- Encoder path -----
     def encode_eul(self, model: INNWatermarker, x_wave: torch.Tensor, payload_bytes: bytes) -> torch.Tensor:
@@ -232,20 +243,61 @@ class EULDriver:
 
         # Analyze current EUL content and allocate slots
         X = model.stft(x_wave)  # [1,2,F,T]
-        slots, amp_per_slot = allocate_slots_and_amplitudes(
-            X, self.sr, self.n_fft, target_bits=min(self.per_eul_bits_target, bits_t.shape[1]),
-            amp_safety=self.amp_safety
-        )
-        S = min(len(slots), bits_t.shape[1])
+        if self.dna_enabled:
+            # Derive Acoustic DNA seed from anchors
+            seed = seed_from_anchors(X)
+            # Reserve pilot budget as a fraction of data budget
+            pilot_bits = int(round(self.pilot_fraction * self.per_eul_bits_target))
+            pilot_bits = max(0, pilot_bits)
+            # Request enough slots for data + pilots
+            requested_bits = min(self.per_eul_bits_target, bits_t.shape[1]) + pilot_bits
+            slots, amp_per_slot = allocate_slots_and_amplitudes(
+                X, self.sr, self.n_fft, target_bits=requested_bits,
+                amp_safety=self.amp_safety
+            )
+            # Content-keyed permutation
+            slots = permute_slots_with_seed(slots, seed)
+            if len(amp_per_slot) == len(slots):
+                paired = list(zip(slots, amp_per_slot))
+                slots, amp_per_slot = [p[0] for p in paired], [p[1] for p in paired]
+            S_total = min(len(slots), requested_bits)
+            S_pilot = min(pilot_bits, S_total)
+            S_data = min(self.per_eul_bits_target, max(0, S_total - S_pilot), bits_t.shape[1])
+            # Generate pilot PN bits deterministically
+            pn_bits = generate_pn_bits(seed, S_pilot)
+        else:
+            # Legacy behavior: no DNA seed, no pilots, no permutation
+            requested_bits = min(self.per_eul_bits_target, bits_t.shape[1])
+            slots, amp_per_slot = allocate_slots_and_amplitudes(
+                X, self.sr, self.n_fft, target_bits=requested_bits,
+                amp_safety=self.amp_safety
+            )
+            S_total = min(len(slots), requested_bits)
+            S_pilot = 0
+            S_data = S_total
 
-        # Build message spectrogram
+        # Build message spectrogram: [PN pilots][data bits]
         F_, T_ = X.shape[-2], X.shape[-1]
+        if S_total <= 0:
+            return x_wave
+        bits_full = torch.zeros(1, S_total, dtype=torch.long, device=x_wave.device)
+        # Fill pilots
+        if self.dna_enabled and S_pilot > 0:
+            for i in range(S_pilot):
+                bits_full[0, i] = int(pn_bits[i])
+        # Fill data
+        for i in range(S_data):
+            bits_full[0, S_pilot + i] = bits_t[0, i]
+        # Build spec
+        amp_vec = None
+        if len(amp_per_slot) >= S_total:
+            amp_vec = np.asarray(amp_per_slot[:S_total], dtype=np.float32)
         M_spec = bits_to_message_spec(
-            bits=bits_t[:, :S],
-            slots=slots[:S],
+            bits=bits_full,
+            slots=slots[:S_total],
             F=F_, T=T_,
             base_amp=self.base_symbol_amp,
-            amp_per_slot=amp_per_slot[:S] if len(amp_per_slot) >= S else None
+            amp_per_slot=amp_vec
         )
 
         # Encode through INN
@@ -263,16 +315,40 @@ class EULDriver:
         # Recover message spectrogram from watermarked audio
         M_rec = model.decode(x_wm_wave)   # [1,2,F,T]
 
-        # Use provided slots or recompute from received audio
-        if slots is None:
-            Xrx = model.stft(x_wm_wave)       # [1,2,F,T]
-            slots, _ = allocate_slots_and_amplitudes(
+        # Recompute slots. If DNA is enabled, use anchors, pilots, and permutation; else legacy path.
+        Xrx = model.stft(x_wm_wave)       # [1,2,F,T]
+        if self.dna_enabled:
+            seed = seed_from_anchors(Xrx)
+            pilot_bits = int(round(self.pilot_fraction * self.per_eul_bits_target))
+            requested_bits = self.per_eul_bits_target + max(0, pilot_bits)
+            slots_rx, _amp_rx = allocate_slots_and_amplitudes(
+                Xrx, self.sr, self.n_fft, target_bits=requested_bits, amp_safety=self.amp_safety
+            )
+            slots_rx = permute_slots_with_seed(slots_rx, seed)
+            S_total = min(len(slots_rx), requested_bits)
+            S_pilot = min(max(0, pilot_bits), S_total)
+            S_data = min(self.per_eul_bits_target, max(0, S_total - S_pilot))
+
+            # Gather raw values at pilot and data slots for sign correction
+            vals = []
+            for (f, t) in slots_rx[:S_total]:
+                vals.append(float(M_rec[0, 0, f, t].item()))
+            vals = np.asarray(vals, dtype=np.float32) if len(vals) > 0 else np.zeros(0, dtype=np.float32)
+            # Compute pilot correlation to determine global sign
+            pn_bits = generate_pn_bits(seed, S_pilot)
+            corr = pilot_correlation(vals[:S_pilot], pn_bits) if S_pilot > 0 else 0.0
+            sign = 1.0 if corr >= 0.0 else -1.0
+
+            # Apply sign to data values and threshold
+            data_vals = sign * vals[S_pilot:S_pilot + S_data]
+            bits_list = [1 if v >= 0.0 else 0 for v in data_vals]
+        else:
+            # Legacy: plan per_eul_bits_target slots and read directly by sign
+            slots_rx, _amp_rx = allocate_slots_and_amplitudes(
                 Xrx, self.sr, self.n_fft, target_bits=self.per_eul_bits_target, amp_safety=self.amp_safety
             )
-
-        # Read bits at those slots
-        bits_rec = message_spec_to_bits(M_rec, slots)  # [1,S]
-        bits_list = bits_rec[0].tolist()
+            bits_rec = message_spec_to_bits(M_rec, slots_rx)  # [1,S]
+            bits_list = bits_rec[0].tolist()
 
         # bits -> bytes
         by = bytearray()

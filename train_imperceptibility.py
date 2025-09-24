@@ -40,6 +40,10 @@ from pipeline.ingest_and_chunk import (
     bits_to_message_spec,
 )
 from pipeline.psychoacoustic import mel_proxy_threshold
+from pipeline.acoustic_dna import (
+    seed_from_anchors,
+    generate_pn_bits,
+)
 from phm.perceptual_frontend import PerceptualFrontend
 from phm.technical_frontend import TechnicalFrontend
 from phm.fusion_head import FusionHead
@@ -163,9 +167,11 @@ class TrainConfig:
     # Payload settings (match decode training)
     target_bits: int = 512  # per 1s chunk
     base_symbol_amp: float = 0.01
+    # Acoustic DNA settings for message construction (keep consistent with decode training)
+    pilot_fraction: float = 0.08
 
 
-def build_message_spec_from_bits(x_wave: torch.Tensor, model: INNWatermarker, target_bits: int, base_amp: float, device) -> torch.Tensor:
+def build_message_spec_from_bits(x_wave: torch.Tensor, model: INNWatermarker, target_bits: int, base_amp: float, device, *, pilot_fraction: float | None = None) -> torch.Tensor:
     """
     Build a proper BPSK message spectrogram using psychoacoustic slot allocation.
     This ensures encoder and decoder training use consistent payload formats.
@@ -177,21 +183,41 @@ def build_message_spec_from_bits(x_wave: torch.Tensor, model: INNWatermarker, ta
         M_spec = torch.zeros(B, 2, F_, T_, device=device)
 
         for i in range(B):
-            # Plan slots for this item
-            slots, amp_per_slot = fast_gpu_plan_slots(model, x_wave[i:i+1], target_bits)
-            S = len(slots)
-
-            # Generate random bits and convert to BPSK symbols
-            bits = make_bits(1, S, device)  # [1, S]
-            signs = (bits * 2 - 1).float() * base_amp  # [-amp, +amp]
-
-            # Apply per-slot amplitude scaling
-            if amp_per_slot.numel() >= S:
-                signs = signs * amp_per_slot[:S].to(device)
-
-            # Place symbols in spectrogram
-            for s, (f, t) in enumerate(slots):
-                M_spec[i, 0, f, t] = signs[0, s]
+            xi = x_wave[i:i+1]
+            # Derive DNA seed from anchors on this item
+            Xi = model.stft(xi)
+            seed = seed_from_anchors(Xi)
+            # Reserve pilots and request enough slots for pilots+data
+            pf = cfg.pilot_fraction if pilot_fraction is None else float(pilot_fraction)
+            S_pilot = int(round(pf * target_bits))
+            S_pilot = max(0, S_pilot)
+            req = target_bits + S_pilot
+            # Plan slots and margin scalers
+            slots, amp_per_slot = fast_gpu_plan_slots(model, xi, req)
+            S = min(len(slots), req)
+            # Apply the same permutation to slots and amplitudes
+            idx = list(range(len(slots)))
+            rng = random.Random(seed)
+            rng.shuffle(idx)
+            slots = [slots[j] for j in idx][:S]
+            if amp_per_slot.numel() > 0:
+                amp_per_slot = amp_per_slot[idx][:S]
+            else:
+                amp_per_slot = torch.ones(S, dtype=torch.float32)
+            # Build bits: [PN pilots][random data]
+            S_p = min(S_pilot, S)
+            S_d = max(0, S - S_p)
+            pn_bits = generate_pn_bits(seed, S_p)
+            data_bits = torch.randint(0, 2, (S_d,), dtype=torch.long, device=device)
+            bits_full = torch.zeros(1, S, dtype=torch.long, device=device)
+            if S_p > 0:
+                bits_full[0, :S_p] = torch.tensor(pn_bits, dtype=torch.long, device=device)
+            if S_d > 0:
+                bits_full[0, S_p:S_p+S_d] = data_bits
+            # Convert to message spectrogram with per-slot amplitude
+            amp_vec = amp_per_slot.detach().cpu().numpy() if isinstance(amp_per_slot, torch.Tensor) else None
+            Mi = bits_to_message_spec(bits_full, slots, F_, T_, base_amp=base_amp, amp_per_slot=amp_vec)
+            M_spec[i:i+1] = Mi
 
         return M_spec
 
@@ -223,7 +249,7 @@ def validate(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, loader: Dat
     with torch.no_grad():
         for batch in loader:
             x = batch.to(device)  # [B,1,T]
-            m = build_message_spec_from_bits(x, model, cfg.target_bits, cfg.base_symbol_amp, device)
+            m = build_message_spec_from_bits(x, model, cfg.target_bits, cfg.base_symbol_amp, device, pilot_fraction=cfg.pilot_fraction)
             x_wm, _ = model.encode(x, m)
             x_wm = match_length(x_wm, x.size(-1))
             L = loss_fn(x, x_wm)
@@ -274,7 +300,7 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
     pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
     for step, batch in pbar:
         x = batch.to(device, non_blocking=True)
-        m = build_message_spec_from_bits(x, model, cfg.target_bits, cfg.base_symbol_amp, device)
+            m = build_message_spec_from_bits(x, model, cfg.target_bits, cfg.base_symbol_amp, device, pilot_fraction=cfg.pilot_fraction)
 
         optimizer.zero_grad(set_to_none=True)
         # Use new torch.amp.autocast API to avoid deprecation warnings

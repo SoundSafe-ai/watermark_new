@@ -30,6 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+import argparse
 import warnings
 import torchaudio
 from torchaudio.transforms import Resample
@@ -39,6 +40,11 @@ import torchaudio.functional as AF
 
 from models.inn_encoder_decoder import INNWatermarker, STFT
 from pipeline.perceptual_losses import CombinedPerceptualLoss
+from pipeline.acoustic_dna import (
+    seed_from_anchors,
+    permute_slots_with_seed,
+    generate_pn_bits,
+)
 from pipeline.ingest_and_chunk import (
     allocate_slots_and_amplitudes,
     bits_to_message_spec,
@@ -138,7 +144,7 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_resample: bool = True
     # Initialize from a prior imperceptibility checkpoint (stage-1)
-    init_from: str | None = None  # Try training from scratch for decode
+    init_from: str | None = "inn_imperc_best.pt"  # Initialize from imperceptibility model
     # Limit number of files used (None uses all)
     train_max_files: int | None = 50000
     val_max_files: int | None = 15000
@@ -158,6 +164,8 @@ class TrainConfig:
     planner: str = "mg"
     # Cache planning per file; re-plan every N epochs
     replan_every: int = 3
+    # Acoustic DNA: fraction of slots reserved for pilot PN (not used in training yet)
+    pilot_fraction: float = 0.08
 
 
 def make_bits(batch_size: int, S: int, device) -> torch.Tensor:
@@ -273,15 +281,48 @@ def build_batch_plan(model: INNWatermarker, x: torch.Tensor, cfg: TrainConfig):
     t_lists: list[list[int]] = []
     amp_lists: list[torch.Tensor] = []
     S_list: list[int] = []
+    bits_lists: list[torch.Tensor] = []
     for i in range(B):
-        slots, amp = fast_gpu_plan_slots(model, x[i:i+1], cfg.target_bits)
-        S = min(len(slots), cfg.target_bits)
+        xi = x[i:i+1]
+        # DNA seed from anchors
+        X = model.stft(xi)
+        seed = seed_from_anchors(X)
+        # Reserve pilots
+        S_pilot = int(round(cfg.pilot_fraction * cfg.target_bits))
+        S_pilot = max(0, S_pilot)
+        req = cfg.target_bits + S_pilot
+        # Plan slots at requested density
+        slots, amp = fast_gpu_plan_slots(model, xi, req)
+        # Content-keyed permutation applied consistently to slots and amp
+        perm_indices = list(range(len(slots)))
+        rng = random.Random(seed)
+        rng.shuffle(perm_indices)
+        S_req = min(len(slots), req)
+        slots = [slots[j] for j in perm_indices][:S_req]
+        if amp.numel() > 0:
+            amp = amp[perm_indices][:S_req]
+        S = min(len(slots), req)
+        # Record indices and amp
         f = [slots[s][0] for s in range(S)]
         t = [slots[s][1] for s in range(S)]
         f_lists.append(f)
         t_lists.append(t)
         amp_lists.append(amp[:S] if amp.numel() >= S else torch.ones(S, dtype=torch.float32))
         S_list.append(S)
+        # Build per-item bit vector [PN | DATA]
+        S_p = min(S_pilot, S)
+        S_d = max(0, S - S_p)
+        pn = torch.tensor(generate_pn_bits(seed, S_p), dtype=torch.long, device=x.device)
+        if cfg.use_rs_interleave:
+            payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
+            encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
+            data_bits = encoded_bits[:S_d] if len(encoded_bits) >= S_d else torch.cat([
+                encoded_bits, torch.zeros(S_d - len(encoded_bits), dtype=torch.long, device=x.device)
+            ])
+        else:
+            data_bits = torch.randint(0, 2, (S_d,), dtype=torch.long, device=x.device)
+        bits_i = torch.cat([pn, data_bits], dim=0) if S > 0 else torch.zeros(0, dtype=torch.long, device=x.device)
+        bits_lists.append(bits_i)
     S_max = int(max(S_list) if len(S_list) > 0 else 0)
     device = x.device
     if S_max == 0:
@@ -308,17 +349,14 @@ def build_batch_plan(model: INNWatermarker, x: torch.Tensor, cfg: TrainConfig):
         t_idx[i, :S] = t_i
         amp[i, :S] = a_i
         mask[i, :S] = True
-    # Generate bits: either random (legacy) or RS-encoded payloads
-    if cfg.use_rs_interleave:
-        bits = torch.zeros(B, S_max, dtype=torch.long, device=device)
-        for i in range(B):
-            payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
-            encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
-            # Truncate or pad to match S_max
-            bit_tensor = encoded_bits[:S_max] if len(encoded_bits) >= S_max else torch.cat([encoded_bits, torch.zeros(S_max - len(encoded_bits), dtype=torch.long, device=device)])
-            bits[i] = bit_tensor
-    else:
-        bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
+    # Assemble batch bit tensor from per-item lists
+    bits = torch.zeros(B, S_max, dtype=torch.long, device=device)
+    for i in range(B):
+        if i < len(bits_lists):
+            bi = bits_lists[i]
+            L = min(S_max, bi.numel())
+            if L > 0:
+                bits[i, :L] = bi[:L]
     return {"f_idx": f_idx, "t_idx": t_idx, "amp": amp, "mask": mask, "bits": bits, "S": S_max}
 
 
@@ -329,20 +367,40 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
     t_lists: list[list[int]] = []
     amp_lists: list[torch.Tensor] = []
     S_list: list[int] = []
+    bits_lists: list[torch.Tensor] = []
     for i in range(B):
         key = (paths[i], cfg.target_bits)
         cached = plan_cache.get(key)
         need_replan = (cached is None) or ((epoch_idx % max(1, cfg.replan_every)) == 0)
+        xi = x[i:i+1]
+        # DNA seed from anchors
+        X = model.stft(xi)
+        seed = seed_from_anchors(X)
+        S_pilot = int(round(cfg.pilot_fraction * cfg.target_bits))
+        S_pilot = max(0, S_pilot)
+        req = cfg.target_bits + S_pilot
         if cfg.planner == "gpu":
-            slots, amp = fast_gpu_plan_slots(model, x[i:i+1], cfg.target_bits)
+            slots, amp = fast_gpu_plan_slots(model, xi, req)
             if need_replan:
                 plan_cache[key] = {"slots": slots}
         else:
             # fallback to CPU MG if requested (not recommended for speed)
-            slots, amp = plan_slots_and_amp(model, x[i:i+1], TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
+            slots, amp = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, req, cfg.base_symbol_amp)
             if need_replan:
                 plan_cache[key] = {"slots": slots}
+        # Content-keyed permutation applied to both slots and amp
+        perm_indices = list(range(len(slots)))
+        rng = random.Random(seed)
+        rng.shuffle(perm_indices)
+        S_req = min(len(slots), req)
+        slots = [slots[j] for j in perm_indices][:S_req]
+        if isinstance(amp, torch.Tensor) and amp.numel() > 0:
+            amp = amp[perm_indices][:S_req]
+        elif isinstance(amp, np.ndarray) and len(amp) > 0:
+            amp = np.asarray([amp[j] for j in perm_indices][:S_req], dtype=np.float32)
         S = min(len(slots), cfg.target_bits)
+        # Update S to requested with pilots
+        S = min(len(slots), req)
         f_lists.append([slots[s][0] for s in range(S)])
         t_lists.append([slots[s][1] for s in range(S)])
         # Ensure amp is a torch.Tensor
@@ -352,6 +410,20 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
             amp_tensor = amp[:S] if amp.numel() >= S else torch.ones(S, dtype=torch.float32)
         amp_lists.append(amp_tensor)
         S_list.append(S)
+        # Build per-item bits with pilots
+        S_p = min(S_pilot, S)
+        S_d = max(0, S - S_p)
+        pn = torch.tensor(generate_pn_bits(seed, S_p), dtype=torch.long, device=x.device)
+        if cfg.use_rs_interleave:
+            payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
+            encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
+            data_bits = encoded_bits[:S_d] if len(encoded_bits) >= S_d else torch.cat([
+                encoded_bits, torch.zeros(S_d - len(encoded_bits), dtype=torch.long, device=x.device)
+            ])
+        else:
+            data_bits = torch.randint(0, 2, (S_d,), dtype=torch.long, device=x.device)
+        bits_i = torch.cat([pn, data_bits], dim=0) if S > 0 else torch.zeros(0, dtype=torch.long, device=x.device)
+        bits_lists.append(bits_i)
 
     S_max = int(max(S_list) if len(S_list) > 0 else 0)
     device = x.device
@@ -377,17 +449,14 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
         if i < len(amp_lists):
             amp[i, :S] = amp_lists[i][:S].to(device)
         mask[i, :S] = True
-    # Generate bits: either random (legacy) or RS-encoded payloads
-    if cfg.use_rs_interleave:
-        bits = torch.zeros(B, S_max, dtype=torch.long, device=device)
-        for i in range(B):
-            payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
-            encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
-            # Truncate or pad to match S_max
-            bit_tensor = encoded_bits[:S_max] if len(encoded_bits) >= S_max else torch.cat([encoded_bits, torch.zeros(S_max - len(encoded_bits), dtype=torch.long, device=device)])
-            bits[i] = bit_tensor
-    else:
-        bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
+    # Assemble bits from per-item lists
+    bits = torch.zeros(B, S_max, dtype=torch.long, device=device)
+    for i in range(B):
+        if i < len(bits_lists):
+            bi = bits_lists[i]
+            L = min(S_max, bi.numel())
+            if L > 0:
+                bits[i, :L] = bi[:L]
     return {"f_idx": f_idx, "t_idx": t_idx, "amp": amp, "mask": mask, "bits": bits, "S": S_max}
 
 
@@ -424,20 +493,38 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 xi = x[i:i+1]
                 # Use same planning method as training
                 if cfg.planner == "gpu":
-                    slots, amp_scale = fast_gpu_plan_slots(model, xi, cfg.target_bits)
+                    # DNA seed + requested slots with pilots
+                    X = model.stft(xi)
+                    seed = seed_from_anchors(X)
+                    S_pilot = int(round(cfg.pilot_fraction * cfg.target_bits))
+                    S_pilot = max(0, S_pilot)
+                    req = cfg.target_bits + S_pilot
+                    slots, amp_scale = fast_gpu_plan_slots(model, xi, req)
+                    slots = permute_slots_with_seed(slots, seed)
                 else:
-                    slots, amp_scale = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
-                S = min(len(slots), cfg.target_bits)
+                    X = model.stft(xi)
+                    seed = seed_from_anchors(X)
+                    S_pilot = int(round(cfg.pilot_fraction * cfg.target_bits))
+                    S_pilot = max(0, S_pilot)
+                    req = cfg.target_bits + S_pilot
+                    slots, amp_scale = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, req, cfg.base_symbol_amp)
+                    slots = permute_slots_with_seed(slots, seed)
+                S = min(len(slots), req)
                 if S == 0:
                     continue
-                # Generate bits: either random or RS-encoded
+                # Generate bits with pilots
+                S_p = min(S_pilot, S)
+                S_d = max(0, S - S_p)
+                pn = torch.tensor(generate_pn_bits(seed, S_p), dtype=torch.long, device=xi.device)
                 if cfg.use_rs_interleave:
                     payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
                     encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
-                    bits = encoded_bits[:S].unsqueeze(0) if len(encoded_bits) >= S else torch.cat([encoded_bits, torch.zeros(S - len(encoded_bits), dtype=torch.long)]).unsqueeze(0)
-                    bits = bits.to(xi.device)
+                    data_bits = encoded_bits[:S_d] if len(encoded_bits) >= S_d else torch.cat([
+                        encoded_bits, torch.zeros(S_d - len(encoded_bits), dtype=torch.long, device=xi.device)
+                    ])
                 else:
-                    bits = make_bits(1, S, xi.device)
+                    data_bits = torch.randint(0, 2, (S_d,), dtype=torch.long, device=xi.device)
+                bits = torch.cat([pn, data_bits], dim=0).unsqueeze(0)
                 # Build message spec
                 X = model.stft(xi)
                 F_, T_ = X.shape[-2], X.shape[-1]
@@ -463,7 +550,7 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 perc_out = loss_perc(xi, x_wm)
                 perc = perc_out["total_perceptual_loss"]
                 mfcc = perc_out["mfcc_cos"]
-                # BER
+                # BER (includes pilots and data)
                 pred_bits = (rec_vals > 0).long()
                 ber = (pred_bits != bits).float().mean()
                 bers.append(float(ber))
@@ -471,10 +558,9 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 # Payload BER (if using RS)
                 if cfg.use_rs_interleave:
                     try:
-                        # Decode the recovered bits back to payload
-                        recovered_payload = decode_payload_with_rs(pred_bits.squeeze(0), cfg.rs_interleave_depth, cfg.rs_payload_bytes)
-                        # Compare with original payload
-                        original_payload = decode_payload_with_rs(bits.squeeze(0), cfg.rs_interleave_depth, cfg.rs_payload_bytes)
+                        # Skip pilot bits for payload decode
+                        recovered_payload = decode_payload_with_rs(pred_bits.squeeze(0)[S_p:], cfg.rs_interleave_depth, cfg.rs_payload_bytes)
+                        original_payload = decode_payload_with_rs(bits.squeeze(0)[S_p:], cfg.rs_interleave_depth, cfg.rs_payload_bytes)
                         payload_ber = sum(b1 != b2 for b1, b2 in zip(recovered_payload, original_payload)) / len(original_payload) if original_payload else 1.0
                     except:
                         payload_ber = 1.0  # Failed decode
@@ -739,7 +825,12 @@ def main(cfg: TrainConfig) -> None:
 
 
 if __name__ == "__main__":
+    # Optional CLI to override a few config fields
+    parser = argparse.ArgumentParser(description="Train decode-focused INN with optional Acoustic DNA settings")
+    parser.add_argument("--pilot_fraction", type=float, default=0.08, help="Fraction of planned bits reserved for pilots (not used yet)")
+    args = parser.parse_args()
     cfg = TrainConfig()
+    cfg.pilot_fraction = args.pilot_fraction
     main(cfg)
 
 

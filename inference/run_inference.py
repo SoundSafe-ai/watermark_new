@@ -21,6 +21,8 @@ from pipeline.payload_codec import pack_fields, unpack_fields
 from pipeline.psychoacoustic import mel_proxy_threshold
 from pipeline.ingest_and_chunk import (
     EULDriver,
+    allocate_slots_and_amplitudes,
+    message_spec_to_bits,
     rs_encode_167_125,
     rs_decode_167_125,
     interleave_bytes,
@@ -224,18 +226,15 @@ def encode_full_audio_eul_driver(model: INNWatermarker, x_full: torch.Tensor, sr
 
 def decode_full_audio_eul_driver(model: INNWatermarker, x_wm_full: torch.Tensor, sr: int, eul_driver: EULDriver, num_bytes_embedded: int) -> bytes:
     """
-    Decode watermark from entire audio using EULDriver (includes RS decoding and full psychoacoustic allocation).
+    Decode watermark from entire audio using EULDriver with Acoustic DNA pilots and slot mapping.
     Returns recovered payload bytes.
     """
     B, C, T = x_wm_full.shape
     assert B == 1 and C == 1
 
     recovered_chunks = []
-    bytes_cursor = 0
-
-    # Calculate how many chunks we need to process
-    # RS encoding expands payload, so we need ceil(num_bytes_embedded / 125) chunks
-    chunks_needed = (num_bytes_embedded + 124) // 125  # Ceiling division
+    # RS expands 125B -> 167B, but we embed per-EUL fixed 125B pre-RS payload
+    chunks_needed = (num_bytes_embedded + 124) // 125
 
     chunk_idx = 0
     for (s, e) in chunk_indices(T, sr, eul_seconds=1.0):
@@ -243,24 +242,16 @@ def decode_full_audio_eul_driver(model: INNWatermarker, x_wm_full: torch.Tensor,
             break
 
         x_wm_seg = match_length(x_wm_full[:, :, s:e], int(sr * 1.0))
-
-        # Use EULDriver for this chunk
         try:
             chunk_bytes = eul_driver.decode_eul(model, x_wm_seg, expected_bytes=125)
             recovered_chunks.append(chunk_bytes)
-            bytes_cursor += len(chunk_bytes)
             chunk_idx += 1
-            print(f"Successfully decoded chunk {chunk_idx}/{chunks_needed} at {s}-{e}s: {len(chunk_bytes)} bytes")
-            if all(b == 0 for b in chunk_bytes):
-                print("WARNING: All decoded bytes are zero - bit recovery likely failed!")
+            print(f"Decoded chunk {chunk_idx}/{chunks_needed} at {s}-{e}s: {len(chunk_bytes)} bytes")
         except Exception as e:
-            print(f"Warning: Failed to decode chunk {chunk_idx+1} at {s}-{e}s: {e}")
-            # For failed chunks, add zero bytes as fallback
+            print(f"Warning: EUL decode failed at {s}-{e}s: {e}")
             recovered_chunks.append(b'\x00' * 125)
-            bytes_cursor += 125
             chunk_idx += 1
 
-    # Concatenate recovered chunks and trim to original payload size
     recovered_payload = b''.join(recovered_chunks)
     return recovered_payload[:num_bytes_embedded]
 
@@ -326,6 +317,7 @@ def main() -> None:
     parser.add_argument("--out_dir", type=str, default="inference_outputs", help="Directory to save outputs")
     parser.add_argument("--device", type=str, default=None, help="cuda or cpu (auto if None)")
     parser.add_argument("--base_symbol_amp", type=float, default=0.2, help="Symbol amplitude used for BPSK embed (increased for better recovery)")
+    parser.add_argument("--pilot_fraction", type=float, default=0.08, help="Fraction of per-EUL bit budget reserved for pilot PN (0.0-0.25). Typical 0.05-0.12; higher fraction reduces payload slightly but improves robustness.")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -354,6 +346,7 @@ def main() -> None:
         per_eul_bits_target=167 * 8,  # 1336 bits for RS(167,125)
         base_symbol_amp=args.base_symbol_amp,
         amp_safety=1.0,
+        pilot_fraction=args.pilot_fraction,
     )
 
     # Encode using EULDriver (includes RS encoding and full psychoacoustic allocation)
