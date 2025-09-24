@@ -255,11 +255,8 @@ class EULDriver:
                 X, self.sr, self.n_fft, target_bits=requested_bits,
                 amp_safety=self.amp_safety
             )
-            # Content-keyed permutation
-            slots = permute_slots_with_seed(slots, seed)
-            if len(amp_per_slot) == len(slots):
-                paired = list(zip(slots, amp_per_slot))
-                slots, amp_per_slot = [p[0] for p in paired], [p[1] for p in paired]
+            # Content-keyed permutation (slots + per-slot amplitude kept aligned)
+            slots, amp_per_slot = permute_slots_with_seed(slots, seed, values=amp_per_slot)
             S_total = min(len(slots), requested_bits)
             S_pilot = min(pilot_bits, S_total)
             S_data = min(self.per_eul_bits_target, max(0, S_total - S_pilot), bits_t.shape[1])
@@ -321,18 +318,20 @@ class EULDriver:
             seed = seed_from_anchors(Xrx)
             pilot_bits = int(round(self.pilot_fraction * self.per_eul_bits_target))
             requested_bits = self.per_eul_bits_target + max(0, pilot_bits)
-            slots_rx, _amp_rx = allocate_slots_and_amplitudes(
+            slots_rx, amp_rx = allocate_slots_and_amplitudes(
                 Xrx, self.sr, self.n_fft, target_bits=requested_bits, amp_safety=self.amp_safety
             )
-            slots_rx = permute_slots_with_seed(slots_rx, seed)
+            slots_rx, amp_rx = permute_slots_with_seed(slots_rx, seed, values=amp_rx)
             S_total = min(len(slots_rx), requested_bits)
             S_pilot = min(max(0, pilot_bits), S_total)
             S_data = min(self.per_eul_bits_target, max(0, S_total - S_pilot))
 
             # Gather raw values at pilot and data slots for sign correction
             vals = []
-            for (f, t) in slots_rx[:S_total]:
-                vals.append(float(M_rec[0, 0, f, t].item()))
+            for idx, (f, t) in enumerate(slots_rx[:S_total]):
+                scale = float(amp_rx[idx]) if idx < len(amp_rx) and amp_rx[idx] is not None else 1.0
+                denom = self.base_symbol_amp * max(scale, 1e-6)
+                vals.append(float(M_rec[0, 0, f, t].item()) / denom)
             vals = np.asarray(vals, dtype=np.float32) if len(vals) > 0 else np.zeros(0, dtype=np.float32)
             # Compute pilot correlation to determine global sign
             pn_bits = generate_pn_bits(seed, S_pilot)

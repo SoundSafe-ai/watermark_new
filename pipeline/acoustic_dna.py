@@ -82,15 +82,51 @@ def seed_from_anchors(X_ri: torch.Tensor) -> int:
     return seed_from_signature(sig)
 
 
-def permute_slots_with_seed(slots: Sequence[Tuple[int, int]], seed: int) -> List[Tuple[int, int]]:
+def permute_slots_with_seed(
+    slots: Sequence[Tuple[int, int]],
+    seed: int,
+    *,
+    values: Sequence[float]
+    | Sequence[np.ndarray]
+    | Sequence[torch.Tensor]
+    | np.ndarray
+    | torch.Tensor
+    | None = None,
+) -> List[Tuple[int, int]] | tuple[List[Tuple[int, int]], object]:
     """
     Deterministically shuffle slot order using the provided seed.
-    This ensures encoder and decoder agree on the same mapping given shared content.
+
+    When ``values`` is provided, it is permuted with the exact same shuffling
+    pattern to keep auxiliary metadata (e.g. per-slot amplitudes) aligned with
+    the slots selected during encoding. The helper returns either just the
+    permuted slot list or a ``(slots, values)`` tuple depending on the caller's
+    needs.
     """
-    slots_list = list(slots)
+
+    indices = list(range(len(slots)))
     rng = random.Random(seed)
-    rng.shuffle(slots_list)
-    return slots_list
+    rng.shuffle(indices)
+
+    perm_slots = [slots[i] for i in indices]
+    if values is None:
+        return perm_slots
+
+    if isinstance(values, torch.Tensor):
+        flat = values.flatten()
+        take = min(len(flat), len(perm_slots))
+        perm_tensor = flat[torch.tensor(indices[:take], device=flat.device)]
+        return perm_slots[:take], perm_tensor
+
+    if isinstance(values, np.ndarray):
+        flat = values.reshape(-1)
+        take = min(len(flat), len(perm_slots))
+        perm_arr = flat[np.array(indices[:take], dtype=np.int64)]
+        return perm_slots[:take], perm_arr
+
+    values_list = list(values)
+    take = min(len(values_list), len(perm_slots))
+    perm_values = [values_list[i] for i in indices[:take]]
+    return perm_slots[:take], perm_values
 
 
 def generate_pn_bits(seed: int, length: int) -> List[int]:

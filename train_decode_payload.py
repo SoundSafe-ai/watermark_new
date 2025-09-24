@@ -44,11 +44,11 @@ from pipeline.acoustic_dna import (
     seed_from_anchors,
     permute_slots_with_seed,
     generate_pn_bits,
+    pilot_correlation,
 )
 from pipeline.ingest_and_chunk import (
     allocate_slots_and_amplitudes,
     bits_to_message_spec,
-    message_spec_to_bits,
 )
 from pipeline.psychoacoustic import mel_proxy_threshold
 from pipeline.ingest_and_chunk import rs_encode_167_125, rs_decode_167_125, interleave_bytes, deinterleave_bytes
@@ -293,21 +293,19 @@ def build_batch_plan(model: INNWatermarker, x: torch.Tensor, cfg: TrainConfig):
         req = cfg.target_bits + S_pilot
         # Plan slots at requested density
         slots, amp = fast_gpu_plan_slots(model, xi, req)
-        # Content-keyed permutation applied consistently to slots and amp
-        perm_indices = list(range(len(slots)))
-        rng = random.Random(seed)
-        rng.shuffle(perm_indices)
-        S_req = min(len(slots), req)
-        slots = [slots[j] for j in perm_indices][:S_req]
-        if amp.numel() > 0:
-            amp = amp[perm_indices][:S_req]
+        slots, amp = permute_slots_with_seed(slots, seed, values=amp)
         S = min(len(slots), req)
         # Record indices and amp
         f = [slots[s][0] for s in range(S)]
         t = [slots[s][1] for s in range(S)]
         f_lists.append(f)
         t_lists.append(t)
-        amp_lists.append(amp[:S] if amp.numel() >= S else torch.ones(S, dtype=torch.float32))
+        if isinstance(amp, torch.Tensor):
+            amp_lists.append(amp[:S] if amp.numel() >= S else torch.ones(S, dtype=torch.float32))
+        elif isinstance(amp, np.ndarray):
+            amp_lists.append(torch.from_numpy(amp[:S] if len(amp) >= S else np.ones(S, dtype=np.float32)))
+        else:
+            amp_lists.append(torch.tensor(list(amp)[:S], dtype=torch.float32) if len(amp) >= S else torch.ones(S, dtype=torch.float32))
         S_list.append(S)
         # Build per-item bit vector [PN | DATA]
         S_p = min(S_pilot, S)
@@ -389,25 +387,17 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
             if need_replan:
                 plan_cache[key] = {"slots": slots}
         # Content-keyed permutation applied to both slots and amp
-        perm_indices = list(range(len(slots)))
-        rng = random.Random(seed)
-        rng.shuffle(perm_indices)
-        S_req = min(len(slots), req)
-        slots = [slots[j] for j in perm_indices][:S_req]
-        if isinstance(amp, torch.Tensor) and amp.numel() > 0:
-            amp = amp[perm_indices][:S_req]
-        elif isinstance(amp, np.ndarray) and len(amp) > 0:
-            amp = np.asarray([amp[j] for j in perm_indices][:S_req], dtype=np.float32)
-        S = min(len(slots), cfg.target_bits)
-        # Update S to requested with pilots
+        slots, amp = permute_slots_with_seed(slots, seed, values=amp)
         S = min(len(slots), req)
         f_lists.append([slots[s][0] for s in range(S)])
         t_lists.append([slots[s][1] for s in range(S)])
         # Ensure amp is a torch.Tensor
-        if isinstance(amp, np.ndarray):
+        if isinstance(amp, torch.Tensor):
+            amp_tensor = amp[:S] if amp.numel() >= S else torch.ones(S, dtype=torch.float32)
+        elif isinstance(amp, np.ndarray):
             amp_tensor = torch.from_numpy(amp[:S] if len(amp) >= S else np.ones(S, dtype=np.float32))
         else:
-            amp_tensor = amp[:S] if amp.numel() >= S else torch.ones(S, dtype=torch.float32)
+            amp_tensor = torch.tensor(list(amp)[:S], dtype=torch.float32) if len(amp) >= S else torch.ones(S, dtype=torch.float32)
         amp_lists.append(amp_tensor)
         S_list.append(S)
         # Build per-item bits with pilots
@@ -500,7 +490,7 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                     S_pilot = max(0, S_pilot)
                     req = cfg.target_bits + S_pilot
                     slots, amp_scale = fast_gpu_plan_slots(model, xi, req)
-                    slots = permute_slots_with_seed(slots, seed)
+                    slots, amp_scale = permute_slots_with_seed(slots, seed, values=amp_scale)
                 else:
                     X = model.stft(xi)
                     seed = seed_from_anchors(X)
@@ -508,7 +498,7 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                     S_pilot = max(0, S_pilot)
                     req = cfg.target_bits + S_pilot
                     slots, amp_scale = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, req, cfg.base_symbol_amp)
-                    slots = permute_slots_with_seed(slots, seed)
+                    slots, amp_scale = permute_slots_with_seed(slots, seed, values=amp_scale)
                 S = min(len(slots), req)
                 if S == 0:
                     continue
@@ -530,9 +520,15 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 F_, T_ = X.shape[-2], X.shape[-1]
                 # For validation, we don't have per-slot amplitude tensor, so use the scale vector directly
                 if isinstance(amp_scale, torch.Tensor):
-                    amp_vec = amp_scale[:S].cpu().numpy() if amp_scale.numel() >= S else np.ones(S, dtype=np.float32)
+                    amp_used = amp_scale[:S] if amp_scale.numel() >= S else torch.ones(S, dtype=torch.float32)
+                    amp_vec = amp_used.cpu().numpy()
+                elif isinstance(amp_scale, np.ndarray):
+                    amp_used = torch.from_numpy(amp_scale[:S] if len(amp_scale) >= S else np.ones(S, dtype=np.float32))
+                    amp_vec = amp_used.numpy()
                 else:
-                    amp_vec = amp_scale[:S] if len(amp_scale) >= S else np.ones(S, dtype=np.float32)
+                    amp_list = list(amp_scale)[:S] if len(amp_scale) >= S else [1.0] * S
+                    amp_used = torch.tensor(amp_list, dtype=torch.float32)
+                    amp_vec = amp_used.numpy()
                 M_spec = bits_to_message_spec(bits, slots[:S], F_, T_, base_amp=cfg.base_symbol_amp, amp_per_slot=amp_vec)
                 # Encode -> Decode
                 x_wm, _ = model.encode(xi, M_spec)
@@ -550,9 +546,16 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 perc_out = loss_perc(xi, x_wm)
                 perc = perc_out["total_perceptual_loss"]
                 mfcc = perc_out["mfcc_cos"]
-                # BER (includes pilots and data)
-                pred_bits = (rec_vals > 0).long()
-                ber = (pred_bits != bits).float().mean()
+                # BER (includes pilots and data) using pilot-assisted sign correction
+                denom = cfg.base_symbol_amp * torch.clamp(amp_used.to(rec_vals.device), min=1e-6)
+                norm_vals = (rec_vals / denom).detach().cpu().numpy().reshape(-1)
+                pn_bits = generate_pn_bits(seed, S_p)
+                corr = pilot_correlation(norm_vals[:S_p], pn_bits) if S_p > 0 else 0.0
+                sign = 1.0 if corr >= 0 else -1.0
+                signed_vals = sign * norm_vals
+                pred_bits_np = np.array([1 if v >= 0 else 0 for v in signed_vals], dtype=np.int64)
+                pred_bits = torch.from_numpy(pred_bits_np).to(bits.device).unsqueeze(0)
+                ber = (pred_bits != bits.long()).float().mean()
                 bers.append(float(ber))
 
                 # Payload BER (if using RS)
@@ -647,7 +650,25 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
             optimizer.step()
 
         with torch.no_grad():
-            pred_bits = (rec_vals > 0).long()
+            pred_bits = torch.zeros_like(bits)
+            base_amp = cfg.base_symbol_amp
+            pilot_slots = int(round(cfg.pilot_fraction * cfg.target_bits))
+            for i in range(B):
+                mask_i = mask[i]
+                S_i = int(mask_i.sum().item())
+                if S_i == 0:
+                    continue
+                amp_i = amp[i, :S_i]
+                denom = base_amp * torch.clamp(amp_i, min=1e-6)
+                rec_i = rec_vals[i, :S_i] / denom
+                rec_np = rec_i.detach().cpu().numpy()
+                S_p_i = min(pilot_slots, S_i)
+                pn_bits = bits[i, :S_p_i].detach().cpu().numpy().astype(int)
+                corr = pilot_correlation(rec_np[:S_p_i], pn_bits) if S_p_i > 0 else 0.0
+                sign = 1.0 if corr >= 0 else -1.0
+                signed = sign * rec_np
+                pred = torch.tensor([1 if v >= 0 else 0 for v in signed], device=bits.device, dtype=torch.long)
+                pred_bits[i, :S_i] = pred
             ber = (pred_bits[valid] != bits[valid]).float().mean()
             running["obj"] += float(L_obj) * B
             running["ber"] += float(ber) * B
