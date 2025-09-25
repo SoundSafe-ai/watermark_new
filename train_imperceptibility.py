@@ -81,7 +81,8 @@ def fast_gpu_plan_slots(model: INNWatermarker, x_wave: torch.Tensor, target_bits
     GPU planner for training: prioritize bins with high mag/headroom using a mel-proxy threshold.
     Returns (slots, amp_per_slot_tensor_on_cpu)
     """
-    X = model.stft(x_wave)  # [1,2,F,T] on device
+    underlying_model = model.module if hasattr(model, "module") else model
+    X = underlying_model.stft(x_wave)  # [1,2,F,T] on device
     B, _, F, T = X.shape
     assert B == 1
     mag = torch.sqrt(torch.clamp(X[:,0]**2 + X[:,1]**2, min=1e-6))  # [1,F,T]
@@ -174,8 +175,9 @@ def build_message_spec_from_bits(x_wave: torch.Tensor, model: INNWatermarker, ta
     This ensures encoder and decoder training use consistent payload formats.
     """
     with torch.no_grad():
+        underlying_model = model.module if hasattr(model, "module") else model
         B = x_wave.size(0)
-        X = model.stft(x_wave)  # [B,2,F,T]
+        X = underlying_model.stft(x_wave)  # [B,2,F,T]
         F_, T_ = X.shape[-2], X.shape[-1]
         M_spec = torch.zeros(B, 2, F_, T_, device=device)
 
@@ -236,7 +238,8 @@ def validate(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, loader: Dat
             metrics["snr"] += L["snr"].detach().item() * x.size(0)
 
             # PHM metrics (no grad)
-            X_ri = model.stft(x_wm)  # [B,2,F,T]
+            underlying_model = model.module if hasattr(model, "module") else model
+            X_ri = underlying_model.stft(x_wm)  # [B,2,F,T]
             M_rec = model.decode(x_wm)  # [B,2,F,T]
             # Build 8-feature telemetry sequence [B,T,8]
             mag = torch.sqrt(torch.clamp(X_ri[:,0]**2 + X_ri[:,1]**2, min=1e-9))  # [B,F,T]
@@ -334,11 +337,12 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
         running["mfcc"] += Lp["mfcc_cos"].detach().item() * x.size(0)
         running["snr"] += Lp["snr"].detach().item() * x.size(0)
 
-        # PHM telemetry + metrics for logging (compute every k steps to save time)
+            # PHM telemetry + metrics for logging (compute every k steps to save time)
         phm_every = 5
         if (step % phm_every) == 0:
             with torch.no_grad():
-                X_ri = model.stft(x_wm)
+                underlying_model = model.module if hasattr(model, "module") else model
+                X_ri = underlying_model.stft(x_wm)
                 mag = torch.sqrt(torch.clamp(X_ri[:,0]**2 + X_ri[:,1]**2, min=1e-6))
                 conf = torch.sigmoid(torch.abs(M_rec[:,0]))
                 softbit_conf = conf.mean(dim=1).unsqueeze(-1)

@@ -17,6 +17,6 @@ TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 exec "${TORCHRUN_BIN}" \
   --nproc_per_node="${NPROC_PER_NODE}" \
   --master_port="${MASTER_PORT}" \
-  train_decode_payload.py
+  watermark_new/train_decode_payload.py
 
 

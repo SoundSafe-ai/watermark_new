@@ -235,7 +235,8 @@ def gather_slots(M: torch.Tensor, slots: List[Tuple[int, int]]) -> torch.Tensor:
 @torch.no_grad()
 def plan_slots_and_amp(model: INNWatermarker, x_wave: torch.Tensor, sr: int, n_fft: int, target_bits: int, base_amp: float):
     # Plan on clean audio to avoid label leakage
-    X = model.stft(x_wave)  # [B,2,F,T]
+    underlying_model = model.module if hasattr(model, "module") else model
+    X = underlying_model.stft(x_wave)  # [B,2,F,T]
     assert X.size(0) == 1, "Call per item for deterministic plan"
     slots, amp_per_slot = allocate_slots_and_amplitudes(X, sr, n_fft, target_bits, amp_safety=1.0)
     # Normalize per-slot amplitude scaling around 1.0 (handled inside allocator)
@@ -248,7 +249,8 @@ def fast_gpu_plan_slots(model: INNWatermarker, x_wave: torch.Tensor, target_bits
     GPU planner for training: prioritize bins with high mag/headroom using a mel-proxy threshold.
     Returns (slots, amp_per_slot_tensor_on_cpu)
     """
-    X = model.stft(x_wave)  # [1,2,F,T] on device
+    underlying_model = model.module if hasattr(model, "module") else model
+    X = underlying_model.stft(x_wave)  # [1,2,F,T] on device
     B, _, F, T = X.shape
     assert B == 1
     mag = torch.sqrt(torch.clamp(X[:,0]**2 + X[:,1]**2, min=1e-6))  # [1,F,T]
