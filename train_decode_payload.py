@@ -234,9 +234,9 @@ def gather_slots(M: torch.Tensor, slots: List[Tuple[int, int]]) -> torch.Tensor:
 
 @torch.no_grad()
 def plan_slots_and_amp(model: INNWatermarker, x_wave: torch.Tensor, sr: int, n_fft: int, target_bits: int, base_amp: float):
+    model = getattr(model, "module", model)
     # Plan on clean audio to avoid label leakage
-    underlying_model = model.module if hasattr(model, "module") else model
-    X = underlying_model.stft(x_wave)  # [B,2,F,T]
+    X = model.stft(x_wave)  # [B,2,F,T]
     assert X.size(0) == 1, "Call per item for deterministic plan"
     slots, amp_per_slot = allocate_slots_and_amplitudes(X, sr, n_fft, target_bits, amp_safety=1.0)
     # Normalize per-slot amplitude scaling around 1.0 (handled inside allocator)
@@ -245,12 +245,12 @@ def plan_slots_and_amp(model: INNWatermarker, x_wave: torch.Tensor, sr: int, n_f
 
 @torch.no_grad()
 def fast_gpu_plan_slots(model: INNWatermarker, x_wave: torch.Tensor, target_bits: int) -> tuple[list[tuple[int,int]], torch.Tensor]:
+    model = getattr(model, "module", model)
     """
     GPU planner for training: prioritize bins with high mag/headroom using a mel-proxy threshold.
     Returns (slots, amp_per_slot_tensor_on_cpu)
     """
-    underlying_model = model.module if hasattr(model, "module") else model
-    X = underlying_model.stft(x_wave)  # [1,2,F,T] on device
+    X = model.stft(x_wave)  # [1,2,F,T] on device
     B, _, F, T = X.shape
     assert B == 1
     mag = torch.sqrt(torch.clamp(X[:,0]**2 + X[:,1]**2, min=1e-6))  # [1,F,T]
@@ -274,6 +274,7 @@ def build_batch_plan(model: INNWatermarker, x: torch.Tensor, cfg: TrainConfig):
     Per-item GPU planning but collated into batch tensors for vectorized loss.
     Returns dict with f_idx [B,S], t_idx [B,S], amp [B,S], mask [B,S], bits [B,S], S.
     """
+    model = getattr(model, "module", model)
     B = x.size(0)
     f_lists: list[list[int]] = []
     t_lists: list[list[int]] = []
@@ -330,6 +331,7 @@ def build_batch_plan(model: INNWatermarker, x: torch.Tensor, cfg: TrainConfig):
 
 @torch.no_grad()
 def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: list[str], cfg: TrainConfig, epoch_idx: int, plan_cache: dict):
+    base_model = getattr(model, "module", model)
     B = x.size(0)
     f_lists: list[list[int]] = []
     t_lists: list[list[int]] = []
@@ -340,12 +342,12 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
         cached = plan_cache.get(key)
         need_replan = (cached is None) or ((epoch_idx % max(1, cfg.replan_every)) == 0)
         if cfg.planner == "gpu":
-            slots, amp = fast_gpu_plan_slots(model, x[i:i+1], cfg.target_bits)
+            slots, amp = fast_gpu_plan_slots(base_model, x[i:i+1], cfg.target_bits)
             if need_replan:
                 plan_cache[key] = {"slots": slots}
         else:
             # fallback to CPU MG if requested (not recommended for speed)
-            slots, amp = plan_slots_and_amp(model, x[i:i+1], TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
+            slots, amp = plan_slots_and_amp(base_model, x[i:i+1], TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
             if need_replan:
                 plan_cache[key] = {"slots": slots}
         S = min(len(slots), cfg.target_bits)
