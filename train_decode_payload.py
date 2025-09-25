@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import math
 import random
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Tuple
 import numpy as np
@@ -530,13 +531,25 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
         M_spec[b_idx[valid], 0, f_idx[valid], t_idx[valid]] = signs[valid]
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast(device_type='cuda', enabled=(scaler is not None)):
+        device_type = x.device.type
+        scaler_enabled = bool(getattr(scaler, "is_enabled", lambda: False)()) if scaler is not None else False
+        if device_type == "cuda":
+            autocast_ctx = torch.amp.autocast(device_type="cuda", enabled=scaler_enabled)
+            autocast_off_ctx = torch.amp.autocast(device_type="cuda", enabled=False)
+        elif device_type == "cpu" and scaler_enabled:
+            autocast_ctx = torch.amp.autocast(device_type="cpu", enabled=True)
+            autocast_off_ctx = nullcontext()
+        else:
+            autocast_ctx = nullcontext()
+            autocast_off_ctx = nullcontext()
+
+        with autocast_ctx:
             x_wm, _ = model.encode(x, M_spec)
             x_wm = match_length(x_wm, x.size(-1))
             x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0)
             M_rec = model.decode(x_wm)
             M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
-        with torch.amp.autocast(device_type='cuda', enabled=False):
+        with autocast_off_ctx:
             rec_vals = torch.zeros(B, S, device=x.device)
             rec_vals[valid] = M_rec[b_idx[valid], 0, f_idx[valid], t_idx[valid]]
             # Keep unclamped rec_vals for MSE to reflect scale gaps
