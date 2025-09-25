@@ -27,6 +27,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 import warnings
 import torchaudio
@@ -255,6 +258,13 @@ def validate(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, loader: Dat
             metrics["reliability"] += fused["decode_reliability"].mean().detach().item() * x.size(0)
             metrics["artifact"] += fused["artifact_risk"].mean().detach().item() * x.size(0)
 
+    # All-reduce sums across DDP ranks before normalizing
+    if dist.is_available() and dist.is_initialized():
+        keys = list(metrics.keys())
+        t = torch.tensor([metrics[k] for k in keys], device=(torch.device(device) if isinstance(device, str) else device))
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        for i, k in enumerate(keys):
+            metrics[k] = float(t[i].item())
     for k in metrics.keys():
         metrics[k] = metrics[k] / len(loader.dataset)
     return metrics
@@ -271,7 +281,13 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
     fusion_head = FusionHead().to(device)
     perc_model.eval(); tech_model.eval(); fusion_head.eval()
 
-    pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
+    pbar = tqdm(
+        enumerate(loader),
+        total=len(loader),
+        desc="train",
+        leave=False,
+        disable=(dist.is_available() and dist.is_initialized() and dist.get_rank() != 0),
+    )
     for step, batch in pbar:
         x = batch.to(device, non_blocking=True)
         m = build_message_spec_from_bits(x, model, cfg.target_bits, cfg.base_symbol_amp, device)
@@ -353,6 +369,13 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
                 "A": f"{running['artifact'] / ((step+1)*loader.batch_size):.3f}",
             })
 
+    # All-reduce sums across DDP ranks before normalizing
+    if dist.is_available() and dist.is_initialized():
+        keys = list(running.keys())
+        t = torch.tensor([running[k] for k in keys], device=(torch.device(device) if isinstance(device, str) else device))
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        for i, k in enumerate(keys):
+            running[k] = float(t[i].item())
     for k in running.keys():
         running[k] = running[k] / len(loader.dataset)
     return running
@@ -361,19 +384,47 @@ def train_one_epoch(model: INNWatermarker, loss_fn: CombinedPerceptualLoss, opti
 def main(cfg: TrainConfig) -> None:
     os.makedirs(cfg.save_dir, exist_ok=True)
 
+    # Initialize Distributed
+    is_distributed = False
+    rank = 0
+    local_rank = 0
+    world_size = 1
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        # Prefer NCCL when available, otherwise fall back to Gloo (e.g., on Windows)
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        try:
+            dist.init_process_group(backend=backend, init_method="env://")
+        except Exception:
+            dist.init_process_group(backend="gloo", init_method="env://")
+        is_distributed = True
+        rank = dist.get_rank()
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        world_size = dist.get_world_size()
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            cfg.device = f"cuda:{local_rank}"
+        else:
+            cfg.device = "cpu"
+
     # Datasets
     train_ds = AudioChunkDataset(cfg.data_dir)
     val_ds = AudioChunkDataset(cfg.val_dir)
 
+    # Samplers
+    train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True) if is_distributed else None
+    val_sampler = DistributedSampler(val_ds, shuffle=False, drop_last=False) if is_distributed else None
+
     # Report dataset stats
-    print(f"Found {len(train_ds)} training files in '{cfg.data_dir}'")
-    print(f"Found {len(val_ds)} validation files in '{cfg.val_dir}'")
+    if (not is_distributed) or rank == 0:
+        print(f"Found {len(train_ds)} training files in '{cfg.data_dir}'")
+        print(f"Found {len(val_ds)} validation files in '{cfg.val_dir}'")
 
     pin = (cfg.device == "cuda")
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=cfg.num_workers,
         drop_last=True,
         pin_memory=pin,
@@ -384,17 +435,27 @@ def main(cfg: TrainConfig) -> None:
         val_ds,
         batch_size=cfg.batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=cfg.num_workers,
         pin_memory=pin,
         persistent_workers=True if cfg.num_workers > 0 else False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
-    print(f"Device: {cfg.device} | Batch size: {cfg.batch_size} | Workers: {cfg.num_workers}")
-    print(f"Train steps/epoch: {len(train_loader)} | Val steps: {len(val_loader)}")
+    if (not is_distributed) or rank == 0:
+        print(f"Device: {cfg.device} | Batch size: {cfg.batch_size} | Workers: {cfg.num_workers}")
+        print(f"Train steps/epoch (per-rank): {len(train_loader)} | Val steps: {len(val_loader)}")
 
     # Model & loss
     model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": cfg.n_fft, "hop_length": cfg.hop, "win_length": cfg.n_fft}).to(cfg.device)
+    if is_distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
     loss_fn = CombinedPerceptualLoss()
 
     # Optimizer & scaler
@@ -408,22 +469,33 @@ def main(cfg: TrainConfig) -> None:
 
     best_val = math.inf
     for epoch in range(1, cfg.epochs + 1):
-        print(f"\nEpoch {epoch}/{cfg.epochs}")
+        if is_distributed and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        if (not is_distributed) or rank == 0:
+            print(f"\nEpoch {epoch}/{cfg.epochs}")
         train_metrics = train_one_epoch(model, loss_fn, optimizer, train_loader, cfg.device, scaler, cfg.log_interval)
-        print(f"train: total={train_metrics['total']:.4f} mrstft={train_metrics['mrstft']:.4f} mfcc={train_metrics['mfcc']:.4f} snr={train_metrics['snr']:.4f}"
-              f" | PHM P={train_metrics['presence']:.3f} R={train_metrics['reliability']:.3f} A={train_metrics['artifact']:.3f}")
+        if (not is_distributed) or rank == 0:
+            print(
+                f"train: total={train_metrics['total']:.4f} mrstft={train_metrics['mrstft']:.4f} mfcc={train_metrics['mfcc']:.4f} snr={train_metrics['snr']:.4f}"
+                f" | PHM P={train_metrics['presence']:.3f} R={train_metrics['reliability']:.3f} A={train_metrics['artifact']:.3f}"
+            )
 
         val_metrics = validate(model, loss_fn, val_loader, cfg.device)
-        print(f"val  : total={val_metrics['total']:.4f} mrstft={val_metrics['mrstft']:.4f} mfcc={val_metrics['mfcc']:.4f} snr={val_metrics['snr']:.4f}"
-              f" | PHM P={val_metrics['presence']:.3f} R={val_metrics['reliability']:.3f} A={val_metrics['artifact']:.3f}")
+        if (not is_distributed) or rank == 0:
+            print(
+                f"val  : total={val_metrics['total']:.4f} mrstft={val_metrics['mrstft']:.4f} mfcc={val_metrics['mfcc']:.4f} snr={val_metrics['snr']:.4f}"
+                f" | PHM P={val_metrics['presence']:.3f} R={val_metrics['reliability']:.3f} A={val_metrics['artifact']:.3f}"
+            )
 
         # Save best on validation total perceptual loss
-        if val_metrics["total"] < best_val:
+        if ((not is_distributed) or rank == 0) and (val_metrics["total"] < best_val):
             best_val = val_metrics["total"]
             ckpt_path = os.path.join(cfg.save_dir, f"inn_imperc_best.pt")
+            to_save = model.module if hasattr(model, "module") else model
             torch.save({
                 "epoch": epoch,
-                "model_state": model.state_dict(),
+                "model_state": to_save.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "val_total": best_val,
                 "cfg": cfg.__dict__,
@@ -431,16 +503,20 @@ def main(cfg: TrainConfig) -> None:
             print(f"Saved best checkpoint to {ckpt_path}")
 
         # periodic save
-        if epoch % 5 == 0:
+        if ((not is_distributed) or rank == 0) and (epoch % 5 == 0):
             ckpt_path = os.path.join(cfg.save_dir, f"inn_imperc_e{epoch}.pt")
+            to_save = model.module if hasattr(model, "module") else model
             torch.save({
                 "epoch": epoch,
-                "model_state": model.state_dict(),
+                "model_state": to_save.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "val_total": val_metrics["total"],
                 "cfg": cfg.__dict__,
             }, ckpt_path)
             print(f"Saved checkpoint to {ckpt_path}")
+
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
