@@ -134,7 +134,7 @@ class TrainConfig:
     batch_size: int = 8
     num_workers: int = 2
     epochs: int = 15
-    lr: float = 1e-4
+    lr: float = 5e-4
     weight_decay: float = 1e-5
     mixed_precision: bool = True
     save_dir: str = "decode_payload"
@@ -160,6 +160,9 @@ class TrainConfig:
     use_rs_interleave: bool = True
     rs_payload_bytes: int = 125  # Raw payload size before RS encoding
     rs_interleave_depth: int = 4  # Interleaving depth
+    # RS warmup controls
+    rs_warmup_epochs: int = 3
+    rs_enable_ber_threshold: float = 0.35
     # Planner selection: "gpu" (fast mel-proxy) or "mg" (Moore–Glasberg)
     planner: str = "mg"
     # Cache planning per file; re-plan every N epochs
@@ -811,14 +814,27 @@ def main(cfg: TrainConfig) -> None:
     best_ber = math.inf
     plan_cache: dict = {}
     prev_amp = cfg.base_symbol_amp  # Track amplitude changes for logging
+    # Remember default RS setting to restore after warmup/threshold
+    default_use_rs = bool(cfg.use_rs_interleave)
+    prev_use_rs = cfg.use_rs_interleave
     for epoch in range(1, cfg.epochs + 1):
-        # Curriculum learning: anneal symbol amplitude
-        if epoch <= 2:
-            cfg.base_symbol_amp = 0.09
-        elif epoch <= 4:
-            cfg.base_symbol_amp = 0.06
+        # Amplitude schedule: keep early epochs louder, then drop
+        if epoch <= 3:
+            cfg.base_symbol_amp = 0.25
+        elif epoch <= 6:
+            cfg.base_symbol_amp = 0.15
         else:
             cfg.base_symbol_amp = 0.03
+
+        # RS warmup & threshold gating: keep RS off for warmup epochs and
+        # until validation BER beats threshold; then restore default setting.
+        if epoch <= max(0, int(cfg.rs_warmup_epochs)):
+            cfg.use_rs_interleave = False
+        else:
+            cfg.use_rs_interleave = (default_use_rs and (best_ber < float(cfg.rs_enable_ber_threshold)))
+        if cfg.use_rs_interleave != prev_use_rs:
+            log(f"Epoch {epoch}: RS+interleave {'ENABLED' if cfg.use_rs_interleave else 'DISABLED'} (best_ber={best_ber:.4f}, thr={cfg.rs_enable_ber_threshold})")
+            prev_use_rs = cfg.use_rs_interleave
 
         # AMP control: disable for first 1-2 epochs, re-enable if BER < 0.3
         if epoch <= 2:
