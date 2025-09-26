@@ -131,7 +131,7 @@ def match_length(y: torch.Tensor, target_T: int) -> torch.Tensor:
 class TrainConfig:
     data_dir: str = "data/train"
     val_dir: str = "data/val"
-    batch_size: int = 8
+    batch_size: int = 32
     num_workers: int = 2
     epochs: int = 15
     lr: float = 1e-4
@@ -437,6 +437,31 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
     return {"f_idx": f_idx, "t_idx": t_idx, "amp": amp, "mask": mask, "bits": bits, "S": S_max}
 
 
+@torch.no_grad()
+def build_message_spec_from_plan(model: INNWatermarker, x: torch.Tensor, plan: dict, base_symbol_amp: float) -> torch.Tensor:
+    """
+    Build message spectrogram M_spec in batch, identical logic for train and val.
+    Uses indices and per-slot amplitudes from plan.
+    """
+    base_model = getattr(model, "module", model)
+    X = base_model.stft(x)
+    B, _, F_, T_ = X.shape
+    S = int(plan.get("S", 0))
+    M_spec = torch.zeros(B, 2, F_, T_, device=x.device)
+    if S == 0:
+        return M_spec
+    f_idx = plan["f_idx"]
+    t_idx = plan["t_idx"]
+    amp = plan["amp"]
+    bits = plan["bits"]
+    mask = plan["mask"]
+    b_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(B, S)
+    signs = (bits * 2 - 1).float() * base_symbol_amp * amp
+    valid = mask
+    M_spec[b_idx[valid], 0, f_idx[valid], t_idx[valid]] = signs[valid]
+    return M_spec
+
+
 def _maybe_resample_gpu(x: torch.Tensor, sr: torch.Tensor, target_sr: int) -> torch.Tensor:
     # x: [B,1,T], sr: [B]
     out = []
@@ -461,76 +486,57 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
             if cfg.gpu_resample:
                 x = _maybe_resample_gpu(x, sr, TARGET_SR)
             B = x.size(0)
-            # Plan slots using the same method as training
+            # Use the same batch planning + M_spec construction as training
             bers = []
             payload_bers = []
             ce_sum = 0.0
             mse_sum = 0.0
             perc_sum = 0.0
-            for i in range(B):
-                xi = x[i:i+1]
-                # Use same planning method as training
-                if cfg.planner == "gpu":
-                    slots, amp_scale = fast_gpu_plan_slots(base_model, xi, cfg.target_bits)
-                else:
-                    slots, amp_scale = plan_slots_and_amp(base_model, xi, TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
-                S = min(len(slots), cfg.target_bits)
-                if S == 0:
-                    continue
-                # Generate bits: from fixed payload (or random fallback)
-                if cfg.use_rs_interleave:
-                    fixed_bytes = build_fixed_payload_bytes(cfg) if cfg.use_fixed_payload else None
-                    payload_bytes = fixed_bytes if fixed_bytes is not None else bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
-                    encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
-                    bits = encoded_bits[:S].unsqueeze(0) if len(encoded_bits) >= S else torch.cat([encoded_bits, torch.zeros(S - len(encoded_bits), dtype=torch.long)]).unsqueeze(0)
-                    bits = bits.to(xi.device)
-                else:
-                    bits = make_bits(1, S, xi.device)
-                # Build message spec
-                X = base_model.stft(xi)
-                F_, T_ = X.shape[-2], X.shape[-1]
-                # For validation, we don't have per-slot amplitude tensor, so use the scale vector directly
-                if isinstance(amp_scale, torch.Tensor):
-                    amp_vec = amp_scale[:S].cpu().numpy() if amp_scale.numel() >= S else np.ones(S, dtype=np.float32)
-                else:
-                    amp_vec = amp_scale[:S] if len(amp_scale) >= S else np.ones(S, dtype=np.float32)
-                M_spec = bits_to_message_spec(bits, slots[:S], F_, T_, base_amp=cfg.base_symbol_amp, amp_per_slot=amp_vec)
-                # Encode -> Decode
-                x_wm, _ = base_model.encode(xi, M_spec)
-                x_wm = match_length(x_wm, xi.size(-1))
-                x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0)
-                M_rec = base_model.decode(x_wm)
-                M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
-                # Loss terms
-                logits = gather_slots(M_rec, slots[:S]).clamp(-6.0, 6.0)
-                targets01 = bits.float()
-                ce = F.binary_cross_entropy_with_logits(logits, targets01)
-                target_sign = symbols_from_bits(bits, amp=cfg.base_symbol_amp)
-                rec_vals = gather_slots(M_rec, slots[:S])
-                mse = F.mse_loss(rec_vals, target_sign)
-                perc_out = loss_perc(xi, x_wm)
-                perc = perc_out["total_perceptual_loss"]
-                mfcc = perc_out["mfcc_cos"]
-                # BER
-                pred_bits = (rec_vals > 0).long()
-                ber = (pred_bits != bits).float().mean()
-                bers.append(float(ber))
-
-                # Payload BER (if using RS)
-                if cfg.use_rs_interleave:
-                    try:
-                        # Decode the recovered bits back to payload
-                        recovered_payload = decode_payload_with_rs(pred_bits.squeeze(0), cfg.rs_interleave_depth, cfg.rs_payload_bytes)
-                        # Compare with original payload
-                        original_payload = decode_payload_with_rs(bits.squeeze(0), cfg.rs_interleave_depth, cfg.rs_payload_bytes)
-                        payload_ber = sum(b1 != b2 for b1, b2 in zip(recovered_payload, original_payload)) / len(original_payload) if original_payload else 1.0
-                    except:
-                        payload_ber = 1.0  # Failed decode
-                    payload_bers.append(payload_ber)
-                ce_sum += float(ce)
-                mse_sum += float(mse)
-                perc_sum += float(perc)
-                metrics["mfcc"] += float(mfcc)
+            # Build a batch plan (no cache needed for val, but reuse function)
+            paths = ["val_item"] * B
+            plan = build_batch_plan_with_cache(model, x, paths, cfg, epoch_idx=0, plan_cache={})
+            S = int(plan["S"])
+            if S == 0:
+                continue
+            # Construct M_spec identically to training
+            M_spec = build_message_spec_from_plan(model, x, plan, cfg.base_symbol_amp)
+            # Encode -> Decode in batch
+            x_wm, _ = base_model.encode(x, M_spec)
+            x_wm = match_length(x_wm, x.size(-1))
+            x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0)
+            M_rec = base_model.decode(x_wm)
+            M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
+            # Compute metrics per item using the same planned indices
+            f_idx = plan["f_idx"]; t_idx = plan["t_idx"]; mask = plan["mask"]; bits = plan["bits"]
+            Bsz = x.size(0)
+            rec_vals = torch.zeros(Bsz, S, device=x.device)
+            b_idx = torch.arange(Bsz, device=x.device).unsqueeze(1).expand(Bsz, S)
+            valid = mask
+            rec_vals[valid] = M_rec[b_idx[valid], 0, f_idx[valid], t_idx[valid]]
+            logits = rec_vals.clamp(-6.0, 6.0)
+            targets01 = bits.float()
+            ce = F.binary_cross_entropy_with_logits(logits[valid], targets01[valid])
+            target_sign = (bits * 2 - 1).float() * cfg.base_symbol_amp * plan["amp"]
+            mse = F.mse_loss(rec_vals[valid], target_sign[valid])
+            perc_out = loss_perc(x, x_wm)
+            perc = perc_out["total_perceptual_loss"]
+            mfcc = perc_out["mfcc_cos"]
+            pred_bits = (rec_vals > 0).long()
+            ber = (pred_bits[valid] != bits[valid]).float().mean()
+            bers.append(float(ber))
+            # Payload BER
+            if cfg.use_rs_interleave:
+                try:
+                    recovered_payload = decode_payload_with_rs(pred_bits[0].detach(), cfg.rs_interleave_depth, cfg.rs_payload_bytes)
+                    original_payload = decode_payload_with_rs(bits[0].detach(), cfg.rs_interleave_depth, cfg.rs_payload_bytes)
+                    payload_ber = sum(b1 != b2 for b1, b2 in zip(recovered_payload, original_payload)) / len(original_payload) if original_payload else 1.0
+                except:
+                    payload_ber = 1.0
+                payload_bers.append(payload_ber)
+            ce_sum += float(ce)
+            mse_sum += float(mse)
+            perc_sum += float(perc)
+            metrics["mfcc"] += float(mfcc)
             if len(bers) > 0:
                 metrics["ber"] += sum(bers) / len(bers) * B
                 if cfg.use_rs_interleave and len(payload_bers) > 0:
