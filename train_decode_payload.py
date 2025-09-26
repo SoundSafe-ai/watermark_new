@@ -131,7 +131,7 @@ def match_length(y: torch.Tensor, target_T: int) -> torch.Tensor:
 class TrainConfig:
     data_dir: str = "data/train"
     val_dir: str = "data/val"
-    batch_size: int = 32
+    batch_size: int = 8
     num_workers: int = 2
     epochs: int = 15
     lr: float = 1e-4
@@ -146,13 +146,13 @@ class TrainConfig:
     # Initialize from a prior imperceptibility checkpoint (stage-1)
     init_from: str | None = None  # Try training from scratch for decode
     # Limit number of files used (None uses all)
-    train_max_files: int | None = 50000
-    val_max_files: int | None = 15000
+    train_max_files: int | None = None
+    val_max_files: int | None = None
     file_seed: int = 42
     # Loss weights
     w_bits: float = 0.9
     w_mse: float = 0.25
-    w_perc: float = 0.05
+    w_perc: float = 0.001
     # Symbol settings
     base_symbol_amp: float = 0.09  # Will be annealed during training
     target_bits: int = 512  # Fixed number of bits; no curriculum
