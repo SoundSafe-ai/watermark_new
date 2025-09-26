@@ -413,6 +413,7 @@ def _maybe_resample_gpu(x: torch.Tensor, sr: torch.Tensor, target_sr: int) -> to
 
 def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptualLoss, cfg: TrainConfig, loader: DataLoader) -> dict:
     model.eval()
+    base_model = getattr(model, "module", model)
     metrics = {"ber": 0.0, "payload_ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0, "mfcc": 0.0}
     with torch.no_grad():
         for batch in loader:
@@ -432,9 +433,9 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 xi = x[i:i+1]
                 # Use same planning method as training
                 if cfg.planner == "gpu":
-                    slots, amp_scale = fast_gpu_plan_slots(model, xi, cfg.target_bits)
+                    slots, amp_scale = fast_gpu_plan_slots(base_model, xi, cfg.target_bits)
                 else:
-                    slots, amp_scale = plan_slots_and_amp(model, xi, TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
+                    slots, amp_scale = plan_slots_and_amp(base_model, xi, TARGET_SR, cfg.n_fft, cfg.target_bits, cfg.base_symbol_amp)
                 S = min(len(slots), cfg.target_bits)
                 if S == 0:
                     continue
@@ -447,7 +448,7 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 else:
                     bits = make_bits(1, S, xi.device)
                 # Build message spec
-                X = model.stft(xi)
+                X = base_model.stft(xi)
                 F_, T_ = X.shape[-2], X.shape[-1]
                 # For validation, we don't have per-slot amplitude tensor, so use the scale vector directly
                 if isinstance(amp_scale, torch.Tensor):
@@ -456,10 +457,10 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                     amp_vec = amp_scale[:S] if len(amp_scale) >= S else np.ones(S, dtype=np.float32)
                 M_spec = bits_to_message_spec(bits, slots[:S], F_, T_, base_amp=cfg.base_symbol_amp, amp_per_slot=amp_vec)
                 # Encode -> Decode
-                x_wm, _ = model.encode(xi, M_spec)
+                x_wm, _ = base_model.encode(xi, M_spec)
                 x_wm = match_length(x_wm, xi.size(-1))
                 x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0)
-                M_rec = model.decode(x_wm)
+                M_rec = base_model.decode(x_wm)
                 M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
                 # Loss terms
                 logits = gather_slots(M_rec, slots[:S]).clamp(-6.0, 6.0)
@@ -514,6 +515,7 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
 
 def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptualLoss, optimizer: torch.optim.Optimizer, scaler, cfg: TrainConfig, loader: DataLoader, *, epoch_idx: int, plan_cache: dict) -> dict:
     model.train()
+    base_model = getattr(model, "module", model)
     running = {"obj": 0.0, "ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0, "mfcc": 0.0}
     pbar = tqdm(
         enumerate(loader),
@@ -543,7 +545,7 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
         mask = plan["mask"]              # [B,S]
 
         # Build message spectrogram in batch
-        X = model.stft(x)
+        X = base_model.stft(x)
         F_, T_ = X.shape[-2], X.shape[-1]
         M_spec = torch.zeros(B, 2, F_, T_, device=x.device)
         b_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(B, S)
@@ -565,10 +567,10 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
             autocast_off_ctx = nullcontext()
 
         with autocast_ctx:
-            x_wm, _ = model.encode(x, M_spec)
+            x_wm, _ = base_model.encode(x, M_spec)
             x_wm = match_length(x_wm, x.size(-1))
             x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0)
-            M_rec = model.decode(x_wm)
+            M_rec = base_model.decode(x_wm)
             M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
         with autocast_off_ctx:
             rec_vals = torch.zeros(B, S, device=x.device)
