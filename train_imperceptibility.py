@@ -35,6 +35,7 @@ import warnings
 import torchaudio
 from torchaudio.transforms import Resample
 from tqdm import tqdm
+from datetime import datetime
 
 from models.inn_encoder_decoder import INNWatermarker, STFT
 from pipeline.perceptual_losses import CombinedPerceptualLoss
@@ -166,6 +167,8 @@ class TrainConfig:
     # Payload settings (match decode training)
     target_bits: int = 512  # per 1s chunk
     base_symbol_amp: float = 0.01
+    # File logging
+    log_file: str = "train_log.txt"
 
 
 def build_message_spec_from_bits(x_wave: torch.Tensor, model: INNWatermarker, target_bits: int, base_amp: float, device) -> torch.Tensor:
@@ -414,10 +417,28 @@ def main(cfg: TrainConfig) -> None:
     train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True) if is_distributed else None
     val_sampler = DistributedSampler(val_ds, shuffle=False, drop_last=False) if is_distributed else None
 
+    # Simple logger that prints and appends to a file (rank-0 only)
+    log_path = os.path.join(cfg.save_dir, getattr(cfg, "log_file", "train_log.txt"))
+    def log(msg: str) -> None:
+        if (not is_distributed) or rank == 0:
+            print(msg)
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except Exception:
+                pass
+    # Start-of-run header
+    if (not is_distributed) or rank == 0:
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"=== New run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        except Exception:
+            pass
+
     # Report dataset stats
     if (not is_distributed) or rank == 0:
-        print(f"Found {len(train_ds)} training files in '{cfg.data_dir}'")
-        print(f"Found {len(val_ds)} validation files in '{cfg.val_dir}'")
+        log(f"Found {len(train_ds)} training files in '{cfg.data_dir}'")
+        log(f"Found {len(val_ds)} validation files in '{cfg.val_dir}'")
 
     pin = (cfg.device == "cuda")
     train_loader = DataLoader(
@@ -443,8 +464,8 @@ def main(cfg: TrainConfig) -> None:
     )
 
     if (not is_distributed) or rank == 0:
-        print(f"Device: {cfg.device} | Batch size: {cfg.batch_size} | Workers: {cfg.num_workers}")
-        print(f"Train steps/epoch (per-rank): {len(train_loader)} | Val steps: {len(val_loader)}")
+        log(f"Device: {cfg.device} | Batch size: {cfg.batch_size} | Workers: {cfg.num_workers}")
+        log(f"Train steps/epoch (per-rank): {len(train_loader)} | Val steps: {len(val_loader)}")
 
     # Model & loss
     model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": cfg.n_fft, "hop_length": cfg.hop, "win_length": cfg.n_fft}).to(cfg.device)
@@ -473,17 +494,17 @@ def main(cfg: TrainConfig) -> None:
             train_sampler.set_epoch(epoch)
 
         if (not is_distributed) or rank == 0:
-            print(f"\nEpoch {epoch}/{cfg.epochs}")
+            log(f"\nEpoch {epoch}/{cfg.epochs}")
         train_metrics = train_one_epoch(model, loss_fn, optimizer, train_loader, cfg.device, scaler, cfg.log_interval)
         if (not is_distributed) or rank == 0:
-            print(
+            log(
                 f"train: total={train_metrics['total']:.4f} mrstft={train_metrics['mrstft']:.4f} mfcc={train_metrics['mfcc']:.4f} snr={train_metrics['snr']:.4f}"
                 f" | PHM P={train_metrics['presence']:.3f} R={train_metrics['reliability']:.3f} A={train_metrics['artifact']:.3f}"
             )
 
         val_metrics = validate(model, loss_fn, val_loader, cfg.device)
         if (not is_distributed) or rank == 0:
-            print(
+            log(
                 f"val  : total={val_metrics['total']:.4f} mrstft={val_metrics['mrstft']:.4f} mfcc={val_metrics['mfcc']:.4f} snr={val_metrics['snr']:.4f}"
                 f" | PHM P={val_metrics['presence']:.3f} R={val_metrics['reliability']:.3f} A={val_metrics['artifact']:.3f}"
             )
@@ -500,7 +521,7 @@ def main(cfg: TrainConfig) -> None:
                 "val_total": best_val,
                 "cfg": cfg.__dict__,
             }, ckpt_path)
-            print(f"Saved best checkpoint to {ckpt_path}")
+            log(f"Saved best checkpoint to {ckpt_path}")
 
         # periodic save
         if ((not is_distributed) or rank == 0) and (epoch % 5 == 0):
@@ -513,7 +534,7 @@ def main(cfg: TrainConfig) -> None:
                 "val_total": val_metrics["total"],
                 "cfg": cfg.__dict__,
             }, ckpt_path)
-            print(f"Saved checkpoint to {ckpt_path}")
+            log(f"Saved checkpoint to {ckpt_path}")
 
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()

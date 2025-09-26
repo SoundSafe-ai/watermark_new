@@ -40,6 +40,7 @@ from torchaudio.transforms import Resample
 from tqdm import tqdm
 import torch.backends.cudnn as cudnn
 import torchaudio.functional as AF
+from datetime import datetime
 
 from models.inn_encoder_decoder import INNWatermarker, STFT
 from pipeline.perceptual_losses import CombinedPerceptualLoss
@@ -50,6 +51,7 @@ from pipeline.ingest_and_chunk import (
 )
 from pipeline.psychoacoustic import mel_proxy_threshold
 from pipeline.ingest_and_chunk import rs_encode_167_125, rs_decode_167_125, interleave_bytes, deinterleave_bytes
+from pipeline.payload_codec import pack_fields
 
 # Quiet known warnings
 warnings.filterwarnings(
@@ -153,7 +155,7 @@ class TrainConfig:
     w_perc: float = 0.05
     # Symbol settings
     base_symbol_amp: float = 0.09  # Will be annealed during training
-    target_bits: int = 1336  # Will be annealed during training (starts at 512)
+    target_bits: int = 512  # Fixed number of bits; no curriculum
     # RS and interleaving settings
     use_rs_interleave: bool = True
     rs_payload_bytes: int = 125  # Raw payload size before RS encoding
@@ -162,6 +164,11 @@ class TrainConfig:
     planner: str = "mg"
     # Cache planning per file; re-plan every N epochs
     replan_every: int = 3
+    # File logging
+    log_file: str = "train_log.txt"
+    # Fixed payload controls
+    use_fixed_payload: bool = False
+    payload_text: str = "ISRC12345678910,ISWC12345678910,duration4:20,RDate10/10/10"
 
 
 def make_bits(batch_size: int, S: int, device) -> torch.Tensor:
@@ -216,6 +223,36 @@ def decode_payload_with_rs(bits: torch.Tensor, interleave_depth: int, expected_p
     except:
         # Return zeros on decode failure
         return bytes(expected_payload_bytes)
+
+
+def _parse_kv_csv_to_fields(text: str) -> dict:
+    fields: dict = {}
+    for seg in text.split(","):
+        seg = seg.strip()
+        if not seg:
+            continue
+        # split on first '-' or ':' to allow values like '4:20'
+        pos_dash = seg.find("-")
+        pos_colon = seg.find(":")
+        # choose the earliest non-negative position
+        positions = [p for p in [pos_dash, pos_colon] if p >= 0]
+        if not positions:
+            continue
+        p = min(positions)
+        key = seg[:p].strip()
+        val = seg[p+1:].strip()
+        if key:
+            fields[key] = val
+    return fields
+
+
+def build_fixed_payload_bytes(cfg: TrainConfig) -> bytes:
+    fields = _parse_kv_csv_to_fields(cfg.payload_text)
+    raw = pack_fields(fields)
+    # Pad/truncate to RS input length
+    if len(raw) >= cfg.rs_payload_bytes:
+        return raw[:cfg.rs_payload_bytes]
+    return raw + bytes(cfg.rs_payload_bytes - len(raw))
 
 
 def symbols_from_bits(bits: torch.Tensor, amp: float) -> torch.Tensor:
@@ -385,13 +422,14 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
         if i < len(amp_lists):
             amp[i, :S] = amp_lists[i][:S].to(device)
         mask[i, :S] = True
-    # Generate bits: either random (legacy) or RS-encoded payloads
+    # Generate bits from fixed payload (or random fallback)
     if cfg.use_rs_interleave:
         bits = torch.zeros(B, S_max, dtype=torch.long, device=device)
+        # Prepare fixed payload once
+        fixed_bytes = build_fixed_payload_bytes(cfg) if cfg.use_fixed_payload else None
         for i in range(B):
-            payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
+            payload_bytes = fixed_bytes if fixed_bytes is not None else bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
             encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
-            # Truncate or pad to match S_max
             bit_tensor = encoded_bits[:S_max] if len(encoded_bits) >= S_max else torch.cat([encoded_bits, torch.zeros(S_max - len(encoded_bits), dtype=torch.long, device=device)])
             bits[i] = bit_tensor
     else:
@@ -439,9 +477,10 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 S = min(len(slots), cfg.target_bits)
                 if S == 0:
                     continue
-                # Generate bits: either random or RS-encoded
+                # Generate bits: from fixed payload (or random fallback)
                 if cfg.use_rs_interleave:
-                    payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
+                    fixed_bytes = build_fixed_payload_bytes(cfg) if cfg.use_fixed_payload else None
+                    payload_bytes = fixed_bytes if fixed_bytes is not None else bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
                     encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
                     bits = encoded_bits[:S].unsqueeze(0) if len(encoded_bits) >= S else torch.cat([encoded_bits, torch.zeros(S - len(encoded_bits), dtype=torch.long)]).unsqueeze(0)
                     bits = bits.to(xi.device)
@@ -671,8 +710,26 @@ def main(cfg: TrainConfig) -> None:
         rnd = random.Random(cfg.file_seed + 1)
         rnd.shuffle(val_ds.files)
         val_ds.files = val_ds.files[:cfg.val_max_files]
+    # Simple logger that prints and appends to a file (rank-0 only)
+    log_path = os.path.join(cfg.save_dir, getattr(cfg, "log_file", "train_log.txt"))
+    def log(msg: str) -> None:
+        if (not is_distributed) or rank == 0:
+            print(msg)
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except Exception:
+                pass
+    # Start-of-run header
     if (not is_distributed) or rank == 0:
-        print(f"Found {len(train_ds)} training files | {len(val_ds)} validation files")
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"=== New run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        except Exception:
+            pass
+
+    if (not is_distributed) or rank == 0:
+        log(f"Found {len(train_ds)} training files | {len(val_ds)} validation files")
 
     pin = (cfg.device == "cuda")
     # Samplers
@@ -701,7 +758,7 @@ def main(cfg: TrainConfig) -> None:
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
     if (not is_distributed) or rank == 0:
-        print(f"Device: {cfg.device} | Batch: {cfg.batch_size} | Workers: {cfg.num_workers}")
+        log(f"Device: {cfg.device} | Batch: {cfg.batch_size} | Workers: {cfg.num_workers}")
 
     stft_cfg = {"n_fft": cfg.n_fft, "hop_length": cfg.hop, "win_length": cfg.n_fft}
     model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg=stft_cfg).to(cfg.device)
@@ -731,11 +788,11 @@ def main(cfg: TrainConfig) -> None:
                 try:
                     model.load_state_dict(state, strict=True)
                     ep = ckpt.get("epoch", "?") if isinstance(ckpt, dict) else "?"
-                    print(f"Loaded init weights from '{cfg.init_from}' (epoch={ep})")
+                    log(f"Loaded init weights from '{cfg.init_from}' (epoch={ep})")
                 except Exception as e:
-                    print(f"Warning: checkpoint state load failed: {e}\nTraining from scratch.")
+                    log(f"Warning: checkpoint state load failed: {e}\nTraining from scratch.")
         else:
-            print(f"Init checkpoint not found: '{cfg.init_from}'. Training from scratch.")
+            log(f"Init checkpoint not found: '{cfg.init_from}'. Training from scratch.")
     loss_perc = CombinedPerceptualLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     try:
@@ -748,7 +805,6 @@ def main(cfg: TrainConfig) -> None:
     best_ber = math.inf
     plan_cache: dict = {}
     prev_amp = cfg.base_symbol_amp  # Track amplitude changes for logging
-    prev_target_bits = cfg.target_bits  # Track target_bits changes for logging
     for epoch in range(1, cfg.epochs + 1):
         # Curriculum learning: anneal symbol amplitude
         if epoch <= 2:
@@ -757,14 +813,6 @@ def main(cfg: TrainConfig) -> None:
             cfg.base_symbol_amp = 0.06
         else:
             cfg.base_symbol_amp = 0.03
-
-        # Density curriculum: start with fewer slots, ramp up
-        if epoch == 1:
-            cfg.target_bits = 512
-        elif epoch == 2:
-            cfg.target_bits = 768
-        else:
-            cfg.target_bits = 1336
 
         # AMP control: disable for first 1-2 epochs, re-enable if BER < 0.3
         if epoch <= 2:
@@ -776,30 +824,25 @@ def main(cfg: TrainConfig) -> None:
                 amp_enabled = cfg.mixed_precision and torch.cuda.is_available()
                 scaler = GradScaler(enabled=amp_enabled)
                 if amp_enabled:
-                    print(f"Epoch {epoch}: Re-enabling mixed precision (BER={best_ber:.4f} < 0.3)")
+                    log(f"Epoch {epoch}: Re-enabling mixed precision (BER={best_ber:.4f} < 0.3)")
 
         # Log amplitude changes
         if cfg.base_symbol_amp != prev_amp:
-            print(f"Epoch {epoch}: Symbol amplitude changed to {cfg.base_symbol_amp}")
+            log(f"Epoch {epoch}: Symbol amplitude changed to {cfg.base_symbol_amp}")
             prev_amp = cfg.base_symbol_amp
-
-        # Log target_bits changes
-        if cfg.target_bits != prev_target_bits:
-            print(f"Epoch {epoch}: Target bits changed to {cfg.target_bits}")
-            prev_target_bits = cfg.target_bits
 
         if is_distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         if (not is_distributed) or rank == 0:
-            print(f"\nEpoch {epoch}/{cfg.epochs}" + (" [AMP OFF]" if not amp_enabled else ""))
+            log(f"\nEpoch {epoch}/{cfg.epochs}" + (" [AMP OFF]" if not amp_enabled else ""))
         tr = train_one_epoch(model, stft_cfg, loss_perc, optimizer, scaler, cfg, train_loader, epoch_idx=epoch, plan_cache=plan_cache)
         if (not is_distributed) or rank == 0:
-            print(f"train: obj={tr['obj']:.4f} ber={tr['ber']:.4f} ce={tr['bits_ce']:.4f} mse={tr['bits_mse']:.4f} perc={tr['perc']:.4f} mfcc={tr['mfcc']:.4f}")
+            log(f"train: obj={tr['obj']:.4f} ber={tr['ber']:.4f} ce={tr['bits_ce']:.4f} mse={tr['bits_mse']:.4f} perc={tr['perc']:.4f} mfcc={tr['mfcc']:.4f}")
         va = validate(model, stft_cfg, loss_perc, cfg, val_loader)
         if (not is_distributed) or rank == 0:
             payload_ber_str = f" p_ber={va['payload_ber']:.4f}" if cfg.use_rs_interleave else ""
-            print(f"val  : ber={va['ber']:.4f}{payload_ber_str} ce={va['bits_ce']:.4f} mse={va['bits_mse']:.4f} perc={va['perc']:.4f} mfcc={va['mfcc']:.4f}")
+            log(f"val  : ber={va['ber']:.4f}{payload_ber_str} ce={va['bits_ce']:.4f} mse={va['bits_mse']:.4f} perc={va['perc']:.4f} mfcc={va['mfcc']:.4f}")
 
         # Save by best BER
         if ((not is_distributed) or rank == 0) and (va["ber"] < best_ber):
@@ -813,7 +856,7 @@ def main(cfg: TrainConfig) -> None:
                 "best_ber": best_ber,
                 "cfg": cfg.__dict__,
             }, ckpt_path)
-            print(f"Saved best-by-BER to {ckpt_path}")
+            log(f"Saved best-by-BER to {ckpt_path}")
 
         if ((not is_distributed) or rank == 0) and (epoch % 5 == 0):
             ckpt_path = os.path.join(cfg.save_dir, f"inn_decode_e{epoch}.pt")
@@ -825,7 +868,7 @@ def main(cfg: TrainConfig) -> None:
                 "val_ber": va["ber"],
                 "cfg": cfg.__dict__,
             }, ckpt_path)
-            print(f"Saved snapshot to {ckpt_path}")
+            log(f"Saved snapshot to {ckpt_path}")
 
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
