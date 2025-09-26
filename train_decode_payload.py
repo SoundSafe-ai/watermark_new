@@ -152,7 +152,7 @@ class TrainConfig:
     # Loss weights
     w_bits: float = 0.9
     w_mse: float = 0.25
-    w_perc: float = 0.001
+    w_perc: float = 0.009
     # Symbol settings
     base_symbol_amp: float = 0.09  # Will be annealed during training
     target_bits: int = 512  # Fixed number of bits; no curriculum
