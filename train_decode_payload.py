@@ -133,8 +133,8 @@ class TrainConfig:
     val_dir: str = "data/val"
     batch_size: int = 8
     num_workers: int = 2
-    epochs: int = 15
-    lr: float = 5e-4
+    epochs: int = 25
+    lr: float = 1e-5
     weight_decay: float = 1e-5
     mixed_precision: bool = True
     save_dir: str = "decode_payload"
@@ -836,7 +836,19 @@ def main(cfg: TrainConfig) -> None:
     # Remember default RS setting to restore after warmup/threshold
     default_use_rs = bool(cfg.use_rs_interleave)
     prev_use_rs = cfg.use_rs_interleave
+    prev_amp = cfg.base_symbol_amp
     for epoch in range(1, cfg.epochs + 1):
+
+        # Base symbol amplitude schedule
+        if epoch <= 5:
+            cfg.base_symbol_amp = 0.18
+        elif epoch <= 10:
+            cfg.base_symbol_amp = 0.13
+        else:
+            cfg.base_symbol_amp = 0.09
+        if cfg.base_symbol_amp != prev_amp:
+            log(f"Epoch {epoch}: Symbol amplitude changed to {cfg.base_symbol_amp}")
+            prev_amp = cfg.base_symbol_amp
 
         # RS enabled from epoch 1
         cfg.use_rs_interleave = default_use_rs
