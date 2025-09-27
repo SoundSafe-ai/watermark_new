@@ -360,9 +360,13 @@ def build_batch_plan(model: INNWatermarker, x: torch.Tensor, cfg: TrainConfig):
         bits = torch.zeros(B, S_max, dtype=torch.long, device=device)
         for i in range(B):
             payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
-            encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
+            encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth).to(device)
             # Truncate or pad to match S_max
-            bit_tensor = encoded_bits[:S_max] if len(encoded_bits) >= S_max else torch.cat([encoded_bits, torch.zeros(S_max - len(encoded_bits), dtype=torch.long, device=device)])
+            if encoded_bits.numel() >= S_max:
+                bit_tensor = encoded_bits[:S_max]
+            else:
+                pad = torch.zeros(S_max - encoded_bits.numel(), dtype=torch.long, device=device)
+                bit_tensor = torch.cat([encoded_bits, pad], dim=0)
             bits[i] = bit_tensor
     else:
         bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
@@ -771,14 +775,6 @@ def main(cfg: TrainConfig) -> None:
 
     stft_cfg = {"n_fft": cfg.n_fft, "hop_length": cfg.hop, "win_length": cfg.n_fft}
     model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg=stft_cfg).to(cfg.device)
-    if is_distributed:
-        model = DDP(
-            model,
-            device_ids=[local_rank] if torch.cuda.is_available() else None,
-            output_device=local_rank if torch.cuda.is_available() else None,
-            broadcast_buffers=False,
-            find_unused_parameters=False,
-        )
     # Warm-start from Stage-1 (imperceptibility) checkpoint if provided
     if cfg.init_from:
         if os.path.isfile(cfg.init_from):
@@ -802,6 +798,16 @@ def main(cfg: TrainConfig) -> None:
                     log(f"Warning: checkpoint state load failed: {e}\nTraining from scratch.")
         else:
             log(f"Init checkpoint not found: '{cfg.init_from}'. Training from scratch.")
+
+    # Wrap in DDP AFTER loading any checkpoint to avoid key prefix mismatches
+    if is_distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
     loss_perc = CombinedPerceptualLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     try:
