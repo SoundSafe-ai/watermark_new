@@ -150,7 +150,7 @@ class TrainConfig:
     val_max_files: int | None = None
     file_seed: int = 42
     # Loss weights
-    w_bits: float = 1.1
+    w_bits: float = 1.0
     w_mse: float = 0.25
     w_perc: float = 0.009
     # Symbol settings
@@ -158,7 +158,7 @@ class TrainConfig:
     target_bits: int = 1344  # Fixed number of bits; no curriculum
     # RS and interleaving settings
     use_rs_interleave: bool = True
-    rs_payload_bytes: int = 125  # Raw payload size before RS encoding
+    rs_payload_bytes: int = 85  # Raw payload size before RS encoding
     rs_interleave_depth: int = 4  # Interleaving depth
     # RS warmup controls
     rs_warmup_epochs: int = 3
@@ -694,6 +694,14 @@ def main(cfg: TrainConfig) -> None:
     except Exception:
         pass
 
+    # If RS interleave is enabled, ensure target_bits matches coded payload length
+    auto_rs_bits = None
+    if cfg.use_rs_interleave:
+        dummy_payload = bytes([0] * cfg.rs_payload_bytes)
+        rs_bits_tensor = encode_payload_with_rs(dummy_payload, cfg.rs_interleave_depth)
+        auto_rs_bits = int(rs_bits_tensor.numel())
+        cfg.target_bits = auto_rs_bits
+
     # Initialize Distributed
     is_distributed = False
     rank = 0
@@ -747,6 +755,8 @@ def main(cfg: TrainConfig) -> None:
 
     if (not is_distributed) or rank == 0:
         log(f"Found {len(train_ds)} training files | {len(val_ds)} validation files")
+        if auto_rs_bits is not None:
+            log(f"RS interleave enabled: setting target_bits to coded length {auto_rs_bits}")
 
     pin = (cfg.device == "cuda")
     # Samplers
