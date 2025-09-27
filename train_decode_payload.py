@@ -437,7 +437,11 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
         for i in range(B):
             payload_bytes = fixed_bytes if fixed_bytes is not None else bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
             encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
-            bit_tensor = encoded_bits[:S_max] if len(encoded_bits) >= S_max else torch.cat([encoded_bits, torch.zeros(S_max - len(encoded_bits), dtype=torch.long, device=device)])
+            if isinstance(encoded_bits, torch.Tensor):
+                encoded_bits = encoded_bits.to(device)
+            else:
+                encoded_bits = torch.tensor(encoded_bits, dtype=torch.long, device=device)
+            bit_tensor = encoded_bits[:S_max] if encoded_bits.numel() >= S_max else torch.cat([encoded_bits, torch.zeros(S_max - encoded_bits.numel(), dtype=torch.long, device=device)], dim=0)
             bits[i] = bit_tensor
     else:
         bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
