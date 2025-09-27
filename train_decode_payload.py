@@ -144,18 +144,18 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_resample: bool = True
     # Initialize from a prior imperceptibility checkpoint (stage-1)
-    init_from: str | None = None  # Try training from scratch for decode
+    init_from: str | None = "inn_decode_best.pt"  # Try training from scratch for decode
     # Limit number of files used (None uses all)
     train_max_files: int | None = None
     val_max_files: int | None = None
     file_seed: int = 42
     # Loss weights
-    w_bits: float = 0.9
+    w_bits: float = 1.1
     w_mse: float = 0.25
     w_perc: float = 0.009
     # Symbol settings
     base_symbol_amp: float = 0.09  # Will be annealed during training
-    target_bits: int = 512  # Fixed number of bits; no curriculum
+    target_bits: int = 1344  # Fixed number of bits; no curriculum
     # RS and interleaving settings
     use_rs_interleave: bool = True
     rs_payload_bytes: int = 125  # Raw payload size before RS encoding
@@ -164,14 +164,14 @@ class TrainConfig:
     rs_warmup_epochs: int = 3
     rs_enable_ber_threshold: float = 0.35
     # Planner selection: "gpu" (fast mel-proxy) or "mg" (Moore–Glasberg)
-    planner: str = "mg"
+    planner: str = "gpu"
     # Cache planning per file; re-plan every N epochs
     replan_every: int = 3
     # File logging
     log_file: str = "train_log.txt"
     # Fixed payload controls
     use_fixed_payload: bool = False
-    payload_text: str = "ISRC12345678910,ISWC12345678910,duration4:20,RDate10/10/10"
+    payload_text: str = "Title:You'reasurvivor,Perf:NikeshShah,ISRC:123456789101,ISWC:123456789012,length:04:20,date:01/01/2025,label:warnerbros"
 
 
 def make_bits(batch_size: int, S: int, device) -> torch.Tensor:
@@ -813,51 +813,27 @@ def main(cfg: TrainConfig) -> None:
 
     best_ber = math.inf
     plan_cache: dict = {}
-    prev_amp = cfg.base_symbol_amp  # Track amplitude changes for logging
     # Remember default RS setting to restore after warmup/threshold
     default_use_rs = bool(cfg.use_rs_interleave)
     prev_use_rs = cfg.use_rs_interleave
     for epoch in range(1, cfg.epochs + 1):
-        # Amplitude schedule: keep early epochs louder, then drop
-        if epoch <= 3:
-            cfg.base_symbol_amp = 0.25
-        elif epoch <= 6:
-            cfg.base_symbol_amp = 0.15
-        else:
-            cfg.base_symbol_amp = 0.03
 
-        # RS warmup & threshold gating: keep RS off for warmup epochs and
-        # until validation BER beats threshold; then restore default setting.
-        if epoch <= max(0, int(cfg.rs_warmup_epochs)):
-            cfg.use_rs_interleave = False
-        else:
-            cfg.use_rs_interleave = (default_use_rs and (best_ber < float(cfg.rs_enable_ber_threshold)))
+        # RS enabled from epoch 1
+        cfg.use_rs_interleave = default_use_rs
         if cfg.use_rs_interleave != prev_use_rs:
-            log(f"Epoch {epoch}: RS+interleave {'ENABLED' if cfg.use_rs_interleave else 'DISABLED'} (best_ber={best_ber:.4f}, thr={cfg.rs_enable_ber_threshold})")
+            log(f"Epoch {epoch}: RS+interleave {'ENABLED' if cfg.use_rs_interleave else 'DISABLED'}")
             prev_use_rs = cfg.use_rs_interleave
 
-        # AMP control: disable for first 1-2 epochs, re-enable if BER < 0.3
-        if epoch <= 2:
-            amp_enabled = False
-            scaler = GradScaler(enabled=False)
-        elif epoch >= 3:
-            # Check if we should re-enable AMP based on previous best BER
-            if best_ber < 0.3 and not amp_enabled:
-                amp_enabled = cfg.mixed_precision and torch.cuda.is_available()
-                scaler = GradScaler(enabled=amp_enabled)
-                if amp_enabled:
-                    log(f"Epoch {epoch}: Re-enabling mixed precision (BER={best_ber:.4f} < 0.3)")
+        # AMP always enabled
+        amp_enabled = cfg.mixed_precision and torch.cuda.is_available()
+        scaler = GradScaler(enabled=amp_enabled)
 
-        # Log amplitude changes
-        if cfg.base_symbol_amp != prev_amp:
-            log(f"Epoch {epoch}: Symbol amplitude changed to {cfg.base_symbol_amp}")
-            prev_amp = cfg.base_symbol_amp
 
         if is_distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         if (not is_distributed) or rank == 0:
-            log(f"\nEpoch {epoch}/{cfg.epochs}" + (" [AMP OFF]" if not amp_enabled else ""))
+            log(f"\nEpoch {epoch}/{cfg.epochs}")
         tr = train_one_epoch(model, stft_cfg, loss_perc, optimizer, scaler, cfg, train_loader, epoch_idx=epoch, plan_cache=plan_cache)
         if (not is_distributed) or rank == 0:
             log(f"train: obj={tr['obj']:.4f} ber={tr['ber']:.4f} ce={tr['bits_ce']:.4f} mse={tr['bits_mse']:.4f} perc={tr['perc']:.4f} mfcc={tr['mfcc']:.4f}")
