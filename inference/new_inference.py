@@ -151,22 +151,34 @@ def _save_spectrogram_side_by_side(orig: torch.Tensor, wm: torch.Tensor, n_fft: 
         return
     # orig, wm: [1, T]
     window = torch.hann_window(n_fft, device=orig.device)
-    def spec_db(x: torch.Tensor):
-        X = torch.stft(x.squeeze(0), n_fft=n_fft, hop_length=hop, win_length=n_fft, window=window, return_complex=True)
-        mag = torch.abs(X).clamp_min(1e-9)
-        return (20.0 * torch.log10(mag)).cpu().numpy()  # [F,T]
-    S1 = spec_db(orig)
-    S2 = spec_db(wm)
-    vmin = min(S1.min(), S2.min())
-    vmax = max(S1.max(), S2.max())
-    fig, axs = plt.subplots(1, 2, figsize=(12, 4), dpi=150)
+    def spec_mag(x: torch.Tensor):
+        X = torch.stft(
+            x.squeeze(0), n_fft=n_fft, hop_length=hop, win_length=n_fft,
+            window=window, return_complex=True, center=False
+        )
+        return torch.abs(X).clamp_min(1e-9)  # [F,T]
+
+    M1 = spec_mag(orig)
+    M2 = spec_mag(wm)
+    # Ensure same time frames for side-by-side comparison
+    Tm = min(M1.size(-1), M2.size(-1))
+    M1 = M1[:, :Tm]
+    M2 = M2[:, :Tm]
+    # Convert to dB relative to a common reference to avoid extreme ranges
+    ref = torch.maximum(M1.max(), M2.max()).clamp_min(1e-6)
+    S1 = (20.0 * torch.log10(M1 / ref)).cpu().numpy()
+    S2 = (20.0 * torch.log10(M2 / ref)).cpu().numpy()
+    vmin, vmax = -80.0, 0.0
+
+    fig, axs = plt.subplots(1, 2, figsize=(14, 5), dpi=150)
     im0 = axs[0].imshow(S1, origin='lower', aspect='auto', vmin=vmin, vmax=vmax, cmap='magma')
     axs[0].set_title('Original')
     im1 = axs[1].imshow(S2, origin='lower', aspect='auto', vmin=vmin, vmax=vmax, cmap='magma')
     axs[1].set_title('Watermarked')
     for ax in axs:
         ax.set_xlabel('Frames'); ax.set_ylabel('Frequency bins')
-    fig.colorbar(im1, ax=axs.ravel().tolist(), shrink=0.8)
+    cbar = fig.colorbar(im1, ax=axs.ravel().tolist(), shrink=0.8)
+    cbar.set_label('dB (relative)')
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
