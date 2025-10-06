@@ -489,7 +489,22 @@ def _maybe_resample_gpu(x: torch.Tensor, sr: torch.Tensor, target_sr: int) -> to
 def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptualLoss, cfg: TrainConfig, loader: DataLoader) -> dict:
     model.eval()
     base_model = getattr(model, "module", model)
-    metrics = {"ber": 0.0, "payload_ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0, "mfcc": 0.0}
+    # Sample-mean accumulators (train-style normalization: add batch_mean * B)
+    metrics = {
+        "obj": 0.0,  # not optimized in val, kept for symmetry
+        "ber_sample_mean": 0.0,
+        "ce_sample_mean": 0.0,
+        "mse_sample_mean": 0.0,
+        "perc_sample_mean": 0.0,
+        "mfcc_sample_mean": 0.0,
+        # Global (symbol-weighted)
+        "ber_global": 0.0,  # stored as numerator; finalized later
+        "ce_global": 0.0,   # stored as sum; finalized later
+        "mse_global": 0.0,  # stored as sum; finalized later
+        "valid_bits": 0.0,
+        # Payload BER (per-sample, averaged like sample-mean)
+        "payload_ber": 0.0,
+    }
     with torch.no_grad():
         for batch in loader:
             x, sr, _paths = batch
@@ -499,11 +514,7 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
                 x = _maybe_resample_gpu(x, sr, TARGET_SR)
             B = x.size(0)
             # Use the same batch planning + M_spec construction as training
-            bers = []
             payload_bers = []
-            ce_sum = 0.0
-            mse_sum = 0.0
-            perc_sum = 0.0
             # Build a batch plan (no cache needed for val, but reuse function)
             paths = ["val_item"] * B
             plan = build_batch_plan_with_cache(model, x, paths, cfg, epoch_idx=0, plan_cache={})
@@ -527,35 +538,53 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
             rec_vals[valid] = M_rec[b_idx[valid], 0, f_idx[valid], t_idx[valid]]
             logits = rec_vals.clamp(-6.0, 6.0)
             targets01 = bits.float()
-            ce = F.binary_cross_entropy_with_logits(logits[valid], targets01[valid])
+            # Elementwise losses for per-sample and global
+            ce_elem = F.binary_cross_entropy_with_logits(logits, targets01, reduction='none')
             target_sign = (bits * 2 - 1).float() * cfg.base_symbol_amp * plan["amp"]
-            mse = F.mse_loss(rec_vals[valid], target_sign[valid])
+            mse_elem = (rec_vals - target_sign).pow(2)
             perc_out = loss_perc(x, x_wm)
             perc = perc_out["total_perceptual_loss"]
             mfcc = perc_out["mfcc_cos"]
             pred_bits = (rec_vals > 0).long()
-            ber = (pred_bits[valid] != bits[valid]).float().mean()
-            bers.append(float(ber))
+            err = (pred_bits != bits).float()
+            # Per-item counts and masked sums
+            n_i = valid.sum(dim=1).clamp_min(1)
+            ce_sum_i = (ce_elem * valid.float()).sum(dim=1)
+            mse_sum_i = (mse_elem * valid.float()).sum(dim=1)
+            err_sum_i = (err * valid.float()).sum(dim=1)
+            ce_i = ce_sum_i / n_i
+            mse_i = mse_sum_i / n_i
+            ber_i = err_sum_i / n_i
+            # Batch means over items
+            ce_batch_mean = ce_i.mean()
+            mse_batch_mean = mse_i.mean()
+            ber_batch_mean = ber_i.mean()
+            # Accumulate sample-mean style (multiply by B)
+            metrics["ce_sample_mean"] += float(ce_batch_mean) * B
+            metrics["mse_sample_mean"] += float(mse_batch_mean) * B
+            metrics["ber_sample_mean"] += float(ber_batch_mean) * B
+            metrics["perc_sample_mean"] += float(perc) * B
+            metrics["mfcc_sample_mean"] += float(mfcc) * B
+            # Accumulate global sums
+            metrics["ce_global"] += float(ce_sum_i.sum())
+            metrics["mse_global"] += float(mse_sum_i.sum())
+            metrics["ber_global"] += float(err_sum_i.sum())
+            metrics["valid_bits"] += float(n_i.sum())
             # Payload BER
             if cfg.use_rs_interleave:
                 try:
-                    recovered_payload = decode_payload_with_rs(pred_bits[0].detach(), cfg.rs_interleave_depth, cfg.rs_payload_bytes)
-                    original_payload = decode_payload_with_rs(bits[0].detach(), cfg.rs_interleave_depth, cfg.rs_payload_bytes)
-                    payload_ber = sum(b1 != b2 for b1, b2 in zip(recovered_payload, original_payload)) / len(original_payload) if original_payload else 1.0
-                except:
-                    payload_ber = 1.0
-                payload_bers.append(payload_ber)
-            ce_sum += float(ce)
-            mse_sum += float(mse)
-            perc_sum += float(perc)
-            metrics["mfcc"] += float(mfcc)
-            if len(bers) > 0:
-                metrics["ber"] += sum(bers) / len(bers) * B
-                if cfg.use_rs_interleave and len(payload_bers) > 0:
-                    metrics["payload_ber"] += sum(payload_bers) / len(payload_bers) * B
-                metrics["bits_ce"] += ce_sum * 1.0
-                metrics["bits_mse"] += mse_sum * 1.0
-                metrics["perc"] += perc_sum * 1.0
+                    # Compute per-item payload BER and average per batch
+                    pbers = []
+                    for i in range(B):
+                        rec_payload = decode_payload_with_rs(pred_bits[i].detach(), cfg.rs_interleave_depth, cfg.rs_payload_bytes)
+                        orig_payload = decode_payload_with_rs(bits[i].detach(), cfg.rs_interleave_depth, cfg.rs_payload_bytes)
+                        if len(orig_payload) == 0:
+                            pbers.append(1.0)
+                        else:
+                            pbers.append(sum(b1 != b2 for b1, b2 in zip(rec_payload, orig_payload)) / len(orig_payload))
+                    metrics["payload_ber"] += float(sum(pbers) / len(pbers)) * B
+                except Exception:
+                    metrics["payload_ber"] += 1.0 * B
 
     # All-reduce sums across DDP ranks before normalizing
     if dist.is_available() and dist.is_initialized():
@@ -565,15 +594,40 @@ def validate(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptua
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
         for i, k in enumerate(keys):
             metrics[k] = float(t[i].item())
-    for k in metrics:
-        metrics[k] = metrics[k] / len(loader.dataset)
-    return metrics
+    # Finalize: sample means divide by N, global divide by valid_bits
+    N = len(loader.dataset)
+    out = {
+        "obj": metrics["obj"] / N if N > 0 else 0.0,
+        "ber_sample_mean": metrics["ber_sample_mean"] / N if N > 0 else 0.0,
+        "ce_sample_mean": metrics["ce_sample_mean"] / N if N > 0 else 0.0,
+        "mse_sample_mean": metrics["mse_sample_mean"] / N if N > 0 else 0.0,
+        "perc_sample_mean": metrics["perc_sample_mean"] / N if N > 0 else 0.0,
+        "mfcc_sample_mean": metrics["mfcc_sample_mean"] / N if N > 0 else 0.0,
+        "payload_ber": metrics["payload_ber"] / N if N > 0 else 0.0,
+        "ber_global": (metrics["ber_global"] / metrics["valid_bits"]) if metrics["valid_bits"] > 0 else 0.0,
+        "ce_global": (metrics["ce_global"] / metrics["valid_bits"]) if metrics["valid_bits"] > 0 else 0.0,
+        "mse_global": (metrics["mse_global"] / metrics["valid_bits"]) if metrics["valid_bits"] > 0 else 0.0,
+    }
+    return out
 
 
 def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPerceptualLoss, optimizer: torch.optim.Optimizer, scaler, cfg: TrainConfig, loader: DataLoader, *, epoch_idx: int, plan_cache: dict) -> dict:
     model.train()
     base_model = getattr(model, "module", model)
-    running = {"obj": 0.0, "ber": 0.0, "bits_ce": 0.0, "bits_mse": 0.0, "perc": 0.0, "mfcc": 0.0}
+    # Sample-mean accumulators (train-style normalization: add batch_mean * B)
+    running = {
+        "obj": 0.0,
+        "ber_sample_mean": 0.0,
+        "ce_sample_mean": 0.0,
+        "mse_sample_mean": 0.0,
+        "perc_sample_mean": 0.0,
+        "mfcc_sample_mean": 0.0,
+        # Global (symbol-weighted)
+        "ber_global": 0.0,   # numerator (err bits)
+        "ce_global": 0.0,    # sum
+        "mse_global": 0.0,   # sum
+        "valid_bits": 0.0,
+    }
     pbar = tqdm(
         enumerate(loader),
         total=len(loader),
@@ -635,9 +689,13 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
             # Keep unclamped rec_vals for MSE to reflect scale gaps
             logits = rec_vals.clamp(-6.0, 6.0)  # Clamp only for BCE
             targets01 = bits.float()
-            L_bits_ce = F.binary_cross_entropy_with_logits(logits[valid], targets01[valid])
+            # Elementwise losses to enable per-sample and global stats
+            ce_elem = F.binary_cross_entropy_with_logits(logits, targets01, reduction='none')
             target_sign = (bits * 2 - 1).float() * cfg.base_symbol_amp * amp
-            L_bits_mse = F.mse_loss(rec_vals[valid], target_sign[valid])
+            mse_elem = (rec_vals - target_sign).pow(2)
+            # Batch-level mean (for objective)
+            L_bits_ce = (ce_elem[valid].mean())
+            L_bits_mse = (mse_elem[valid].mean())
             perc_out = loss_perc(x.float(), x_wm.float())
             L_perc = perc_out["total_perceptual_loss"]
             L_mfcc = perc_out["mfcc_cos"]
@@ -655,22 +713,43 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
 
         with torch.no_grad():
             pred_bits = (rec_vals > 0).long()
-            ber = (pred_bits[valid] != bits[valid]).float().mean()
+            err = (pred_bits != bits).float()
+            # Per-item counts
+            n_i = valid.sum(dim=1).clamp_min(1)
+            ce_sum_i = (ce_elem * valid.float()).sum(dim=1)
+            mse_sum_i = (mse_elem * valid.float()).sum(dim=1)
+            err_sum_i = (err * valid.float()).sum(dim=1)
+            ce_i = ce_sum_i / n_i
+            mse_i = mse_sum_i / n_i
+            ber_i = err_sum_i / n_i
+            # Batch means over items
+            ce_batch_mean = ce_i.mean()
+            mse_batch_mean = mse_i.mean()
+            ber_batch_mean = ber_i.mean()
+            # Accumulate sample-mean style
             running["obj"] += float(L_obj) * B
-            running["ber"] += float(ber) * B
-            running["bits_ce"] += float(L_bits_ce) * B
-            running["bits_mse"] += float(L_bits_mse) * B
-            running["perc"] += float(L_perc) * B
-            running["mfcc"] += float(L_mfcc) * B
+            running["ce_sample_mean"] += float(ce_batch_mean) * B
+            running["mse_sample_mean"] += float(mse_batch_mean) * B
+            running["ber_sample_mean"] += float(ber_batch_mean) * B
+            running["perc_sample_mean"] += float(L_perc) * B
+            running["mfcc_sample_mean"] += float(L_mfcc) * B
+            # Accumulate global sums
+            running["ce_global"] += float(ce_sum_i.sum())
+            running["mse_global"] += float(mse_sum_i.sum())
+            running["ber_global"] += float(err_sum_i.sum())
+            running["valid_bits"] += float(n_i.sum())
 
         if (step + 1) % cfg.log_interval == 0:
             pbar.set_postfix({
                 "obj": f"{running['obj'] / ((step+1)*loader.batch_size):.4f}",
-                "ber": f"{running['ber'] / ((step+1)*loader.batch_size):.4f}",
-                "ce": f"{running['bits_ce'] / ((step+1)*loader.batch_size):.4f}",
-                "mse": f"{running['bits_mse'] / ((step+1)*loader.batch_size):.4f}",
-                "perc": f"{running['perc'] / ((step+1)*loader.batch_size):.4f}",
-                "mfcc": f"{running['mfcc'] / ((step+1)*loader.batch_size):.4f}",
+                "ber_s": f"{running['ber_sample_mean'] / ((step+1)*loader.batch_size):.4f}",
+                "ce_s": f"{running['ce_sample_mean'] / ((step+1)*loader.batch_size):.4f}",
+                "mse_s": f"{running['mse_sample_mean'] / ((step+1)*loader.batch_size):.4f}",
+                "perc_s": f"{running['perc_sample_mean'] / ((step+1)*loader.batch_size):.4f}",
+                "mfcc_s": f"{running['mfcc_sample_mean'] / ((step+1)*loader.batch_size):.4f}",
+                "ber_g": f"{(running['ber_global'] / max(1.0, running['valid_bits'])):.4f}",
+                "ce_g": f"{(running['ce_global'] / max(1.0, running['valid_bits'])):.4f}",
+                "mse_g": f"{(running['mse_global'] / max(1.0, running['valid_bits'])):.4f}",
             })
 
     # All-reduce sums across DDP ranks before normalizing
@@ -681,9 +760,20 @@ def train_one_epoch(model: INNWatermarker, stft_cfg: dict, loss_perc: CombinedPe
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
         for i, k in enumerate(keys):
             running[k] = float(t[i].item())
-    for k in running:
-        running[k] = running[k] / len(loader.dataset)
-    return running
+    # Finalize epoch metrics
+    N = len(loader.dataset)
+    out = {
+        "obj": running["obj"] / N if N > 0 else 0.0,
+        "ber_sample_mean": running["ber_sample_mean"] / N if N > 0 else 0.0,
+        "ce_sample_mean": running["ce_sample_mean"] / N if N > 0 else 0.0,
+        "mse_sample_mean": running["mse_sample_mean"] / N if N > 0 else 0.0,
+        "perc_sample_mean": running["perc_sample_mean"] / N if N > 0 else 0.0,
+        "mfcc_sample_mean": running["mfcc_sample_mean"] / N if N > 0 else 0.0,
+        "ber_global": (running["ber_global"] / running["valid_bits"]) if running["valid_bits"] > 0 else 0.0,
+        "ce_global": (running["ce_global"] / running["valid_bits"]) if running["valid_bits"] > 0 else 0.0,
+        "mse_global": (running["mse_global"] / running["valid_bits"]) if running["valid_bits"] > 0 else 0.0,
+    }
+    return out
 
 
 def main(cfg: TrainConfig) -> None:
@@ -919,15 +1009,27 @@ def main(cfg: TrainConfig) -> None:
             log(f"\nEpoch {epoch}/{cfg.epochs}")
         tr = train_one_epoch(model, stft_cfg, loss_perc, optimizer, scaler, cfg, train_loader, epoch_idx=epoch, plan_cache=plan_cache)
         if (not is_distributed) or rank == 0:
-            log(f"train: obj={tr['obj']:.4f} ber={tr['ber']:.4f} ce={tr['bits_ce']:.4f} mse={tr['bits_mse']:.4f} perc={tr['perc']:.4f} mfcc={tr['mfcc']:.4f}")
+            log(
+                "train: "
+                f"obj={tr['obj']:.4f} "
+                f"ber_s={tr['ber_sample_mean']:.4f} ce_s={tr['ce_sample_mean']:.4f} mse_s={tr['mse_sample_mean']:.4f} "
+                f"perc_s={tr['perc_sample_mean']:.4f} mfcc_s={tr['mfcc_sample_mean']:.4f} "
+                f"| ber_g={tr['ber_global']:.4f} ce_g={tr['ce_global']:.4f} mse_g={tr['mse_global']:.4f}"
+            )
         va = validate(model, stft_cfg, loss_perc, cfg, val_loader)
         if (not is_distributed) or rank == 0:
             payload_ber_str = f" p_ber={va['payload_ber']:.4f}" if cfg.use_rs_interleave else ""
-            log(f"val  : ber={va['ber']:.4f}{payload_ber_str} ce={va['bits_ce']:.4f} mse={va['bits_mse']:.4f} perc={va['perc']:.4f} mfcc={va['mfcc']:.4f}")
+            log(
+                "val  : "
+                f"obj={va['obj']:.4f} "
+                f"ber_s={va['ber_sample_mean']:.4f} ce_s={va['ce_sample_mean']:.4f} mse_s={va['mse_sample_mean']:.4f} "
+                f"perc_s={va['perc_sample_mean']:.4f} mfcc_s={va['mfcc_sample_mean']:.4f}{payload_ber_str} "
+                f"| ber_g={va['ber_global']:.4f} ce_g={va['ce_global']:.4f} mse_g={va['mse_global']:.4f}"
+            )
 
         # Save by best BER
-        if ((not is_distributed) or rank == 0) and (va["ber"] < best_ber):
-            best_ber = va["ber"]
+        if ((not is_distributed) or rank == 0) and (va["ber_sample_mean"] < best_ber):
+            best_ber = va["ber_sample_mean"]
             ckpt_path = os.path.join(cfg.save_dir, "inn_decode_best.pt")
             to_save = model.module if hasattr(model, "module") else model
             torch.save({

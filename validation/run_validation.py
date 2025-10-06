@@ -113,8 +113,6 @@ def run_embed(
         str(audio_path),
         "--out",
         str(out_audio),
-        "--spec_out",
-        str(spec_path),
         "--payload",
         payload,
         "--planner",
@@ -388,7 +386,13 @@ def write_results(path: Path, records: Iterable[ValidationRecord]) -> None:
         "attacked_audio",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+            quoting=csv.QUOTE_MINIMAL,
+            escapechar='\\',
+            lineterminator="\n",
+        )
         writer.writeheader()
         for rec in records:
             writer.writerow({
@@ -418,6 +422,7 @@ def process_manifest(
     decode_script: Path,
     results_path: Path,
     planner: str = "mg",
+    augment_enabled: bool = True,
 ) -> list[ValidationRecord]:
     rows = _read_manifest(manifest)
     root = manifest.parent.parent if manifest.parts[-2] == "validation" else Path.cwd()
@@ -426,7 +431,7 @@ def process_manifest(
     for idx, row in enumerate(rows, start=1):
         audio_rel = row.get("audio_path", "")
         payload = row.get("payload", "")
-        out_dir_rel = row.get("out_dir", "validation/output")
+        out_dir_rel = row.get("out_dir", "watermark_new/validation/output")
         augment_str = row.get("augment", "")
 
         audio_path = Path(audio_rel)
@@ -547,7 +552,7 @@ def process_manifest(
 
         # Apply augmentation chain if provided
         augment_chain = [tok for tok in augment_str.split("|") if tok]
-        if augment_chain:
+        if augment_enabled and augment_chain:
             attack_label = _slugify("_".join(augment_chain))
             attack_audio_path = clip_out_dir / f"attack_{attack_label}.wav"
             logging.info("[%03d] Applying augmentations %s", idx, augment_chain)
@@ -597,6 +602,8 @@ def process_manifest(
                     )
                 )
         else:
+            if not augment_enabled and augment_chain:
+                logging.info("[%03d] Augmentations present but disabled by flag; skipping", idx)
             logging.debug("[%03d] No augmentations listed; skipping attack phase", idx)
 
     write_results(results_path, records)
@@ -605,12 +612,13 @@ def process_manifest(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run validation suite for decoder checkpoint")
-    parser.add_argument("--manifest", type=Path, default=Path("validation/manifest.csv"))
+    parser.add_argument("--manifest", type=Path, default=Path("watermark_new/validation/manifest.csv"))
     parser.add_argument("--ckpt", type=Path, required=True, help="Checkpoint to validate")
-    parser.add_argument("--inference-script", type=Path, default=Path("inference/new_inference.py"))
-    parser.add_argument("--decode-script", type=Path, default=Path("inference/decode_watermark.py"))
-    parser.add_argument("--results", type=Path, default=Path("validation/results.csv"))
+    parser.add_argument("--inference-script", type=Path, default=Path("watermark_new/inference/new_inference.py"))
+    parser.add_argument("--decode-script", type=Path, default=Path("watermark_new/inference/decode_watermark.py"))
+    parser.add_argument("--results", type=Path, default=Path("watermark_new/validation/results.csv"))
     parser.add_argument("--planner", type=str, default="mg", choices=["mg", "gpu"], help="Planner to pass through")
+    parser.add_argument("--no-augment", action="store_true", help="Disable applying augmentations even if present in manifest")
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args(argv)
@@ -624,6 +632,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             decode_script=args.decode_script,
             results_path=args.results,
             planner=args.planner,
+            augment_enabled=not args.no_augment,
         )
     except Exception as exc:
         logging.exception("Validation run failed: %s", exc)
