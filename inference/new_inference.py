@@ -164,6 +164,18 @@ def _save_spectrogram_side_by_side(orig: torch.Tensor, wm: torch.Tensor, n_fft: 
     Tm = min(M1.size(-1), M2.size(-1))
     M1 = M1[:, :Tm]
     M2 = M2[:, :Tm]
+    
+    # Remove any trailing silence/black regions by finding the last non-silent frame
+    # Find the last frame with significant energy (above -60 dB threshold)
+    energy1 = torch.log10(M1 + 1e-9).max(dim=0)[0]  # Max energy per frame
+    energy2 = torch.log10(M2 + 1e-9).max(dim=0)[0]
+    max_energy = torch.maximum(energy1, energy2)
+    last_active_frame = torch.where(max_energy > -60.0)[0]
+    if len(last_active_frame) > 0:
+        last_frame = last_active_frame[-1].item() + 1
+        M1 = M1[:, :last_frame]
+        M2 = M2[:, :last_frame]
+    
     # Convert to dB relative to a common reference to avoid extreme ranges
     ref = torch.maximum(M1.max(), M2.max()).clamp_min(1e-6)
     S1 = (20.0 * torch.log10(M1 / ref)).cpu().numpy()
@@ -176,13 +188,16 @@ def _save_spectrogram_side_by_side(orig: torch.Tensor, wm: torch.Tensor, n_fft: 
     im1 = axs[1].imshow(S2, origin='lower', aspect='auto', vmin=vmin, vmax=vmax, cmap='magma')
     axs[1].set_title('Watermarked')
     for ax in axs:
-        ax.set_xlabel('Frames'); ax.set_ylabel('Frequency bins')
-    cbar = fig.colorbar(im1, ax=axs.ravel().tolist(), shrink=0.8)
-    cbar.set_label('dB (relative)')
+        ax.set_xlabel('Frames')
+        ax.set_ylabel('Frequency bins')
+    
+    # Fix colorbar positioning - only attach to the right subplot
+    cbar = fig.colorbar(im1, ax=axs[1], shrink=0.8, pad=0.02)
+    cbar.set_label('dB (relative)', rotation=270, labelpad=20)
+    
     fig.tight_layout()
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
-
 
 @torch.no_grad()
 def main():
@@ -194,9 +209,13 @@ def main():
     parser.add_argument("--payload", type=str, default="ISRC12345678910,ISWC12345678910,duration4:20,RDate10/10/10")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--planner", type=str, default=None, choices=[None, "gpu", "mg"], help="Override planner (default: use checkpoint cfg)")
-    parser.add_argument("--slots_out", type=str, default=None, help="Optional path to write slots per chunk as JSON for reuse in decode")
     args = parser.parse_args()
+    
+    print(f"Starting inference with checkpoint: {args.ckpt}")
+    print(f"Audio file: {args.audio}")
+    print(f"Device: {args.device}")
 
+    print("Loading checkpoint...")
     state = torch.load(args.ckpt, map_location=args.device)
     cfg = state.get("cfg", {})
     n_fft = int(cfg.get("n_fft", 1024))
@@ -206,19 +225,23 @@ def main():
     rs_payload_bytes = int(cfg.get("rs_payload_bytes", 125))
     rs_interleave_depth = int(cfg.get("rs_interleave_depth", 4))
     planner = args.planner or cfg.get("planner", "mg")
+    print(f"Config loaded: n_fft={n_fft}, hop={hop}, target_bits={target_bits}, base_symbol_amp={base_symbol_amp}")
 
+    print("Building model...")
     model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": n_fft, "hop_length": hop, "win_length": n_fft}).to(args.device)
     model.load_state_dict(state.get("model_state", state), strict=False)
     model.eval()
+    print("Model loaded successfully")
 
+    print("Loading audio...")
     wav, sr = _load_audio_mono(args.audio)
     if sr != TARGET_SR:
         raise RuntimeError(f"Unexpected SR after resample: {sr}")
     chunks = _chunk_audio_1s(wav)  # list of [1,T]
+    print(f"Audio loaded: {len(chunks)} chunks")
 
     # Plan per chunk
     planned = []
-    slots_per_chunk_json = []
     total_capacity = 0
     for ch in chunks:
         x = ch.to(args.device).unsqueeze(0)
@@ -228,7 +251,6 @@ def main():
             slots, amp_scale = _mg_plan_slots(model, x, target_bits, n_fft)
         S = min(len(slots), target_bits)
         planned.append((x, slots, amp_scale, S))
-        slots_per_chunk_json.append([[int(f), int(t)] for (f, t) in slots[:S]])
         total_capacity += S
 
     rs_code_bits = 167 * 8
@@ -280,19 +302,9 @@ def main():
         except Exception:
             recovered_text = ""
 
-    # Save outputs
-    torchaudio.save(args.out, x_wm_full.cpu(), sample_rate=TARGET_SR)
-    _save_spectrogram_side_by_side(x_full.to(args.device), x_wm_full.to(args.device), n_fft=n_fft, hop=hop, out_path=args.spec_out)
-
-    # Optionally save slots per chunk
-    if args.slots_out:
-        try:
-            import json
-            with open(args.slots_out, "w", encoding="utf-8") as f:
-                json.dump({"slots_per_chunk": slots_per_chunk_json}, f)
-            print(f"Saved slots to: {args.slots_out}")
-        except Exception as e:
-            print(f"Failed to save slots to {args.slots_out}: {e}")
+    # Save outputs (ensure tensors are detached for CPU/GPU compatibility)
+    torchaudio.save(args.out, x_wm_full.detach().cpu(), sample_rate=TARGET_SR)
+    _save_spectrogram_side_by_side(x_full.to(args.device).detach(), x_wm_full.to(args.device).detach(), n_fft=n_fft, hop=hop, out_path=args.spec_out)
 
     print(f"BER={ber:.6f}")
     if recovered_text:
@@ -306,176 +318,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-@torch.no_grad()
-def _mg_plan_slots(model: INNWatermarker, x_wave: torch.Tensor, target_bits: int, n_fft: int) -> tuple[list[tuple[int,int]], torch.Tensor]:
-    """Moore–Glasberg allocator (same as training MG path)."""
-    X = model.stft(x_wave)
-    slots, amp = allocate_slots_and_amplitudes(X, TARGET_SR, n_fft, target_bits, amp_safety=1.0)
-    if isinstance(amp, torch.Tensor):
-        amp_t = amp
-    else:
-        import numpy as np  # local import
-        if isinstance(amp, np.ndarray):
-            amp_t = torch.from_numpy(amp)
-        else:
-            amp_t = torch.ones(len(slots), dtype=torch.float32)
-    return slots, amp_t.to(x_wave.device)
-
-
-def _encode_payload_bits_from_text(text: str, rs_payload_bytes: int, interleave_depth: int, target_bits: int, device: torch.device) -> torch.Tensor:
-    # Convert text to bytes; pad/truncate to rs_payload_bytes
-    raw = text.encode("utf-8", errors="ignore")
-    if len(raw) >= rs_payload_bytes:
-        payload_bytes = raw[:rs_payload_bytes]
-    else:
-        payload_bytes = raw + bytes(rs_payload_bytes - len(raw))
-    # RS encode -> interleave -> bits
-    rs_encoded = rs_encode_167_125(payload_bytes)
-    interleaved = interleave_bytes(rs_encoded, interleave_depth)
-    bits = []
-    for b in interleaved:
-        for k in range(8):
-            bits.append((b >> k) & 1)
-    bit_t = torch.tensor(bits, dtype=torch.long, device=device)
-    # Truncate/pad to exactly target_bits
-    if bit_t.numel() >= target_bits:
-        bit_t = bit_t[:target_bits]
-    else:
-        pad = torch.zeros(target_bits - bit_t.numel(), dtype=torch.long, device=device)
-        bit_t = torch.cat([bit_t, pad], dim=0)
-    return bit_t.unsqueeze(0)  # [1, S]
-
-
-def _decode_payload_bits(bits: torch.Tensor, interleave_depth: int, expected_payload_bytes: int) -> bytes:
-    # bits: [S] or [1,S]
-    if bits.dim() == 2:
-        bits = bits[0]
-    by = bytearray()
-    for i in range(0, len(bits), 8):
-        if i + 8 > len(bits):
-            break
-        b = 0
-        for k in range(8):
-            b |= (int(bits[i + k]) & 1) << k
-        by.append(b)
-    deint = deinterleave_bytes(bytes(by), interleave_depth)
-    try:
-        decoded = rs_decode_167_125(deint)
-        return decoded[:expected_payload_bytes]
-    except Exception:
-        return bytes(expected_payload_bytes)
-
-
-@torch.no_grad()
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, required=True, help="Path to decode checkpoint (.pt)")
-    parser.add_argument("--audio", type=str, required=True, help="Path to input audio file")
-    parser.add_argument("--out", type=str, default="watermarked.wav", help="Path to save watermarked audio (wav)")
-    parser.add_argument("--payload", type=str, default="ISRC12345678910,ISWC12345678910,duration4:20,RDate10/10/10")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--planner", type=str, default=None, choices=[None, "gpu", "mg"], help="Override planner (default: use checkpoint cfg)")
-    args = parser.parse_args()
-
-    # Load checkpoint and recover training config
-    state = torch.load(args.ckpt, map_location=args.device)
-    cfg = state.get("cfg", {})
-    n_fft = int(cfg.get("n_fft", 1024))
-    hop = int(cfg.get("hop", 512))
-    base_symbol_amp = float(cfg.get("base_symbol_amp", 0.03))
-    target_bits = int(cfg.get("target_bits", 1336))
-    rs_payload_bytes = int(cfg.get("rs_payload_bytes", 125))
-    rs_interleave_depth = int(cfg.get("rs_interleave_depth", 4))
-    planner = args.planner or cfg.get("planner", "mg")
-
-    # Build model with same STFT config
-    model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": n_fft, "hop_length": hop, "win_length": n_fft}).to(args.device)
-    model.load_state_dict(state.get("model_state", state), strict=False)
-    model.eval()
-
-    # Load audio (mono), resample to 22050, split into 1s chunks
-    wav, sr = _load_audio_mono(args.audio)
-    if sr != TARGET_SR:
-        raise RuntimeError(f"Unexpected SR after resample: {sr}")
-    chunks = _chunk_audio_1s(wav)  # list of [1, T]
-
-    # Plan per chunk and accumulate capacity
-    planned = []
-    total_capacity = 0
-    for ch in chunks:
-        x = ch.to(args.device).unsqueeze(0)
-        if planner == "gpu":
-            slots, amp_scale = _fast_gpu_plan_slots(model, x, target_bits)
-        else:
-            slots, amp_scale = _mg_plan_slots(model, x, target_bits, n_fft)
-        S = min(len(slots), target_bits)
-        planned.append((x, slots, amp_scale, S))
-        total_capacity += S
-
-    # Build payload bits once to fill at least one RS codeword and all chunks
-    rs_code_bits = 167 * 8
-    want_bits = max(rs_code_bits, total_capacity)
-    payload_bits = _encode_payload_bits_from_text(args.payload, rs_payload_bytes, rs_interleave_depth, want_bits, device=torch.device(args.device))
-
-    # Encode per chunk and collect recovered bits
-    wm_chunks = []
-    rec_bits_list = []
-    cursor = 0
-    for (x, slots, amp_scale, S) in planned:
-        if S == 0:
-            wm_chunks.append(x)
-            continue
-        bits_i = payload_bits[:, cursor:cursor+S]
-        if bits_i.size(1) < S:
-            pad = torch.zeros(1, S - bits_i.size(1), dtype=torch.long, device=x.device)
-            bits_i = torch.cat([bits_i, pad], dim=1)
-        cursor += S
-
-        X = model.stft(x)
-        F_, T_ = X.shape[-2], X.shape[-1]
-        M_spec = torch.zeros(1, 2, F_, T_, device=x.device)
-        amp_vec = amp_scale[:S].to(x.device) if isinstance(amp_scale, torch.Tensor) else torch.ones(S, device=x.device)
-        signs = (bits_i * 2 - 1).float() * base_symbol_amp * amp_vec.unsqueeze(0)
-        for s, (f, t) in enumerate(slots[:S]):
-            M_spec[0, 0, f, t] = signs[0, s]
-
-        x_wm, _ = model.encode(x, M_spec)
-        x_wm = torch.clamp(x_wm, -1.0, 1.0)
-        M_rec = model.decode(x_wm)
-        rec_vals = torch.stack([M_rec[0, 0, f, t] for (f, t) in slots[:S]], dim=0).unsqueeze(0)
-        rec_bits = (rec_vals > 0).long()
-        rec_bits_list.append(rec_bits)
-        wm_chunks.append(x_wm)
-
-    # Concatenate watermarked chunks
-    x_wm_full = torch.cat([ch.squeeze(0) for ch in wm_chunks], dim=-1)
-
-    # Compute BER over available bits (up to one RS codeword)
-    all_rec_bits = torch.cat(rec_bits_list, dim=1) if len(rec_bits_list) > 0 else torch.zeros(1, 0, dtype=torch.long, device=torch.device(args.device))
-    compare_len = min(all_rec_bits.size(1), payload_bits.size(1))
-    ber = (all_rec_bits[:, :compare_len] != payload_bits[:, :compare_len]).float().mean().item() if compare_len > 0 else 1.0
-
-    # Attempt RS decode if we have a full codeword
-    recovered_text = ""
-    if all_rec_bits.size(1) >= rs_code_bits:
-        recovered_payload = _decode_payload_bits(all_rec_bits[0, :rs_code_bits].detach().cpu(), rs_interleave_depth, rs_payload_bytes)
-        try:
-            recovered_text = recovered_payload.decode("utf-8", errors="ignore")
-        except Exception:
-            recovered_text = ""
-
-    # Save full watermarked audio
-    torchaudio.save(args.out, x_wm_full.cpu(), sample_rate=TARGET_SR)
-
-    print(f"n_fft={n_fft} hop={hop} target_bits={target_bits} base_symbol_amp={base_symbol_amp}")
-    print(f"BER={ber:.6f}")
-    if recovered_text:
-        print(f"Recovered payload (utf-8, truncated): {recovered_text[:128]}")
-    else:
-        print("Recovered payload unavailable (insufficient bits for full RS decode)")
-    print(f"Saved watermarked audio to: {args.out}")
-
-
-if __name__ == "__main__":
-    main()
