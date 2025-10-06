@@ -102,6 +102,7 @@ def run_embed(
     payload: str,
     out_audio: Path,
     spec_path: Path,
+    slots_path: Path | None,
     planner: str = "mg",
 ) -> EmbedResult:
     cmd = [
@@ -118,6 +119,8 @@ def run_embed(
         "--planner",
         planner,
     ]
+    if slots_path is not None:
+        cmd.extend(["--slots_out", str(slots_path)])
     proc = subprocess.run(cmd, capture_output=True, text=True)
     ber = None
     match = re.search(r"BER=([0-9.]+)", proc.stdout)
@@ -141,6 +144,7 @@ def run_decode(
     ckpt: Path,
     audio_path: Path,
     out_text: Path,
+    slots_path: Path | None = None,
     planner: str = "mg",
 ) -> DecodeResult:
     cmd = [
@@ -155,6 +159,8 @@ def run_decode(
         "--planner",
         planner,
     ]
+    if slots_path is not None and slots_path.exists():
+        cmd.extend(["--slots", str(slots_path)])
     proc = subprocess.run(cmd, capture_output=True, text=True)
     bits = None
     recovered = None
@@ -465,6 +471,7 @@ def process_manifest(
 
         wm_audio = clip_out_dir / "clean_wm.wav"
         spec_path = clip_out_dir / "clean_spec.png"
+        slots_json = clip_out_dir / "slots.json"
 
         # If source is not WAV, try to transcode to WAV to avoid codec/backend issues
         src_for_embed = audio_path
@@ -488,6 +495,7 @@ def process_manifest(
             payload=payload,
             out_audio=wm_audio,
             spec_path=spec_path,
+            slots_path=slots_json,
             planner=planner,
         )
 
@@ -527,11 +535,13 @@ def process_manifest(
         # Decode clean watermarked audio
         decode_clean_path = clip_out_dir / "clean_recovered.txt"
         logging.info("[%03d] Decoding clean output", idx)
+        # Decode clean using exact slots if present
         decode_res = run_decode(
             decode_script=decode_script,
             ckpt=ckpt,
             audio_path=wm_audio,
             out_text=decode_clean_path,
+            slots_path=slots_json,
             planner=planner,
         )
         record_clean = ValidationRecord(
@@ -583,6 +593,7 @@ def process_manifest(
                     ckpt=ckpt,
                     audio_path=attack_audio_path,
                     out_text=decode_attack_path,
+                    slots_path=slots_json,
                     planner=planner,
                 )
                 records.append(

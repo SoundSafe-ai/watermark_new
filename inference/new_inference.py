@@ -194,6 +194,7 @@ def main():
     parser.add_argument("--payload", type=str, default="ISRC12345678910,ISWC12345678910,duration4:20,RDate10/10/10")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--planner", type=str, default=None, choices=[None, "gpu", "mg"], help="Override planner (default: use checkpoint cfg)")
+    parser.add_argument("--slots_out", type=str, default=None, help="Optional path to write slots per chunk as JSON for reuse in decode")
     args = parser.parse_args()
 
     state = torch.load(args.ckpt, map_location=args.device)
@@ -217,6 +218,7 @@ def main():
 
     # Plan per chunk
     planned = []
+    slots_per_chunk_json = []
     total_capacity = 0
     for ch in chunks:
         x = ch.to(args.device).unsqueeze(0)
@@ -226,6 +228,7 @@ def main():
             slots, amp_scale = _mg_plan_slots(model, x, target_bits, n_fft)
         S = min(len(slots), target_bits)
         planned.append((x, slots, amp_scale, S))
+        slots_per_chunk_json.append([[int(f), int(t)] for (f, t) in slots[:S]])
         total_capacity += S
 
     rs_code_bits = 167 * 8
@@ -280,6 +283,16 @@ def main():
     # Save outputs
     torchaudio.save(args.out, x_wm_full.cpu(), sample_rate=TARGET_SR)
     _save_spectrogram_side_by_side(x_full.to(args.device), x_wm_full.to(args.device), n_fft=n_fft, hop=hop, out_path=args.spec_out)
+
+    # Optionally save slots per chunk
+    if args.slots_out:
+        try:
+            import json
+            with open(args.slots_out, "w", encoding="utf-8") as f:
+                json.dump({"slots_per_chunk": slots_per_chunk_json}, f)
+            print(f"Saved slots to: {args.slots_out}")
+        except Exception as e:
+            print(f"Failed to save slots to {args.slots_out}: {e}")
 
     print(f"BER={ber:.6f}")
     if recovered_text:
