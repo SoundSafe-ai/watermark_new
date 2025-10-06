@@ -461,11 +461,25 @@ def process_manifest(
         wm_audio = clip_out_dir / "clean_wm.wav"
         spec_path = clip_out_dir / "clean_spec.png"
 
-        logging.info("[%03d] Embedding payload into %s", idx, audio_path)
+        # If source is not WAV, try to transcode to WAV to avoid codec/backend issues
+        src_for_embed = audio_path
+        if audio_path.suffix.lower() != ".wav" and _ffmpeg_available():
+            trans_wav = clip_out_dir / "source_converted.wav"
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", str(audio_path), str(trans_wav)
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode == 0 and trans_wav.exists():
+                src_for_embed = trans_wav
+            else:
+                logging.warning("[%03d] ffmpeg failed to convert %s to wav: %s", idx, audio_path, proc.stderr.strip())
+
+        logging.info("[%03d] Embedding payload into %s", idx, src_for_embed)
         embed_res = run_embed(
             inference_script=inference_script,
             ckpt=ckpt,
-            audio_path=audio_path,
+            audio_path=src_for_embed,
             payload=payload,
             out_audio=wm_audio,
             spec_path=spec_path,
@@ -490,9 +504,18 @@ def process_manifest(
         if embed_res.exit_code != 0 or not embed_res.watermarked_audio:
             record_base.notes = "embed_failed"
             record_base.decode_exit = None
+            # Persist logs to assist debugging
+            try:
+                (clip_out_dir / "embed_stdout.txt").write_text(embed_res.stdout, encoding="utf-8")
+                (clip_out_dir / "embed_stderr.txt").write_text(embed_res.stderr, encoding="utf-8")
+            except Exception:
+                pass
+            # Log a short snippet for quick triage
+            err_snip = (embed_res.stderr or "").strip().splitlines()[-1:] or [""]
+            logging.warning("[%03d] Embed stderr tail: %s", idx, err_snip[0])
             records.append(record_base)
             logging.warning(
-                "[%03d] Embed failed for %s (exit %s)", idx, audio_path, embed_res.exit_code
+                "[%03d] Embed failed for %s (exit %s)", idx, src_for_embed, embed_res.exit_code
             )
             continue
 
