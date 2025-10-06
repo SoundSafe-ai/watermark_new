@@ -133,8 +133,8 @@ class TrainConfig:
     val_dir: str = "data/val"
     batch_size: int = 8
     num_workers: int = 2
-    epochs: int = 15
-    lr: float = 5e-4
+    epochs: int = 25
+    lr: float = 1e-5
     weight_decay: float = 1e-5
     mixed_precision: bool = True
     save_dir: str = "decode_payload"
@@ -144,34 +144,34 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_resample: bool = True
     # Initialize from a prior imperceptibility checkpoint (stage-1)
-    init_from: str | None = None  # Try training from scratch for decode
+    init_from: str | None = "inn_decode_best.pt"  # Try training from scratch for decode
     # Limit number of files used (None uses all)
     train_max_files: int | None = None
     val_max_files: int | None = None
     file_seed: int = 42
     # Loss weights
-    w_bits: float = 0.9
+    w_bits: float = 1.0
     w_mse: float = 0.25
     w_perc: float = 0.009
     # Symbol settings
     base_symbol_amp: float = 0.09  # Will be annealed during training
-    target_bits: int = 512  # Fixed number of bits; no curriculum
+    target_bits: int = 1344  # Fixed number of bits; no curriculum
     # RS and interleaving settings
     use_rs_interleave: bool = True
-    rs_payload_bytes: int = 125  # Raw payload size before RS encoding
+    rs_payload_bytes: int = 64     # Raw payload size before RS encoding
     rs_interleave_depth: int = 4  # Interleaving depth
     # RS warmup controls
     rs_warmup_epochs: int = 3
     rs_enable_ber_threshold: float = 0.35
     # Planner selection: "gpu" (fast mel-proxy) or "mg" (Moore–Glasberg)
-    planner: str = "mg"
+    planner: str = "gpu"
     # Cache planning per file; re-plan every N epochs
     replan_every: int = 3
     # File logging
     log_file: str = "train_log.txt"
     # Fixed payload controls
     use_fixed_payload: bool = False
-    payload_text: str = "ISRC12345678910,ISWC12345678910,duration4:20,RDate10/10/10"
+    payload_text: str = "Title:You'reasurvivor,Perf:NikeshShah,ISRC:123456789101,ISWC:123456789012,length:04:20,date:01/01/2025,label:warnerbros"
 
 
 def make_bits(batch_size: int, S: int, device) -> torch.Tensor:
@@ -360,9 +360,13 @@ def build_batch_plan(model: INNWatermarker, x: torch.Tensor, cfg: TrainConfig):
         bits = torch.zeros(B, S_max, dtype=torch.long, device=device)
         for i in range(B):
             payload_bytes = bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
-            encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
+            encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth).to(device)
             # Truncate or pad to match S_max
-            bit_tensor = encoded_bits[:S_max] if len(encoded_bits) >= S_max else torch.cat([encoded_bits, torch.zeros(S_max - len(encoded_bits), dtype=torch.long, device=device)])
+            if encoded_bits.numel() >= S_max:
+                bit_tensor = encoded_bits[:S_max]
+            else:
+                pad = torch.zeros(S_max - encoded_bits.numel(), dtype=torch.long, device=device)
+                bit_tensor = torch.cat([encoded_bits, pad], dim=0)
             bits[i] = bit_tensor
     else:
         bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
@@ -433,7 +437,11 @@ def build_batch_plan_with_cache(model: INNWatermarker, x: torch.Tensor, paths: l
         for i in range(B):
             payload_bytes = fixed_bytes if fixed_bytes is not None else bytes([random.randint(0, 255) for _ in range(cfg.rs_payload_bytes)])
             encoded_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
-            bit_tensor = encoded_bits[:S_max] if len(encoded_bits) >= S_max else torch.cat([encoded_bits, torch.zeros(S_max - len(encoded_bits), dtype=torch.long, device=device)])
+            if isinstance(encoded_bits, torch.Tensor):
+                encoded_bits = encoded_bits.to(device)
+            else:
+                encoded_bits = torch.tensor(encoded_bits, dtype=torch.long, device=device)
+            bit_tensor = encoded_bits[:S_max] if encoded_bits.numel() >= S_max else torch.cat([encoded_bits, torch.zeros(S_max - encoded_bits.numel(), dtype=torch.long, device=device)], dim=0)
             bits[i] = bit_tensor
     else:
         bits = torch.randint(0, 2, (B, S_max), device=device, dtype=torch.long)
@@ -686,6 +694,14 @@ def main(cfg: TrainConfig) -> None:
     except Exception:
         pass
 
+    # If RS interleave is enabled, ensure target_bits matches coded payload length
+    auto_rs_bits = None
+    if cfg.use_rs_interleave:
+        dummy_payload = bytes([0] * cfg.rs_payload_bytes)
+        rs_bits_tensor = encode_payload_with_rs(dummy_payload, cfg.rs_interleave_depth)
+        auto_rs_bits = int(rs_bits_tensor.numel())
+        cfg.target_bits = auto_rs_bits
+
     # Initialize Distributed
     is_distributed = False
     rank = 0
@@ -739,6 +755,8 @@ def main(cfg: TrainConfig) -> None:
 
     if (not is_distributed) or rank == 0:
         log(f"Found {len(train_ds)} training files | {len(val_ds)} validation files")
+        if auto_rs_bits is not None:
+            log(f"RS interleave enabled: setting target_bits to coded length {auto_rs_bits}")
 
     pin = (cfg.device == "cuda")
     # Samplers
@@ -771,14 +789,6 @@ def main(cfg: TrainConfig) -> None:
 
     stft_cfg = {"n_fft": cfg.n_fft, "hop_length": cfg.hop, "win_length": cfg.n_fft}
     model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg=stft_cfg).to(cfg.device)
-    if is_distributed:
-        model = DDP(
-            model,
-            device_ids=[local_rank] if torch.cuda.is_available() else None,
-            output_device=local_rank if torch.cuda.is_available() else None,
-            broadcast_buffers=False,
-            find_unused_parameters=False,
-        )
     # Warm-start from Stage-1 (imperceptibility) checkpoint if provided
     if cfg.init_from:
         if os.path.isfile(cfg.init_from):
@@ -802,6 +812,16 @@ def main(cfg: TrainConfig) -> None:
                     log(f"Warning: checkpoint state load failed: {e}\nTraining from scratch.")
         else:
             log(f"Init checkpoint not found: '{cfg.init_from}'. Training from scratch.")
+
+    # Wrap in DDP AFTER loading any checkpoint to avoid key prefix mismatches
+    if is_distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
     loss_perc = CombinedPerceptualLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     try:
@@ -813,51 +833,39 @@ def main(cfg: TrainConfig) -> None:
 
     best_ber = math.inf
     plan_cache: dict = {}
-    prev_amp = cfg.base_symbol_amp  # Track amplitude changes for logging
     # Remember default RS setting to restore after warmup/threshold
     default_use_rs = bool(cfg.use_rs_interleave)
     prev_use_rs = cfg.use_rs_interleave
+    prev_amp = cfg.base_symbol_amp
     for epoch in range(1, cfg.epochs + 1):
-        # Amplitude schedule: keep early epochs louder, then drop
-        if epoch <= 3:
-            cfg.base_symbol_amp = 0.25
-        elif epoch <= 6:
-            cfg.base_symbol_amp = 0.15
+
+        # Base symbol amplitude schedule
+        if epoch <= 5:
+            cfg.base_symbol_amp = 0.18
+        elif epoch <= 10:
+            cfg.base_symbol_amp = 0.13
         else:
-            cfg.base_symbol_amp = 0.03
-
-        # RS warmup & threshold gating: keep RS off for warmup epochs and
-        # until validation BER beats threshold; then restore default setting.
-        if epoch <= max(0, int(cfg.rs_warmup_epochs)):
-            cfg.use_rs_interleave = False
-        else:
-            cfg.use_rs_interleave = (default_use_rs and (best_ber < float(cfg.rs_enable_ber_threshold)))
-        if cfg.use_rs_interleave != prev_use_rs:
-            log(f"Epoch {epoch}: RS+interleave {'ENABLED' if cfg.use_rs_interleave else 'DISABLED'} (best_ber={best_ber:.4f}, thr={cfg.rs_enable_ber_threshold})")
-            prev_use_rs = cfg.use_rs_interleave
-
-        # AMP control: disable for first 1-2 epochs, re-enable if BER < 0.3
-        if epoch <= 2:
-            amp_enabled = False
-            scaler = GradScaler(enabled=False)
-        elif epoch >= 3:
-            # Check if we should re-enable AMP based on previous best BER
-            if best_ber < 0.3 and not amp_enabled:
-                amp_enabled = cfg.mixed_precision and torch.cuda.is_available()
-                scaler = GradScaler(enabled=amp_enabled)
-                if amp_enabled:
-                    log(f"Epoch {epoch}: Re-enabling mixed precision (BER={best_ber:.4f} < 0.3)")
-
-        # Log amplitude changes
+            cfg.base_symbol_amp = 0.09
         if cfg.base_symbol_amp != prev_amp:
             log(f"Epoch {epoch}: Symbol amplitude changed to {cfg.base_symbol_amp}")
             prev_amp = cfg.base_symbol_amp
+
+        # RS enabled from epoch 1
+        cfg.use_rs_interleave = default_use_rs
+        if cfg.use_rs_interleave != prev_use_rs:
+            log(f"Epoch {epoch}: RS+interleave {'ENABLED' if cfg.use_rs_interleave else 'DISABLED'}")
+            prev_use_rs = cfg.use_rs_interleave
+
+        # AMP always enabled
+        amp_enabled = cfg.mixed_precision and torch.cuda.is_available()
+        scaler = GradScaler(enabled=amp_enabled)
+
 
         if is_distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         if (not is_distributed) or rank == 0:
-            log(f"\nEpoch {epoch}/{cfg.epochs}" + (" [AMP OFF]" if not amp_enabled else ""))
+            log(f"\nEpoch {epoch}/{cfg.epochs}")
         tr = train_one_epoch(model, stft_cfg, loss_perc, optimizer, scaler, cfg, train_loader, epoch_idx=epoch, plan_cache=plan_cache)
         if (not is_distributed) or rank == 0:
             log(f"train: obj={tr['obj']:.4f} ber={tr['ber']:.4f} ce={tr['bits_ce']:.4f} mse={tr['bits_mse']:.4f} perc={tr['perc']:.4f} mfcc={tr['mfcc']:.4f}")
