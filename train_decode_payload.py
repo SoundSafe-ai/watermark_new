@@ -23,6 +23,7 @@ import math
 import random
 from contextlib import nullcontext
 from dataclasses import dataclass
+from collections import OrderedDict
 from typing import List, Tuple
 import numpy as np
 
@@ -789,7 +790,12 @@ def main(cfg: TrainConfig) -> None:
 
     stft_cfg = {"n_fft": cfg.n_fft, "hop_length": cfg.hop, "win_length": cfg.n_fft}
     model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg=stft_cfg).to(cfg.device)
-    # Warm-start from Stage-1 (imperceptibility) checkpoint if provided
+    # Track resume state
+    start_epoch = 1
+    resume_optimizer_state = None
+    resume_scaler_state = None
+    best_ber = math.inf
+    # Warm-start/resume from checkpoint if provided
     if cfg.init_from:
         if os.path.isfile(cfg.init_from):
             # Try weights_only=True first (PyTorch 2.6 default). If it fails for this file,
@@ -803,11 +809,45 @@ def main(cfg: TrainConfig) -> None:
                 except Exception as e:
                     print(f"Warning: failed to load init_from '{cfg.init_from}': {e}\nTraining from scratch.")
             if ckpt is not None:
-                state = ckpt["model_state"] if isinstance(ckpt, dict) and "model_state" in ckpt else ckpt
+                raw_state = ckpt["model_state"] if isinstance(ckpt, dict) and "model_state" in ckpt else ckpt
+                state = OrderedDict(raw_state)
+                # Normalize DDP 'module.' prefix if needed
+                def _has_module_prefix(keys):
+                    try:
+                        return all(k.startswith("module.") for k in keys)
+                    except Exception:
+                        return False
                 try:
+                    model_keys = model.state_dict().keys()
+                    if _has_module_prefix(state.keys()) and not _has_module_prefix(model_keys):
+                        state = OrderedDict((k[len("module."):], v) for k, v in state.items())
+                    elif (not _has_module_prefix(state.keys())) and _has_module_prefix(model_keys):
+                        state = OrderedDict((f"module.{k}", v) for k, v in state.items())
                     model.load_state_dict(state, strict=True)
                     ep = ckpt.get("epoch", "?") if isinstance(ckpt, dict) else "?"
                     log(f"Loaded init weights from '{cfg.init_from}' (epoch={ep})")
+                    # Collect optional resume artifacts
+                    if isinstance(ckpt, dict):
+                        resume_optimizer_state = ckpt.get("optimizer_state")
+                        resume_scaler_state = ckpt.get("scaler_state")
+                        if isinstance(ckpt.get("epoch"), int):
+                            start_epoch = int(ckpt["epoch"]) + 1
+                        if "best_ber" in ckpt:
+                            try:
+                                best_ber = float(ckpt["best_ber"])  # start from saved best
+                            except Exception:
+                                best_ber = math.inf
+                        # Align RS-related cfg with checkpoint if present
+                        if "cfg" in ckpt and isinstance(ckpt["cfg"], dict):
+                            saved_cfg = ckpt["cfg"]
+                            for k in ["rs_payload_bytes", "rs_interleave_depth", "use_rs_interleave"]:
+                                if k in saved_cfg:
+                                    setattr(cfg, k, saved_cfg[k])
+                            # Recompute target_bits from (possibly) restored RS settings
+                            if cfg.use_rs_interleave:
+                                dummy_payload = bytes([0] * cfg.rs_payload_bytes)
+                                rs_bits_tensor = encode_payload_with_rs(dummy_payload, cfg.rs_interleave_depth)
+                                cfg.target_bits = int(rs_bits_tensor.numel())
                 except Exception as e:
                     log(f"Warning: checkpoint state load failed: {e}\nTraining from scratch.")
         else:
@@ -829,15 +869,26 @@ def main(cfg: TrainConfig) -> None:
     except Exception:
         from torch.cuda.amp import GradScaler  # type: ignore
     scaler = GradScaler(enabled=(cfg.mixed_precision and torch.cuda.is_available()))
+    # Restore optimizer/scaler if resuming
+    if resume_optimizer_state is not None:
+        try:
+            optimizer.load_state_dict(resume_optimizer_state)  # type: ignore[arg-type]
+        except Exception:
+            pass
+    if resume_scaler_state is not None:
+        try:
+            scaler.load_state_dict(resume_scaler_state)  # type: ignore[arg-type]
+        except Exception:
+            pass
     amp_enabled = cfg.mixed_precision and torch.cuda.is_available()
 
-    best_ber = math.inf
+    best_ber = best_ber if isinstance(best_ber, float) else math.inf
     plan_cache: dict = {}
     # Remember default RS setting to restore after warmup/threshold
     default_use_rs = bool(cfg.use_rs_interleave)
     prev_use_rs = cfg.use_rs_interleave
     prev_amp = cfg.base_symbol_amp
-    for epoch in range(1, cfg.epochs + 1):
+    for epoch in range(start_epoch, cfg.epochs + 1):
 
         # Base symbol amplitude schedule
         if epoch <= 5:
@@ -883,6 +934,7 @@ def main(cfg: TrainConfig) -> None:
                 "epoch": epoch,
                 "model_state": to_save.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
+                "scaler_state": scaler.state_dict() if scaler is not None else None,
                 "best_ber": best_ber,
                 "cfg": cfg.__dict__,
             }, ckpt_path)
@@ -895,6 +947,7 @@ def main(cfg: TrainConfig) -> None:
                 "epoch": epoch,
                 "model_state": to_save.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
+                "scaler_state": scaler.state_dict() if scaler is not None else None,
                 "val_ber": va["ber"],
                 "cfg": cfg.__dict__,
             }, ckpt_path)
