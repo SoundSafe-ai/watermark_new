@@ -708,6 +708,22 @@ def main(cfg: TrainConfig) -> None:
             cfg.device = f"cuda:{local_rank}"
         else:
             cfg.device = "cpu"
+
+    # Adjust batch size for DistributedDataParallel so cfg.batch_size is GLOBAL by default
+    # If launched with multiple processes, split the global batch across ranks
+    global_bs_env = os.environ.get("GLOBAL_BATCH_SIZE")
+    if global_bs_env is not None:
+        try:
+            cfg.batch_size = int(global_bs_env)
+        except Exception:
+            pass
+    effective_global_bs = cfg.batch_size
+    if is_distributed and world_size > 1:
+        per_device_bs = max(1, effective_global_bs // world_size)
+    else:
+        per_device_bs = effective_global_bs
+    if (not is_distributed) or rank == 0:
+        print(f"Using batch sizes -> global: {effective_global_bs}, per_device: {per_device_bs} (world_size={world_size})")
     
     # Datasets
     train_ds = AudioChunkDataset(cfg.data_dir, gpu_resample=(cfg.device=="cuda" and cfg.gpu_resample))
@@ -755,7 +771,7 @@ def main(cfg: TrainConfig) -> None:
     
     train_loader = DataLoader(
         train_ds,
-        batch_size=cfg.batch_size,
+        batch_size=per_device_bs,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=cfg.num_workers,
@@ -766,7 +782,7 @@ def main(cfg: TrainConfig) -> None:
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=cfg.batch_size,
+        batch_size=per_device_bs,
         shuffle=False,
         sampler=val_sampler,
         num_workers=cfg.num_workers,

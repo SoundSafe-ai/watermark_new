@@ -185,7 +185,9 @@ class ISTFT(nn.Module):
             win_length = min(self.win, n_fft)
             hop_length = max(1, int(round(win_length * self.base_hop_ratio)))
 
-        window = torch.hann_window(win_length, device=X.device, dtype=X.dtype)
+        # hann_window must be real-valued; use real dtype even if X is complex
+        real_dtype = X.real.dtype if torch.is_complex(X) else X.dtype
+        window = torch.hann_window(win_length, device=X.device, dtype=real_dtype)
 
         x = torch.istft(
             X,
