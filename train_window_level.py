@@ -155,7 +155,7 @@ class TrainConfig:
     
     # Advanced features from original system
     init_from: str | None = "inn_decode_best.pt"  # Initialize from old checkpoint
-    train_max_files: int | None = 25000
+    train_max_files: int | None = 20000
     val_max_files: int | None = 5000
     file_seed: int = 42
     
