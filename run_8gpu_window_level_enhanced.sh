@@ -13,7 +13,7 @@ GPUS=8
 NODE_RANK=${NODE_RANK:-0}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29500}
-GLOBAL_BATCH=64
+GLOBAL_BATCH=16
 EPOCHS=30
 DATA_DIR="data/train"
 VAL_DIR="data/val"
@@ -42,7 +42,7 @@ export WORLD_SIZE=$(( NODES * GPUS ))
 export GLOBAL_BATCH_SIZE=${GLOBAL_BATCH}
 
 # Optional: improve NCCL stability in some environments
-export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_NSOCKS_PERTHREAD=2
 export NCCL_SOCKET_NTHREADS=2
 export OMP_NUM_THREADS=4
@@ -55,7 +55,7 @@ torchrun --nnodes ${NODES} \
          --node_rank ${NODE_RANK} \
          --master_addr ${MASTER_ADDR} \
          --master_port ${MASTER_PORT} \
-  watermark_new/train_window_level_enhanced.py \
+  watermark_new/train_window_level.py \
     --data_dir ${DATA_DIR} \
     --val_dir ${VAL_DIR} \
     --epochs ${EPOCHS} \

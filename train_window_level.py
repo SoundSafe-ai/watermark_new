@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.amp import autocast
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
@@ -387,55 +388,63 @@ def validate_enhanced_window_level(model: INNWatermarker, trainer: AdvancedWindo
                 payload_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
                 payload_bits = payload_bits.to(cfg.device).unsqueeze(0)
                 
-                # Build enhanced window-level plan
-                plan = trainer.build_enhanced_window_plan(
-                    base_model, x_1s, cfg.target_bits_per_window, cfg.base_symbol_amp,
-                    cfg.mapper_seed, cfg.replan_every, epoch_idx=0, n_symbols=cfg.n_symbols
-                )
-                
-                if cfg.use_symbol_level:
-                    # Use symbol-level training
-                    window_plans = trainer.build_symbol_level_labels(
-                        plan['window_plans'], payload_bits
+                # Wrap hot paths with autocast for AMP optimization
+                with autocast(device_type="cuda", enabled=cfg.mixed_precision):
+                    # Build enhanced window-level plan
+                    plan = trainer.build_enhanced_window_plan(
+                        base_model, x_1s, cfg.target_bits_per_window, cfg.base_symbol_amp,
+                        cfg.mapper_seed, cfg.replan_every, epoch_idx=0, n_symbols=cfg.n_symbols
                     )
                     
-                    loss_weights = {
-                        'ce': cfg.w_bits,
-                        'mse': cfg.w_mse,
-                        'perceptual': cfg.w_perc,
-                        'crc': cfg.crc_weight
-                    }
-                    
-                    window_losses = trainer.compute_symbol_level_loss(
-                        base_model, window_plans, plan['symbol_mappings'], 
-                        cfg.base_symbol_amp, loss_weights
-                    )
-                else:
-                    # Use simple window-level training
-                    window_plans = trainer.duplicate_labels_across_overlaps(
-                        plan['window_plans'], payload_bits
-                    )
-                    
-                    loss_weights = {
-                        'ce': cfg.w_bits,
-                        'mse': cfg.w_mse,
-                        'perceptual': cfg.w_perc,
-                        'crc': cfg.crc_weight
-                    }
-                    
-                    window_losses = trainer.compute_window_level_loss(
-                        base_model, window_plans, cfg.base_symbol_amp, loss_weights
-                    )
+                    if cfg.use_symbol_level:
+                        # Use symbol-level training
+                        window_plans = trainer.build_symbol_level_labels(
+                            plan['window_plans'], payload_bits
+                        )
+                        
+                        loss_weights = {
+                            'ce': cfg.w_bits,
+                            'mse': cfg.w_mse,
+                            'perceptual': cfg.w_perc,
+                            'crc': cfg.crc_weight
+                        }
+                        
+                        window_losses = trainer.compute_symbol_level_loss(
+                            base_model, window_plans, plan['symbol_mappings'], 
+                            cfg.base_symbol_amp, loss_weights
+                        )
+                    else:
+                        # Use simple window-level training
+                        window_plans = trainer.duplicate_labels_across_overlaps(
+                            plan['window_plans'], payload_bits
+                        )
+                        
+                        loss_weights = {
+                            'ce': cfg.w_bits,
+                            'mse': cfg.w_mse,
+                            'perceptual': cfg.w_perc,
+                            'crc': cfg.crc_weight
+                        }
+                        
+                        window_losses = trainer.compute_window_level_loss(
+                            base_model, window_plans, cfg.base_symbol_amp, loss_weights
+                        )
                 
                 # Calculate payload BER
                 if cfg.use_rs_interleave:
                     try:
-                        # Recover bits from all windows
+                        # Recover bits from all windows (batched)
                         all_bits = []
-                        for plan in window_plans:
-                            if plan['n_slots'] > 0:
-                                # Decode window
-                                M_rec = base_model.decode(plan['window'])
+                        valid_plans = [plan for plan in window_plans if plan['n_slots'] > 0]
+                        
+                        if valid_plans:
+                            # Batch decode all windows at once
+                            windows = torch.stack([plan['window'] for plan in valid_plans], dim=0)  # [N, 1, T]
+                            M_recs = base_model.decode(windows)  # [N, 1, F, T]
+                            
+                            # Extract bits from each window
+                            for i, plan in enumerate(valid_plans):
+                                M_rec = M_recs[i:i+1]  # [1, 1, F, T]
                                 rec_vals = torch.zeros(1, len(plan['slots']), device=plan['window'].device)
                                 for s, (f, t) in enumerate(plan['slots']):
                                     if f < M_rec.size(2) and t < M_rec.size(3):
@@ -576,43 +585,45 @@ def train_one_epoch_enhanced(model: INNWatermarker, trainer: AdvancedWindowLevel
             payload_bits = encode_payload_with_rs(payload_bytes, cfg.rs_interleave_depth)
             payload_bits = payload_bits.to(cfg.device).unsqueeze(0)
             
-            # Build enhanced window-level plan
-            plan = trainer.build_enhanced_window_plan(
-                base_model, x_1s, cfg.target_bits_per_window, current_amp,
-                cfg.mapper_seed, cfg.replan_every, epoch_idx, n_symbols=cfg.n_symbols
-            )
-            
-            if cfg.use_symbol_level:
-                # Use symbol-level training
-                window_plans = trainer.build_symbol_level_labels(
-                    plan['window_plans'], payload_bits
+            # Wrap hot paths with autocast for AMP optimization
+            with autocast(device_type="cuda", enabled=cfg.mixed_precision):
+                # Build enhanced window-level plan
+                plan = trainer.build_enhanced_window_plan(
+                    base_model, x_1s, cfg.target_bits_per_window, current_amp,
+                    cfg.mapper_seed, cfg.replan_every, epoch_idx, n_symbols=cfg.n_symbols
                 )
                 
-                loss_weights = {
-                    'ce': cfg.w_bits,
-                    'mse': cfg.w_mse,
-                    'perceptual': cfg.w_perc
-                }
-                
-                window_losses = trainer.compute_symbol_level_loss(
-                    base_model, window_plans, plan['symbol_mappings'], 
-                    current_amp, loss_weights
-                )
-            else:
-                # Use simple window-level training
-                window_plans = trainer.duplicate_labels_across_overlaps(
-                    plan['window_plans'], payload_bits
-                )
-                
-                loss_weights = {
-                    'ce': cfg.w_bits,
-                    'mse': cfg.w_mse,
-                    'perceptual': cfg.w_perc
-                }
-                
-                window_losses = trainer.compute_window_level_loss(
-                    base_model, window_plans, current_amp, loss_weights
-                )
+                if cfg.use_symbol_level:
+                    # Use symbol-level training
+                    window_plans = trainer.build_symbol_level_labels(
+                        plan['window_plans'], payload_bits
+                    )
+                    
+                    loss_weights = {
+                        'ce': cfg.w_bits,
+                        'mse': cfg.w_mse,
+                        'perceptual': cfg.w_perc
+                    }
+                    
+                    window_losses = trainer.compute_symbol_level_loss(
+                        base_model, window_plans, plan['symbol_mappings'], 
+                        current_amp, loss_weights
+                    )
+                else:
+                    # Use simple window-level training
+                    window_plans = trainer.duplicate_labels_across_overlaps(
+                        plan['window_plans'], payload_bits
+                    )
+                    
+                    loss_weights = {
+                        'ce': cfg.w_bits,
+                        'mse': cfg.w_mse,
+                        'perceptual': cfg.w_perc
+                    }
+                    
+                    window_losses = trainer.compute_window_level_loss(
+                        base_model, window_plans, current_amp, loss_weights
+                    )
             
             # For window-level API we keep using total_loss (float). If a grad-capable
             # tensor is provided (loss_tensor), prefer that for backward.
