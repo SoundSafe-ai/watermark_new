@@ -17,7 +17,7 @@ GLOBAL_BATCH=64
 EPOCHS=30
 DATA_DIR="data/train"
 VAL_DIR="data/val"
-SAVE_DIR="window_level_enhanced_checkpoints"
+SAVE_DIR="window_level_checkpoints"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -55,7 +55,7 @@ torchrun --nnodes ${NODES} \
          --node_rank ${NODE_RANK} \
          --master_addr ${MASTER_ADDR} \
          --master_port ${MASTER_PORT} \
-  train_window_level_enhanced.py \
+  watermark_new/train_window_level_enhanced.py \
     --data_dir ${DATA_DIR} \
     --val_dir ${VAL_DIR} \
     --epochs ${EPOCHS} \

@@ -693,10 +693,11 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
         
         ber = total_errors / total_symbols if total_symbols > 0 else 0.0
         
+        # Return plain Python floats so callers can aggregate easily without device assumptions
         return {
-            'total_loss': torch.tensor(total_loss, device=model.device),
-            'ber': ber,
-            'total_symbols': total_symbols,
-            'total_errors': total_errors,
-            'perceptual_loss': total_perceptual
+            'total_loss': float(total_loss),
+            'ber': float(ber),
+            'total_symbols': int(total_symbols),
+            'total_errors': int(total_errors),
+            'perceptual_loss': float(total_perceptual)
         }
