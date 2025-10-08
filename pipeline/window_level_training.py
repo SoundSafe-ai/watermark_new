@@ -290,18 +290,28 @@ class WindowLevelTrainer:
                 if f < M_rec.size(2) and t < M_rec.size(3):
                     rec_vals[0, s] = M_rec[0, 0, f, t]
             
-            # Compute losses
+            # Compute losses with bit mask
             target_bits = bits[:, :len(slots)]
+            bit_mask = plan.get('bit_mask', torch.ones_like(target_bits, dtype=torch.bool))
+            bit_mask = bit_mask[:, :len(slots)]  # Ensure mask matches slots length
             
-            # Bit error loss
-            logits = rec_vals.clamp(-6.0, 6.0)
-            ce_loss = F.binary_cross_entropy_with_logits(logits, target_bits.float())
-            
-            # MSE loss
-            target_symbols = (target_bits * 2 - 1).float() * base_symbol_amp
-            if len(amp_per_slot) >= len(slots):
-                target_symbols = target_symbols * amp_per_slot[:len(slots)].unsqueeze(0)
-            mse_loss = F.mse_loss(rec_vals, target_symbols)
+            # Only compute loss for supervised bits
+            if bit_mask.any():
+                # Bit error loss (only for supervised bits)
+                logits = rec_vals.clamp(-6.0, 6.0)
+                ce_loss = F.binary_cross_entropy_with_logits(
+                    logits[bit_mask], target_bits[bit_mask].float()
+                )
+                
+                # MSE loss (only for supervised bits)
+                target_symbols = (target_bits * 2 - 1).float() * base_symbol_amp
+                if len(amp_per_slot) >= len(slots):
+                    target_symbols = target_symbols * amp_per_slot[:len(slots)].unsqueeze(0)
+                mse_loss = F.mse_loss(rec_vals[bit_mask], target_symbols[bit_mask])
+            else:
+                # No supervised bits in this window
+                ce_loss = torch.tensor(0.0, device=window.device)
+                mse_loss = torch.tensor(0.0, device=window.device)
             
             # Perceptual loss (simplified)
             perc_loss = F.mse_loss(window, window_wm)
@@ -311,9 +321,12 @@ class WindowLevelTrainer:
                           loss_weights.get('mse', 0.25) * mse_loss + 
                           loss_weights.get('perceptual', 0.01) * perc_loss)
             
-            total_loss += window_loss * len(slots)
-            total_bits += len(slots)
-            total_errors += (rec_vals > 0).long().ne(target_bits).sum().item()
+            # Only count supervised bits for loss and metrics
+            supervised_slots = bit_mask.sum().item()
+            if supervised_slots > 0:
+                total_loss += window_loss * supervised_slots
+                total_bits += supervised_slots
+                total_errors += (rec_vals[bit_mask] > 0).long().ne(target_bits[bit_mask]).sum().item()
             total_perceptual += perc_loss.item()
         
         # Average losses
@@ -375,6 +388,22 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
         self.use_crc = use_crc
         self.symbol_length = symbol_length
         self.min_agreement_rate = min_agreement_rate
+    
+    def _choose_indices(self, num_bits: int, k: int, seed: int, device: torch.device) -> torch.Tensor:
+        """
+        Fairly select k indices from num_bits using deterministic sampling.
+        
+        Args:
+            num_bits: Total number of bits available
+            k: Number of bits to select
+            seed: Deterministic seed for reproducible selection
+            device: Device for the output tensor
+            
+        Returns:
+            Tensor of selected indices [k]
+        """
+        generator = torch.Generator(device=device).manual_seed(seed)
+        return torch.randperm(num_bits, generator=generator, device=device)[:k]
     
     def build_symbol_level_plan(self, model: INNWatermarker, x_1s: torch.Tensor, 
                                n_symbols: int, base_symbol_amp: float) -> Dict:
@@ -472,12 +501,30 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
                 plan['symbol_bits'] = torch.tensor([], dtype=torch.long, device=payload_bits.device).unsqueeze(0)
                 continue
             
-            # Create window-level bits (for backward compatibility)
-            if n_slots >= payload_bits.size(1):
-                plan['bits'] = payload_bits
+            # Create window-level bits with proper supervision masking
+            num_bits = payload_bits.size(1)
+            if n_slots >= num_bits:
+                # Pad if we have more slots than payload bits
+                pad = torch.zeros(1, n_slots - num_bits, dtype=payload_bits.dtype, device=payload_bits.device)
+                bits = torch.cat([payload_bits, pad], dim=1)
+                # Create supervision mask: True for real bits, False for padded zeros
+                mask = torch.cat([
+                    torch.ones(1, num_bits, dtype=torch.bool, device=payload_bits.device),
+                    torch.zeros(1, n_slots - num_bits, dtype=torch.bool, device=payload_bits.device)
+                ], dim=1)
             else:
-                pad = torch.zeros(1, n_slots - payload_bits.size(1), dtype=torch.long, device=payload_bits.device)
-                plan['bits'] = torch.cat([payload_bits, pad], dim=1)
+                # Fairly select which bits to keep using deterministic sampling
+                # Use window index and second index for deterministic seed
+                window_idx = plan.get('window_idx', 0)
+                second_idx = plan.get('second_idx', 0)
+                seed = (second_idx * 1000 + window_idx) % (2**32)  # Deterministic seed
+                keep_idx = self._choose_indices(num_bits, n_slots, seed, payload_bits.device)
+                bits = payload_bits[:, keep_idx]
+                # All selected bits should be supervised
+                mask = torch.ones(1, n_slots, dtype=torch.bool, device=payload_bits.device)
+            
+            plan['bits'] = bits
+            plan['bit_mask'] = mask
             
             # Create symbol-level bits (only for symbols assigned to this window)
             symbol_bits = []
@@ -541,19 +588,29 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
             
             window_predictions.append(rec_vals)
             
-            # Compute window-level losses
+            # Compute window-level losses with bit mask
             if len(symbol_bits) > 0:
                 target_bits = symbol_bits[:, :len(slots)]
+                bit_mask = plan.get('bit_mask', torch.ones_like(target_bits, dtype=torch.bool))
+                bit_mask = bit_mask[:, :len(slots)]  # Ensure mask matches slots length
                 
-                # Bit error loss
-                logits = rec_vals.clamp(-6.0, 6.0)
-                ce_loss = F.binary_cross_entropy_with_logits(logits, target_bits.float())
-                
-                # MSE loss
-                target_symbols = (target_bits * 2 - 1).float() * base_symbol_amp
-                if len(amp_per_slot) >= len(slots):
-                    target_symbols = target_symbols * amp_per_slot[:len(slots)].unsqueeze(0)
-                mse_loss = F.mse_loss(rec_vals, target_symbols)
+                # Only compute loss for supervised bits
+                if bit_mask.any():
+                    # Bit error loss (only for supervised bits)
+                    logits = rec_vals.clamp(-6.0, 6.0)
+                    ce_loss = F.binary_cross_entropy_with_logits(
+                        logits[bit_mask], target_bits[bit_mask].float()
+                    )
+                    
+                    # MSE loss (only for supervised bits)
+                    target_symbols = (target_bits * 2 - 1).float() * base_symbol_amp
+                    if len(amp_per_slot) >= len(slots):
+                        target_symbols = target_symbols * amp_per_slot[:len(slots)].unsqueeze(0)
+                    mse_loss = F.mse_loss(rec_vals[bit_mask], target_symbols[bit_mask])
+                else:
+                    # No supervised bits in this window
+                    ce_loss = torch.tensor(0.0, device=window.device)
+                    mse_loss = torch.tensor(0.0, device=window.device)
                 
                 # Perceptual loss
                 perceptual_loss_output = self.perceptual_loss_fn(window.float(), window_wm.float())
@@ -567,11 +624,12 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
                 total_loss += window_loss.item()
                 total_perceptual += perceptual_loss.item()
                 
-                # BER calculation
-                pred_bits = (rec_vals > 0).long()
-                errors = (pred_bits != target_bits).float().sum().item()
-                total_errors += errors
-                total_symbols += target_bits.numel()
+                # BER calculation (only for supervised bits)
+                if bit_mask.any():
+                    pred_bits = (rec_vals > 0).long()
+                    errors = (pred_bits[bit_mask] != target_bits[bit_mask]).float().sum().item()
+                    total_errors += errors
+                    total_symbols += bit_mask.sum().item()
         
         # Symbol-level fusion and loss
         if window_predictions and symbol_mappings:
