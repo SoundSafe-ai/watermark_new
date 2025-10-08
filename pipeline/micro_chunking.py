@@ -80,7 +80,8 @@ class MicroChunker:
         if T < self.min_samples:
             T = self.min_samples
             
-        n_chunks = max(1, (T - self.window_samples) // self.hop_samples + 1)
+        # Use exact formula: W = floor((segment_len - win_len)/hop) + 1
+        n_chunks = max(1, int((T - self.window_samples) / self.hop_samples) + 1)
         total_coverage = (n_chunks - 1) * self.hop_samples + self.window_samples
         
         return {
@@ -305,47 +306,64 @@ class EnhancedDeterministicMapper:
 def _adaptive_stft(audio_window: torch.Tensor, overlap_ratio: float = 0.5) -> torch.Tensor:
     """
     Compute STFT with parameters adapted to the window length.
+    Uses the SAME logic as the INN model STFT for consistency.
     
     Args:
         audio_window: Audio window [1, T] or [B, 1, T]
         overlap_ratio: Overlap ratio for hop length calculation
         
     Returns:
-        STFT coefficients [1, 2, F, T] (real and imaginary channels)
+        STFT coefficients [B, 2, F, T] (real and imaginary channels)
     """
-    # Get the time dimension (last dimension)
-    T = audio_window.shape[-1]
+    # Normalize to [B, 1, T] format
+    if audio_window.dim() == 1:  # [T]
+        audio_window = audio_window.unsqueeze(0).unsqueeze(0)
+    elif audio_window.dim() == 2:  # [B, T] or [1, T]
+        if audio_window.size(0) == 1:  # [1, T]
+            audio_window = audio_window.unsqueeze(0)  # [1, 1, T]
+        else:  # [B, T]
+            audio_window = audio_window.unsqueeze(1)  # [B, 1, T]
+    elif audio_window.dim() == 3:  # [B, 1, T]
+        pass
+    else:
+        raise ValueError(f"Unexpected audio_window ndim {audio_window.dim()}, expected 1/2/3")
     
-    # Adaptive STFT parameters (consistent with stft_micro)
-    win_length = T
-    n_fft = 1 << (win_length - 1).bit_length()  # next pow2, e.g., 330 -> 512
-    hop_length = max(1, int(round(win_length * (1.0 - overlap_ratio))))  # 50% overlap -> win_len//2
+    # Downmix to mono if needed
+    if audio_window.size(1) > 1:
+        audio_window = audio_window.mean(dim=1, keepdim=True)
     
-    # Create window on same device and dtype as input
+    # x_wave: [B, 1, T]
+    B, _, T = audio_window.shape
+    
+    # Use EXACT same logic as INN STFT
+    win_length = int(T)
+    # Next power of two >= win_length (efficient FFT)
+    n_fft = 1 << (max(1, win_length) - 1).bit_length()
+    # Use overlap_ratio instead of base_hop_ratio for consistency
+    hop_length = max(1, int(round(win_length * (1.0 - overlap_ratio))))
+    
+    # Prefer reflect padding when valid; otherwise disable centering
+    center = True
+    pad_mode = "reflect"
+    if (n_fft // 2) >= win_length:
+        center = False
+        pad_mode = "constant"
+    
+    # Build per-call Hann window on the correct device/dtype
     window = torch.hann_window(win_length, device=audio_window.device, dtype=audio_window.dtype)
     
-    # Ensure input is 2D for STFT: [B, T]
-    if audio_window.dim() == 3:
-        audio_2d = audio_window.squeeze(1)  # [B, T]
-    else:
-        audio_2d = audio_window  # [1, T]
-    
-    # Compute STFT
     X = torch.stft(
-        audio_2d,
+        audio_window.squeeze(1),
         n_fft=n_fft,
         hop_length=hop_length,
         win_length=win_length,
         window=window,
-        center=True,
-        pad_mode="reflect",  # Now valid since n_fft//2 < T
+        center=center,
+        pad_mode=pad_mode,
         return_complex=True,
-    )  # [B, F, T]
+    )  # [B, F, T_frames]
     
-    # Convert to real/imaginary channels: [B, 2, F, T]
-    X_ri = torch.stack([X.real, X.imag], dim=1)
-    
-    return X_ri
+    return torch.stack([X.real, X.imag], dim=1)  # [B, 2, F, T]
 
 
 def apply_psychoacoustic_gate(audio_window: torch.Tensor, slots: List[Tuple[int, int]], 
@@ -353,6 +371,7 @@ def apply_psychoacoustic_gate(audio_window: torch.Tensor, slots: List[Tuple[int,
     """
     Apply psychoacoustic masking to filter slots based on audio content.
     Uses adaptive STFT parameters that match the micro-window size.
+    Improved to be less restrictive and more sophisticated.
     
     Args:
         audio_window: Audio window [1, T]
@@ -371,19 +390,42 @@ def apply_psychoacoustic_gate(audio_window: torch.Tensor, slots: List[Tuple[int,
     X = _adaptive_stft(audio_window, overlap_ratio=0.5)  # [1, 2, F, T]
     mag = torch.sqrt(torch.clamp(X[:, 0]**2 + X[:, 1]**2, min=1e-12))  # [1, F, T]
     
-    # Simple psychoacoustic gating: prefer slots with higher magnitude
-    # (indicating more masking headroom)
+    # Improved psychoacoustic gating with multiple criteria
     slot_scores = []
     for f, t in slots:
         if f < mag.size(1) and t < mag.size(2):
-            score = mag[0, f, t].item()
+            # Get magnitude at this slot
+            slot_mag = mag[0, f, t].item()
+            
+            # Get local context (3x3 neighborhood)
+            f_start = max(0, f-1)
+            f_end = min(mag.size(1), f+2)
+            t_start = max(0, t-1)
+            t_end = min(mag.size(2), t+2)
+            
+            local_mag = mag[0, f_start:f_end, t_start:t_end]
+            local_mean = local_mag.mean().item()
+            local_std = local_mag.std().item()
+            
+            # Score based on:
+            # 1. Absolute magnitude (higher is better)
+            # 2. Relative magnitude vs local mean (higher is better)
+            # 3. Local variance (some variance is good for masking)
+            relative_mag = slot_mag / (local_mean + 1e-12)
+            variance_score = min(local_std / (local_mean + 1e-12), 2.0)  # Cap at 2.0
+            
+            # Combined score (weighted)
+            score = (slot_mag * 0.4 + relative_mag * 0.4 + variance_score * 0.2)
             slot_scores.append((score, f, t))
         else:
             slot_scores.append((0.0, f, t))
     
-    # Sort by score and take top slots
+    # Sort by score and take top slots (be less restrictive)
     slot_scores.sort(reverse=True)
-    filtered_slots = [(f, t) for _, f, t in slot_scores]
+    
+    # Instead of taking all slots, take at least 50% or minimum 1
+    min_slots = max(1, len(slots) // 2)
+    filtered_slots = [(f, t) for _, f, t in slot_scores[:max(min_slots, len(slots))]]
     
     return filtered_slots
 
