@@ -90,29 +90,90 @@ class InvertibleBlock(nn.Module):
 class STFT(nn.Module):
     def __init__(self, n_fft=1024, hop_length=512, win_length=1024):
         super().__init__()
+        # Store base settings (used to derive adaptive params)
         self.n_fft = n_fft; self.hop = hop_length; self.win = win_length
+        # Base hop ratio preserves the intended overlap (e.g., 512/1024 -> 0.5)
+        self.base_hop_ratio = float(hop_length) / float(win_length) if win_length > 0 else 0.5
+        # Keep a default window as a fallback; adaptive path creates per-call windows
         self.register_buffer("window", torch.hann_window(win_length), persistent=False)
+        # Cache last-used params so ISTFT can mirror them
+        self._last_params = None
 
     def forward(self, x_wave: torch.Tensor) -> torch.Tensor:
         # x_wave: [B, 1, T]
+        B, _, T = x_wave.shape
+        # Derive adaptive STFT parameters from window length T
+        win_length = int(T)
+        # Next power of two >= win_length (efficient FFT)
+        n_fft = 1 << (max(1, win_length) - 1).bit_length()
+        # Maintain original overlap via base hop ratio
+        hop_length = max(1, int(round(win_length * self.base_hop_ratio)))
+
+        # Prefer reflect padding when valid; otherwise disable centering
+        center = True
+        pad_mode = "reflect"
+        if (n_fft // 2) >= win_length:
+            center = False
+            pad_mode = "constant"
+
+        # Build per-call Hann window on the correct device/dtype
+        window = torch.hann_window(win_length, device=x_wave.device, dtype=x_wave.dtype)
+
         X = torch.stft(
-            x_wave.squeeze(1), n_fft=self.n_fft, hop_length=self.hop, win_length=self.win,
-            window=self.window, return_complex=True
-        )  # [B, F, T]
+            x_wave.squeeze(1),
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            window=window,
+            center=center,
+            pad_mode=pad_mode,
+            return_complex=True,
+        )  # [B, F, T_frames]
+
+        # Save the parameters for a matching ISTFT call
+        self._last_params = {
+            "n_fft": n_fft,
+            "hop_length": hop_length,
+            "win_length": win_length,
+            "center": center,
+            "pad_mode": pad_mode,
+        }
         return torch.stack([X.real, X.imag], dim=1)  # [B, 2, F, T]
+
+    def get_last_params(self) -> dict | None:
+        return self._last_params
 
 class ISTFT(nn.Module):
     def __init__(self, n_fft=1024, hop_length=512, win_length=1024):
         super().__init__()
         self.n_fft = n_fft; self.hop = hop_length; self.win = win_length
+        self.base_hop_ratio = float(hop_length) / float(win_length) if win_length > 0 else 0.5
         self.register_buffer("window", torch.hann_window(win_length), persistent=False)
 
-    def forward(self, X_ri: torch.Tensor) -> torch.Tensor:
+    def forward(self, X_ri: torch.Tensor, stft_params: dict | None = None) -> torch.Tensor:
         # X_ri: [B, 2, F, T]
-        X = torch.complex(X_ri[:,0], X_ri[:,1])  # [B, F, T]
+        X = torch.complex(X_ri[:,0], X_ri[:,1])  # [B, F, T_frames]
+
+        if stft_params is not None:
+            n_fft = stft_params.get("n_fft", self.n_fft)
+            win_length = stft_params.get("win_length", min(self.win, n_fft))
+            hop_length = stft_params.get("hop_length", max(1, int(round(win_length * self.base_hop_ratio))))
+        else:
+            # Infer n_fft from frequency bins when possible
+            inferred_n_fft = int((X.size(1) - 1) * 2)
+            n_fft = inferred_n_fft if inferred_n_fft > 0 else self.n_fft
+            win_length = min(self.win, n_fft)
+            hop_length = max(1, int(round(win_length * self.base_hop_ratio)))
+
+        window = torch.hann_window(win_length, device=X.device, dtype=X.dtype)
+
         x = torch.istft(
-            X, n_fft=self.n_fft, hop_length=self.hop, win_length=self.win,
-            window=self.window, length=None
+            X,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            window=window,
+            length=None,
         )  # [B, T]
         return x.unsqueeze(1)
 
@@ -136,7 +197,7 @@ class INNWatermarker(nn.Module):
         x, m = X0, m_spec
         for blk in self.blocks:
             x, m = blk.forward_enc(x, m)
-        x_wm = self.istft(x)
+        x_wm = self.istft(x, self.stft.get_last_params())
         return x_wm, x  # return watermarked waveform and final spec if needed
 
     # ----- Decoder: watermarked waveform -> recovered message spec -----
