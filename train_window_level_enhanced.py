@@ -128,10 +128,10 @@ def match_length(y: torch.Tensor, target_T: int) -> torch.Tensor:
 class TrainConfig:
     data_dir: str = "data/train"
     val_dir: str = "data/val"
-    batch_size: int = 4  # Reduced for window-level processing
+    batch_size: int = 8  # Reduced for window-level processing
     num_workers: int = 2
     epochs: int = 25
-    lr: float = 1e-5
+    lr: float = 5e-5
     weight_decay: float = 1e-5
     mixed_precision: bool = True
     save_dir: str = "window_level_enhanced_checkpoints"
@@ -543,7 +543,7 @@ def train_one_epoch_enhanced(model: INNWatermarker, trainer: AdvancedWindowLevel
     
     for step, batch in pbar:
         x, sr, paths = batch
-            x = x.to(cfg.device, non_blocking=True)
+        x = x.to(cfg.device, non_blocking=True)
         sr = sr.to(cfg.device) if isinstance(sr, torch.Tensor) else torch.tensor(sr, device=cfg.device)
         if cfg.gpu_resample:
             x = _maybe_resample_gpu(x, sr, TARGET_SR)

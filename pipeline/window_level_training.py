@@ -355,9 +355,9 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
     
     def __init__(self, sr: int = 22050, window_ms: int = 15, overlap_ratio: float = 0.5, 
                  mapper_seed: int = 42, n_fft: int = 1024, hop: int = 512,
-                 redundancy: int = 3, bias_lower_mid: bool = True,
+                 sync_strength: float = 0.1, redundancy: int = 3, bias_lower_mid: bool = True,
                  use_crc: bool = True, symbol_length: int = 8, min_agreement_rate: float = 0.3):
-        super().__init__(sr, window_ms, overlap_ratio, mapper_seed, n_fft, hop)
+        super().__init__(window_ms, overlap_ratio, sr, n_fft, hop, mapper_seed, sync_strength)
         
         # Replace simple mapper with enhanced mapper
         self.enhanced_mapper = EnhancedDeterministicMapper(
