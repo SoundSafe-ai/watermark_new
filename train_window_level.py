@@ -25,6 +25,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import autocast
+
+# Enable TF32 for better performance on A100/RTX 30+ series
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
@@ -433,12 +437,18 @@ def validate_enhanced_window_level(model: INNWatermarker, trainer: AdvancedWindo
                 # Calculate payload BER
                 if cfg.use_rs_interleave:
                     try:
-                        # Recover bits from all windows
+                        # Recover bits from all windows (batched)
                         all_bits = []
-                        for plan in window_plans:
-                            if plan['n_slots'] > 0:
-                                # Decode window
-                                M_rec = base_model.decode(plan['window'])
+                        valid_plans = [plan for plan in window_plans if plan['n_slots'] > 0]
+                        
+                        if valid_plans:
+                            # Batch decode all windows at once
+                            windows = torch.stack([plan['window'] for plan in valid_plans], dim=0)  # [N, 1, T]
+                            M_recs = base_model.decode(windows)  # [N, 1, F, T]
+                            
+                            # Extract bits from each window
+                            for i, plan in enumerate(valid_plans):
+                                M_rec = M_recs[i:i+1]  # [1, 1, F, T]
                                 rec_vals = torch.zeros(1, len(plan['slots']), device=plan['window'].device)
                                 for s, (f, t) in enumerate(plan['slots']):
                                     if f < M_rec.size(2) and t < M_rec.size(3):
@@ -797,21 +807,23 @@ def main(cfg: TrainConfig) -> None:
         batch_size=per_device_bs,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        num_workers=cfg.num_workers,
+        num_workers=min(16, os.cpu_count()) if cfg.num_workers == 0 else cfg.num_workers,
         drop_last=True,
         pin_memory=(cfg.device == "cuda"),
+        pin_memory_device="cuda" if cfg.device == "cuda" else None,
         persistent_workers=True if cfg.num_workers > 0 else False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        prefetch_factor=4 if cfg.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=per_device_bs,
         shuffle=False,
         sampler=val_sampler,
-        num_workers=cfg.num_workers,
+        num_workers=min(16, os.cpu_count()) if cfg.num_workers == 0 else cfg.num_workers,
         pin_memory=(cfg.device == "cuda"),
+        pin_memory_device="cuda" if cfg.device == "cuda" else None,
         persistent_workers=True if cfg.num_workers > 0 else False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        prefetch_factor=4 if cfg.num_workers > 0 else None,
     )
     
     # Model and trainer

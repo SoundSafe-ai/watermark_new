@@ -26,6 +26,10 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Enable TF32 for better performance on A100/RTX 30+ series
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
@@ -446,21 +450,23 @@ def main(cfg: TrainConfig) -> None:
         batch_size=cfg.batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        num_workers=cfg.num_workers,
+        num_workers=min(16, os.cpu_count()) if cfg.num_workers == 0 else cfg.num_workers,
         drop_last=True,
         pin_memory=pin,
+        pin_memory_device="cuda" if pin else None,
         persistent_workers=True if cfg.num_workers > 0 else False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        prefetch_factor=4 if cfg.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.batch_size,
         shuffle=False,
         sampler=val_sampler,
-        num_workers=cfg.num_workers,
+        num_workers=min(16, os.cpu_count()) if cfg.num_workers == 0 else cfg.num_workers,
         pin_memory=pin,
+        pin_memory_device="cuda" if pin else None,
         persistent_workers=True if cfg.num_workers > 0 else False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        prefetch_factor=4 if cfg.num_workers > 0 else None,
     )
 
     if (not is_distributed) or rank == 0:
