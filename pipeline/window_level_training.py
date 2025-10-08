@@ -258,7 +258,6 @@ class WindowLevelTrainer:
         Returns:
             Loss dictionary
         """
-        loss_terms: List[torch.Tensor] = []
         total_loss = 0.0
         total_bits = 0
         total_errors = 0
@@ -580,6 +579,7 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
         Returns:
             Dict with symbol-level loss metrics
         """
+        loss_terms: List[torch.Tensor] = []
         total_loss = 0.0
         total_symbols = 0
         total_errors = 0
