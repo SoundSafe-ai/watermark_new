@@ -259,7 +259,6 @@ class WindowLevelTrainer:
             Loss dictionary
         """
         loss_terms: List[torch.Tensor] = []
-        loss_terms: List[torch.Tensor] = []
         total_loss = 0.0
         total_bits = 0
         total_errors = 0
