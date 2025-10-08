@@ -471,9 +471,9 @@ def validate_enhanced_window_level(model: INNWatermarker, trainer: AdvancedWindo
                 # Accumulate metrics (window_losses returns floats)
                 batch_metrics["obj"] += window_losses['total_loss']
                 batch_metrics["ber"] += window_losses['ber']
-                batch_metrics["ce"] += window_losses['ber']  # Approximate
-                batch_metrics["mse"] += window_losses['ber']  # Approximate
-                batch_metrics["perc"] += window_losses['perceptual_loss']
+                batch_metrics["ce"] += window_losses.get('ce_loss', window_losses['ber'])  # Use actual CE loss if available
+                batch_metrics["mse"] += window_losses.get('mse_loss', window_losses['ber'])  # Use actual MSE loss if available
+                batch_metrics["perc"] += abs(window_losses['perceptual_loss'])  # Ensure perceptual loss is positive
                 batch_metrics["bits"] += window_losses['total_bits']
                 batch_metrics["errors"] += window_losses['total_errors']
             
@@ -641,9 +641,9 @@ def train_one_epoch_enhanced(model: INNWatermarker, trainer: AdvancedWindowLevel
             else:
                 batch_loss += window_losses['total_loss']
             batch_ber += window_losses['ber']
-            batch_ce += window_losses['ber']  # Approximate
-            batch_mse += window_losses['ber']  # Approximate
-            batch_perc += window_losses['perceptual_loss']
+            batch_ce += window_losses.get('ce_loss', window_losses['ber'])  # Use actual CE loss if available
+            batch_mse += window_losses.get('mse_loss', window_losses['ber'])  # Use actual MSE loss if available
+            batch_perc += abs(window_losses['perceptual_loss'])  # Ensure perceptual loss is positive
             batch_bits += window_losses['total_bits']
             batch_errors += window_losses['total_errors']
         
@@ -881,6 +881,7 @@ def main(cfg: TrainConfig) -> None:
         min_agreement_rate=cfg.min_agreement_rate
     )
     
+    # Instantiate perceptual loss without .to(device) - it will use device from input tensors
     loss_perc = CombinedPerceptualLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     

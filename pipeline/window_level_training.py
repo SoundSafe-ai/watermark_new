@@ -343,6 +343,54 @@ class WindowLevelTrainer:
                 total_errors += int((rec_vals[bit_mask] > 0).long().ne(target_bits[bit_mask]).sum().item())
             total_perceptual += perc_loss.item()
         
+        # Calculate separate CE and MSE losses
+        total_ce_loss = 0.0
+        total_mse_loss = 0.0
+        ce_count = 0
+        mse_count = 0
+        
+        for window_plan in window_plans:
+            if window_plan['n_slots'] == 0:
+                continue
+                
+            window = window_plan['window']
+            slots = window_plan['slots']
+            amp_per_slot = window_plan['amp_per_slot']
+            target_bits = window_plan['target_bits']
+            
+            # Build message spec and encode
+            M_spec = self.build_message_spec_from_window_plan(window_plan, base_symbol_amp)
+            window_wm, _ = model.encode(window.unsqueeze(0), M_spec.unsqueeze(0))
+            M_rec = model.decode(window_wm)
+            
+            # Extract values at slot positions
+            rec_vals = torch.zeros(1, len(slots), device=window.device)
+            for s, (f, t) in enumerate(slots):
+                if f < M_rec.size(2) and t < M_rec.size(3):
+                    rec_vals[0, s] = M_rec[0, 0, f, t]
+            
+            # Create bit mask for supervised slots
+            bit_mask = torch.zeros_like(target_bits, dtype=torch.bool)
+            if len(target_bits) > 0 and len(slots) > 0:
+                bit_mask = bit_mask[:, :len(slots)]
+            
+            if bit_mask.any():
+                # CE loss
+                logits = rec_vals.clamp(-6.0, 6.0)
+                ce_loss = F.binary_cross_entropy_with_logits(
+                    logits[bit_mask], target_bits[bit_mask].float()
+                )
+                total_ce_loss += ce_loss.item()
+                ce_count += 1
+                
+                # MSE loss
+                target_symbols = (target_bits * 2 - 1).float() * base_symbol_amp
+                if len(amp_per_slot) >= len(slots):
+                    target_symbols = target_symbols * amp_per_slot[:len(slots)].unsqueeze(0)
+                mse_loss = F.mse_loss(rec_vals[bit_mask], target_symbols[bit_mask])
+                total_mse_loss += mse_loss.item()
+                mse_count += 1
+        
         # Average losses
         if total_bits > 0 and len(loss_terms) > 0:
             loss_tensor = torch.stack(loss_terms).sum() / total_bits
@@ -355,10 +403,15 @@ class WindowLevelTrainer:
             ber = 0.0
             avg_perceptual = 0.0
         
+        avg_ce_loss = total_ce_loss / max(1, ce_count)
+        avg_mse_loss = total_mse_loss / max(1, mse_count)
+        
         return {
             'loss_tensor': loss_tensor,
             'total_loss': avg_loss,
             'ber': ber,
+            'ce_loss': avg_ce_loss,
+            'mse_loss': avg_mse_loss,
             'perceptual_loss': avg_perceptual,
             'total_bits': total_bits,
             'total_errors': total_errors
@@ -600,6 +653,10 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
         total_symbols = 0
         total_errors = 0
         total_perceptual = 0.0
+        total_ce_loss = 0.0
+        total_mse_loss = 0.0
+        ce_count = 0
+        mse_count = 0
         
         # Filter out empty plans and prepare for batching
         valid_plans = [plan for plan in window_plans if plan['n_slots'] > 0]
@@ -671,13 +728,25 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
                     if len(amp_per_slot) >= len(slots):
                         target_symbols = target_symbols * amp_per_slot[:len(slots)].unsqueeze(0)
                     mse_loss = F.mse_loss(rec_vals[bit_mask], target_symbols[bit_mask])
+                    
+                    # Accumulate CE and MSE losses
+                    total_ce_loss += ce_loss.item()
+                    total_mse_loss += mse_loss.item()
+                    ce_count += 1
+                    mse_count += 1
                 else:
                     # No supervised bits in this window
                     ce_loss = torch.tensor(0.0, device=window.device)
                     mse_loss = torch.tensor(0.0, device=window.device)
                 
-                # Perceptual loss
-                perceptual_loss_output = self.perceptual_loss_fn(window.float(), window_wm.float())
+                # Perceptual loss - ensure tensors are on same device and dtype
+                window_float = window.float()
+                window_wm_float = window_wm.float()
+                # Ensure both tensors are on the same device
+                if window_float.device != window_wm_float.device:
+                    window_wm_float = window_wm_float.to(window_float.device)
+                
+                perceptual_loss_output = self.perceptual_loss_fn(window_float, window_wm_float)
                 perceptual_loss = perceptual_loss_output["total_perceptual_loss"]
                 
                 # Window-level loss
@@ -744,10 +813,15 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
             device = first_param.device if first_param is not None else torch.device('cpu')
             loss_tensor = torch.tensor(0.0, device=device, requires_grad=True)
 
+        avg_ce_loss = total_ce_loss / max(1, ce_count)
+        avg_mse_loss = total_mse_loss / max(1, mse_count)
+        
         return {
             'loss_tensor': loss_tensor,
             'total_loss': float(total_loss),
             'ber': float(ber),
+            'ce_loss': float(avg_ce_loss),
+            'mse_loss': float(avg_mse_loss),
             'total_bits': int(total_symbols),  # match window-level API expected by callers
             'total_symbols': int(total_symbols),
             'total_errors': int(total_errors),
