@@ -247,7 +247,7 @@ class WindowLevelTrainer:
     def compute_window_level_loss(self, model: INNWatermarker, window_plans: List[Dict],
                                  base_symbol_amp: float, loss_weights: Dict) -> Dict:
         """
-        Compute window-level loss for training with batched model calls.
+        Compute window-level loss for training.
         
         Args:
             model: INNWatermarker model
@@ -263,39 +263,24 @@ class WindowLevelTrainer:
         total_errors = 0
         total_perceptual = 0.0
         
-        # Filter out empty plans and prepare for batching
-        valid_plans = [plan for plan in window_plans if plan['n_slots'] > 0]
-        if not valid_plans:
-            return {
-                'total_loss': 0.0,
-                'ber': 0.0,
-                'perceptual_loss': 0.0,
-                'total_bits': 0,
-                'total_errors': 0,
-                'loss_tensor': torch.tensor(0.0, device=next(iter(window_plans))['window'].device if window_plans else torch.device('cpu'))
-            }
-        
-        # Batch windows and message spectrograms
-        windows = torch.stack([plan['window'] for plan in valid_plans], dim=0)  # [N, 1, T]
-        M_specs = torch.stack([
-            self.build_message_spec_from_window_plan(plan, base_symbol_amp) 
-            for plan in valid_plans
-        ], dim=0)  # [N, 1, F, T]
-        
-        # Single batched encode/decode call
-        windows_wm, _ = model.encode(windows, M_specs)  # [N, 1, T]
-        windows_wm = torch.clamp(windows_wm, -1.0, 1.0)
-        M_recs = model.decode(windows_wm)  # [N, 1, F, T]
-        
-        # Process each window individually for loss computation
-        for i, plan in enumerate(valid_plans):
+        for plan in window_plans:
+            if plan['n_slots'] == 0:
+                continue
+            
             window = plan['window']
             slots = plan['slots']
             bits = plan['bits']
             amp_per_slot = plan['amp_per_slot']
             
-            # Extract decoded spectrogram for this window
-            M_rec = M_recs[i:i+1]  # [1, 1, F, T]
+            # Build message spectrogram
+            M_spec = self.build_message_spec_from_window_plan(plan, base_symbol_amp)
+            
+            # Encode
+            window_wm, _ = model.encode(window, M_spec)
+            window_wm = torch.clamp(window_wm, -1.0, 1.0)
+            
+            # Decode
+            M_rec = model.decode(window_wm)
             
             # Extract bits from slots
             rec_vals = torch.zeros(1, len(slots), device=window.device)
@@ -582,7 +567,7 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
                                  symbol_mappings: Dict, base_symbol_amp: float, 
                                  loss_weights: Dict) -> Dict:
         """
-        Compute symbol-level loss with fusion across windows using batched model calls.
+        Compute symbol-level loss with fusion across windows.
         
         Args:
             model: INNWatermarker model
@@ -600,99 +585,82 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
         total_errors = 0
         total_perceptual = 0.0
         
-        # Filter out empty plans and prepare for batching
-        valid_plans = [plan for plan in window_plans if plan['n_slots'] > 0]
-        empty_plan_indices = [i for i, plan in enumerate(window_plans) if plan['n_slots'] == 0]
-        
         # Collect window predictions for symbol fusion
         window_predictions = []
         
-        # Handle empty plans first
-        for i in empty_plan_indices:
-            plan = window_plans[i]
-            dev = plan.get('window').device if isinstance(plan.get('window'), torch.Tensor) else None
-            window_predictions.append(torch.zeros(1, 0, device=dev) if dev is not None else torch.zeros(1, 0))
-        
-        if valid_plans:
-            # Batch windows and message spectrograms
-            windows = torch.stack([plan['window'] for plan in valid_plans], dim=0)  # [N, 1, T]
-            M_specs = torch.stack([
-                self.build_message_spec_from_window_plan(plan, base_symbol_amp) 
-                for plan in valid_plans
-            ], dim=0)  # [N, 1, F, T]
+        for plan in window_plans:
+            if plan['n_slots'] == 0:
+                # Use window tensor device if available; otherwise default to CPU
+                dev = plan.get('window').device if isinstance(plan.get('window'), torch.Tensor) else None
+                window_predictions.append(torch.zeros(1, 0, device=dev) if dev is not None else torch.zeros(1, 0))
+                continue
             
-            # Single batched encode/decode call
-            windows_wm, _ = model.encode(windows, M_specs)  # [N, 1, T]
-            windows_wm = torch.clamp(windows_wm, -1.0, 1.0)
-            M_recs = model.decode(windows_wm)  # [N, 1, F, T]
+            window = plan['window']
+            slots = plan['slots']
+            symbol_bits = plan['symbol_bits']
+            amp_per_slot = plan['amp_per_slot']
             
-            # Process each valid window
-            valid_idx = 0
-            for i, plan in enumerate(window_plans):
-                if plan['n_slots'] == 0:
-                    continue  # Already handled above
+            # Build message spectrogram
+            M_spec = self.build_message_spec_from_window_plan(plan, base_symbol_amp)
+            
+            # Encode
+            window_wm, _ = model.encode(window, M_spec)
+            window_wm = torch.clamp(window_wm, -1.0, 1.0)
+            
+            # Decode
+            M_rec = model.decode(window_wm)
+            
+            # Extract predictions from slots
+            rec_vals = torch.zeros(1, len(slots), device=window.device)
+            for s, (f, t) in enumerate(slots):
+                if f < M_rec.size(2) and t < M_rec.size(3):
+                    rec_vals[0, s] = M_rec[0, 0, f, t]
+            
+            window_predictions.append(rec_vals)
+            
+            # Compute window-level losses with bit mask
+            if len(symbol_bits) > 0:
+                target_bits = symbol_bits[:, :len(slots)]
+                bit_mask = plan.get('bit_mask', torch.ones_like(target_bits, dtype=torch.bool))
+                bit_mask = bit_mask[:, :len(slots)]  # Ensure mask matches slots length
                 
-                window = plan['window']
-                slots = plan['slots']
-                symbol_bits = plan['symbol_bits']
-                amp_per_slot = plan['amp_per_slot']
+                # Only compute loss for supervised bits
+                if bit_mask.any():
+                    # Bit error loss (only for supervised bits)
+                    logits = rec_vals.clamp(-6.0, 6.0)
+                    ce_loss = F.binary_cross_entropy_with_logits(
+                        logits[bit_mask], target_bits[bit_mask].float()
+                    )
+                    
+                    # MSE loss (only for supervised bits)
+                    target_symbols = (target_bits * 2 - 1).float() * base_symbol_amp
+                    if len(amp_per_slot) >= len(slots):
+                        target_symbols = target_symbols * amp_per_slot[:len(slots)].unsqueeze(0)
+                    mse_loss = F.mse_loss(rec_vals[bit_mask], target_symbols[bit_mask])
+                else:
+                    # No supervised bits in this window
+                    ce_loss = torch.tensor(0.0, device=window.device)
+                    mse_loss = torch.tensor(0.0, device=window.device)
                 
-                # Extract decoded spectrogram for this window
-                M_rec = M_recs[valid_idx:valid_idx+1]  # [1, 1, F, T]
-                valid_idx += 1
+                # Perceptual loss
+                perceptual_loss_output = self.perceptual_loss_fn(window.float(), window_wm.float())
+                perceptual_loss = perceptual_loss_output["total_perceptual_loss"]
                 
-                # Extract predictions from slots
-                rec_vals = torch.zeros(1, len(slots), device=window.device)
-                for s, (f, t) in enumerate(slots):
-                    if f < M_rec.size(2) and t < M_rec.size(3):
-                        rec_vals[0, s] = M_rec[0, 0, f, t]
+                # Window-level loss
+                window_loss = (loss_weights.get('ce', 0.0) * ce_loss +
+                             loss_weights.get('mse', 0.0) * mse_loss +
+                             loss_weights.get('perceptual', 0.0) * perceptual_loss)
                 
-                window_predictions.append(rec_vals)
+                total_loss += float(window_loss.detach().item())
+                loss_terms.append(window_loss)
+                total_perceptual += perceptual_loss.item()
                 
-                # Compute window-level losses with bit mask
-                if len(symbol_bits) > 0:
-                    target_bits = symbol_bits[:, :len(slots)]
-                    bit_mask = plan.get('bit_mask', torch.ones_like(target_bits, dtype=torch.bool))
-                    bit_mask = bit_mask[:, :len(slots)]  # Ensure mask matches slots length
-                    
-                    # Only compute loss for supervised bits
-                    if bit_mask.any():
-                        # Bit error loss (only for supervised bits)
-                        logits = rec_vals.clamp(-6.0, 6.0)
-                        ce_loss = F.binary_cross_entropy_with_logits(
-                            logits[bit_mask], target_bits[bit_mask].float()
-                        )
-                        
-                        # MSE loss (only for supervised bits)
-                        target_symbols = (target_bits * 2 - 1).float() * base_symbol_amp
-                        if len(amp_per_slot) >= len(slots):
-                            target_symbols = target_symbols * amp_per_slot[:len(slots)].unsqueeze(0)
-                        mse_loss = F.mse_loss(rec_vals[bit_mask], target_symbols[bit_mask])
-                    else:
-                        # No supervised bits in this window
-                        ce_loss = torch.tensor(0.0, device=window.device)
-                        mse_loss = torch.tensor(0.0, device=window.device)
-                    
-                    # Perceptual loss
-                    window_wm_single = windows_wm[valid_idx-1:valid_idx]  # [1, 1, T]
-                    perceptual_loss_output = self.perceptual_loss_fn(window.float(), window_wm_single.float())
-                    perceptual_loss = perceptual_loss_output["total_perceptual_loss"]
-                    
-                    # Window-level loss
-                    window_loss = (loss_weights.get('ce', 0.0) * ce_loss +
-                                 loss_weights.get('mse', 0.0) * mse_loss +
-                                 loss_weights.get('perceptual', 0.0) * perceptual_loss)
-                    
-                    total_loss += float(window_loss.detach().item())
-                    loss_terms.append(window_loss)
-                    total_perceptual += perceptual_loss.item()
-                    
-                    # BER calculation (only for supervised bits)
-                    if bit_mask.any():
-                        pred_bits = (rec_vals > 0).long()
-                        errors = (pred_bits[bit_mask] != target_bits[bit_mask]).float().sum().item()
-                        total_errors += errors
-                        total_symbols += bit_mask.sum().item()
+                # BER calculation (only for supervised bits)
+                if bit_mask.any():
+                    pred_bits = (rec_vals > 0).long()
+                    errors = (pred_bits[bit_mask] != target_bits[bit_mask]).float().sum().item()
+                    total_errors += errors
+                    total_symbols += bit_mask.sum().item()
         
         # Symbol-level fusion and loss
         if window_predictions and symbol_mappings:

@@ -433,18 +433,12 @@ def validate_enhanced_window_level(model: INNWatermarker, trainer: AdvancedWindo
                 # Calculate payload BER
                 if cfg.use_rs_interleave:
                     try:
-                        # Recover bits from all windows (batched)
+                        # Recover bits from all windows
                         all_bits = []
-                        valid_plans = [plan for plan in window_plans if plan['n_slots'] > 0]
-                        
-                        if valid_plans:
-                            # Batch decode all windows at once
-                            windows = torch.stack([plan['window'] for plan in valid_plans], dim=0)  # [N, 1, T]
-                            M_recs = base_model.decode(windows)  # [N, 1, F, T]
-                            
-                            # Extract bits from each window
-                            for i, plan in enumerate(valid_plans):
-                                M_rec = M_recs[i:i+1]  # [1, 1, F, T]
+                        for plan in window_plans:
+                            if plan['n_slots'] > 0:
+                                # Decode window
+                                M_rec = base_model.decode(plan['window'])
                                 rec_vals = torch.zeros(1, len(plan['slots']), device=plan['window'].device)
                                 for s, (f, t) in enumerate(plan['slots']):
                                     if f < M_rec.size(2) and t < M_rec.size(3):
