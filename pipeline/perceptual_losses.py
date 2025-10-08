@@ -51,22 +51,42 @@ def stft_mag(x: torch.Tensor, n_fft: int, hop: int, win: int,
     return X.abs()
 
 def build_mel_filter(sr: int, n_fft: int, n_mels: int, device) -> torch.Tensor:
-    # Simple triangular mel filterbank (HTK-ish)
-    def hz_to_mel(f): return 2595 * torch.log10(torch.tensor(1.0, device=device) + f / 700.0)
-    def mel_to_hz(m): return 700.0 * (10**(m / 2595.0) - 1.0)
+    """Triangular mel filterbank with guards for very small FFT sizes.
+    Ensures strictly increasing bin edges and non-negative segment lengths.
+    """
+    def hz_to_mel(f):
+        return 2595 * torch.log10(torch.tensor(1.0, device=device) + f / 700.0)
+    def mel_to_hz(m):
+        return 700.0 * (10**(m / 2595.0) - 1.0)
+
+    F = n_fft // 2 + 1
+    # If FFT is extremely small, cap number of mels to a feasible value
+    n_mels_eff = int(min(n_mels, max(1, F - 1)))
+
     f_max = sr / 2
-    m_min, m_max = hz_to_mel(torch.tensor(0.0, device=device)), hz_to_mel(torch.tensor(f_max, device=device))
-    m_points = torch.linspace(m_min, m_max, n_mels + 2, device=device)
+    m_min = hz_to_mel(torch.tensor(0.0, device=device))
+    m_max = hz_to_mel(torch.tensor(f_max, device=device))
+    m_points = torch.linspace(m_min, m_max, n_mels_eff + 2, device=device)
     f_points = mel_to_hz(m_points)
     bins = torch.floor((n_fft // 2) * f_points / f_max).long()
-    fb = torch.zeros(n_mels, n_fft // 2 + 1, device=device)
-    for m in range(1, n_mels + 1):
-        f_m0, f_m1, f_m2 = bins[m - 1], bins[m], bins[m + 1]
-        if f_m1 == f_m0: f_m1 += 1
-        if f_m2 == f_m1: f_m2 += 1
-        fb[m - 1, f_m0:f_m1] = torch.linspace(0, 1, f_m1 - f_m0, device=device)
-        fb[m - 1, f_m1:f_m2] = torch.linspace(1, 0, f_m2 - f_m1, device=device)
-    return fb  # [M, F]
+
+    fb = torch.zeros(n_mels_eff, F, device=device)
+    for m in range(1, n_mels_eff + 1):
+        f0 = int(bins[m - 1].item())
+        f1 = int(bins[m].item())
+        f2 = int(bins[m + 1].item())
+        # Clamp to valid range and enforce strictly increasing edges
+        f0 = max(0, min(f0, F - 1))
+        f1 = max(f0 + 1, min(f1, F))
+        f2 = max(f1 + 1, min(f2, F))
+
+        len1 = f1 - f0
+        if len1 > 0:
+            fb[m - 1, f0:f1] = torch.linspace(0, 1, steps=len1, device=device)
+        len2 = f2 - f1
+        if len2 > 0:
+            fb[m - 1, f1:f2] = torch.linspace(1, 0, steps=len2, device=device)
+    return fb  # [M_eff, F]
 
 def dct_mat(n_mels: int, n_ceps: int, device) -> torch.Tensor:
     # Type-II DCT matrix for MFCC
