@@ -259,6 +259,7 @@ class WindowLevelTrainer:
             Loss dictionary
         """
         loss_terms: List[torch.Tensor] = []
+        loss_terms: List[torch.Tensor] = []
         total_loss = 0.0
         total_bits = 0
         total_errors = 0
@@ -652,6 +653,7 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
                              loss_weights.get('perceptual', 0.0) * perceptual_loss)
                 
                 total_loss += float(window_loss.detach().item())
+                loss_terms.append(window_loss)
                 total_perceptual += perceptual_loss.item()
                 
                 # BER calculation (only for supervised bits)
@@ -695,12 +697,22 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
             symbol_loss = (loss_weights.get('ce', 0.0) * symbol_ce_loss +
                           loss_weights.get('mse', 0.0) * symbol_mse_loss +
                           loss_weights.get('crc', 0.1) * crc_penalty)
-            total_loss += symbol_loss.item()
+            total_loss += float(symbol_loss.detach().item())
+            loss_terms.append(symbol_loss)
         
         ber = total_errors / total_symbols if total_symbols > 0 else 0.0
         
-        # Return plain Python floats so callers can aggregate easily without device assumptions
+        # Produce a grad-capable scalar for the caller to backprop through
+        if len(loss_terms) > 0:
+            denom = max(1, total_symbols)
+            loss_tensor = torch.stack([t for t in loss_terms]).sum() / denom
+        else:
+            first_param = next(iter(model.parameters()), None)
+            device = first_param.device if first_param is not None else torch.device('cpu')
+            loss_tensor = torch.tensor(0.0, device=device, requires_grad=True)
+
         return {
+            'loss_tensor': loss_tensor,
             'total_loss': float(total_loss),
             'ber': float(ber),
             'total_bits': int(total_symbols),  # match window-level API expected by callers
