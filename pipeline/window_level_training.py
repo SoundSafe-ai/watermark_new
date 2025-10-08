@@ -697,6 +697,7 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
         return {
             'total_loss': float(total_loss),
             'ber': float(ber),
+            'total_bits': int(total_symbols),  # match window-level API expected by callers
             'total_symbols': int(total_symbols),
             'total_errors': int(total_errors),
             'perceptual_loss': float(total_perceptual)
