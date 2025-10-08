@@ -848,6 +848,12 @@ def main(cfg: TrainConfig) -> None:
     except Exception:
         from torch.cuda.amp import GradScaler
     scaler = GradScaler(enabled=(cfg.mixed_precision and torch.cuda.is_available()))
+
+    # Expose perceptual loss fn to the trainer (used in symbol-level path)
+    try:
+        trainer.perceptual_loss_fn = loss_perc
+    except Exception:
+        pass
     
     for epoch in range(start_epoch, cfg.epochs + 1):
         if is_distributed and train_sampler is not None:
