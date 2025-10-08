@@ -100,6 +100,20 @@ class STFT(nn.Module):
         self._last_params = None
 
     def forward(self, x_wave: torch.Tensor) -> torch.Tensor:
+        # Normalize x_wave to [B, 1, T]
+        if x_wave.dim() == 1:  # [T]
+            x_wave = x_wave.unsqueeze(0).unsqueeze(0)
+        elif x_wave.dim() == 2:  # [B, T]
+            x_wave = x_wave.unsqueeze(1)
+        elif x_wave.dim() == 3:  # [B, C, T]
+            pass
+        else:
+            raise ValueError(f"Unexpected x_wave ndim {x_wave.dim()}, expected 1/2/3")
+
+        # Downmix to mono if needed
+        if x_wave.size(1) > 1:
+            x_wave = x_wave.mean(dim=1, keepdim=True)
+
         # x_wave: [B, 1, T]
         B, _, T = x_wave.shape
         # Derive adaptive STFT parameters from window length T
@@ -151,6 +165,12 @@ class ISTFT(nn.Module):
         self.register_buffer("window", torch.hann_window(win_length), persistent=False)
 
     def forward(self, X_ri: torch.Tensor, stft_params: dict | None = None) -> torch.Tensor:
+        # Normalize X_ri to [B, 2, F, T]
+        if X_ri.dim() == 3:  # [B, F, T]
+            X_ri = torch.stack([X_ri.real, X_ri.imag], dim=1) if X_ri.is_complex() else X_ri
+        elif X_ri.dim() != 4:
+            raise ValueError(f"Unexpected X_ri ndim {X_ri.dim()}, expected 3/4")
+
         # X_ri: [B, 2, F, T]
         X = torch.complex(X_ri[:,0], X_ri[:,1])  # [B, F, T_frames]
 
