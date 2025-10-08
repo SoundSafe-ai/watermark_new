@@ -802,29 +802,35 @@ def main(cfg: TrainConfig) -> None:
     train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True) if is_distributed else None
     val_sampler = DistributedSampler(val_ds, shuffle=False, drop_last=False) if is_distributed else None
     
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=per_device_bs,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        num_workers=min(16, os.cpu_count()) if cfg.num_workers == 0 else cfg.num_workers,
-        drop_last=True,
-        pin_memory=(cfg.device == "cuda"),
-        pin_memory_device="cuda" if cfg.device == "cuda" else None,
-        persistent_workers=True if cfg.num_workers > 0 else False,
-        prefetch_factor=4 if cfg.num_workers > 0 else None,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=per_device_bs,
-        shuffle=False,
-        sampler=val_sampler,
-        num_workers=min(16, os.cpu_count()) if cfg.num_workers == 0 else cfg.num_workers,
-        pin_memory=(cfg.device == "cuda"),
-        pin_memory_device="cuda" if cfg.device == "cuda" else None,
-        persistent_workers=True if cfg.num_workers > 0 else False,
-        prefetch_factor=4 if cfg.num_workers > 0 else None,
-    )
+    # DataLoader arguments
+    dataloader_kwargs = {
+        "batch_size": per_device_bs,
+        "shuffle": (train_sampler is None),
+        "sampler": train_sampler,
+        "num_workers": min(16, os.cpu_count()) if cfg.num_workers == 0 else cfg.num_workers,
+        "drop_last": True,
+        "pin_memory": (cfg.device == "cuda"),
+        "persistent_workers": True if cfg.num_workers > 0 else False,
+        "prefetch_factor": 4 if cfg.num_workers > 0 else None,
+    }
+    if cfg.device == "cuda":
+        dataloader_kwargs["pin_memory_device"] = "cuda"
+    
+    train_loader = DataLoader(train_ds, **dataloader_kwargs)
+    # Validation DataLoader arguments
+    val_dataloader_kwargs = {
+        "batch_size": per_device_bs,
+        "shuffle": False,
+        "sampler": val_sampler,
+        "num_workers": min(16, os.cpu_count()) if cfg.num_workers == 0 else cfg.num_workers,
+        "pin_memory": (cfg.device == "cuda"),
+        "persistent_workers": True if cfg.num_workers > 0 else False,
+        "prefetch_factor": 4 if cfg.num_workers > 0 else None,
+    }
+    if cfg.device == "cuda":
+        val_dataloader_kwargs["pin_memory_device"] = "cuda"
+    
+    val_loader = DataLoader(val_ds, **val_dataloader_kwargs)
     
     # Model and trainer
     model = INNWatermarker(n_blocks=8, spec_channels=2, 
