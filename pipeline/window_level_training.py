@@ -281,6 +281,7 @@ class WindowLevelTrainer:
             self.build_message_spec_from_window_plan(plan, base_symbol_amp) 
             for plan in valid_plans
         ], dim=0)  # [N, 1, 2, F, T]
+        M_specs = M_specs.squeeze(1)  # [N, 2, F, T] - Remove extra dimension
         
         # Single batched encode/decode call
         windows_wm, _ = model.encode(windows, M_specs)  # [N, 1, T]
@@ -620,6 +621,7 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
                 self.build_message_spec_from_window_plan(plan, base_symbol_amp) 
                 for plan in valid_plans
             ], dim=0)  # [N, 1, 2, F, T]
+            M_specs = M_specs.squeeze(1)  # [N, 2, F, T] - Remove extra dimension
             
             # Single batched encode/decode call
             windows_wm, _ = model.encode(windows, M_specs)  # [N, 1, T]
