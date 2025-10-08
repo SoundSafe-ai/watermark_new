@@ -455,8 +455,8 @@ def validate_enhanced_window_level(model: INNWatermarker, trainer: AdvancedWindo
                     except Exception:
                         batch_metrics["payload_ber"] += 1.0
                 
-                # Accumulate metrics
-                batch_metrics["obj"] += window_losses['total_loss'].item()
+                # Accumulate metrics (window_losses returns floats)
+                batch_metrics["obj"] += window_losses['total_loss']
                 batch_metrics["ber"] += window_losses['ber']
                 batch_metrics["ce"] += window_losses['ber']  # Approximate
                 batch_metrics["mse"] += window_losses['ber']  # Approximate
@@ -614,7 +614,7 @@ def train_one_epoch_enhanced(model: INNWatermarker, trainer: AdvancedWindowLevel
                     base_model, window_plans, current_amp, loss_weights
                 )
             
-            batch_loss += window_losses['total_loss'].item()
+            batch_loss += window_losses['total_loss']
             batch_ber += window_losses['ber']
             batch_ce += window_losses['ber']  # Approximate
             batch_mse += window_losses['ber']  # Approximate
