@@ -639,8 +639,9 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
                 symbol_bits = plan['symbol_bits']
                 amp_per_slot = plan['amp_per_slot']
                 
-                # Extract decoded spectrogram for this window
+                # Extract decoded spectrogram and watermarked window for this window
                 M_rec = M_recs[valid_idx:valid_idx+1]  # [1, 1, F, T]
+                window_wm = windows_wm[valid_idx:valid_idx+1]  # [1, 1, T]
                 valid_idx += 1
                 
                 # Extract predictions from slots
