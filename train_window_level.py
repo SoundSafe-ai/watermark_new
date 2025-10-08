@@ -810,7 +810,7 @@ def main(cfg: TrainConfig) -> None:
         num_workers=min(16, os.cpu_count()) if cfg.num_workers == 0 else cfg.num_workers,
         drop_last=True,
         pin_memory=(cfg.device == "cuda"),
-        pin_memory_device="cuda" if cfg.device == "cuda" else None,
+        pin_memory_device="cuda" if cfg.device == "cuda" else "cpu",
         persistent_workers=True if cfg.num_workers > 0 else False,
         prefetch_factor=4 if cfg.num_workers > 0 else None,
     )
@@ -821,7 +821,7 @@ def main(cfg: TrainConfig) -> None:
         sampler=val_sampler,
         num_workers=min(16, os.cpu_count()) if cfg.num_workers == 0 else cfg.num_workers,
         pin_memory=(cfg.device == "cuda"),
-        pin_memory_device="cuda" if cfg.device == "cuda" else None,
+        pin_memory_device="cuda" if cfg.device == "cuda" else "cpu",
         persistent_workers=True if cfg.num_workers > 0 else False,
         prefetch_factor=4 if cfg.num_workers > 0 else None,
     )
