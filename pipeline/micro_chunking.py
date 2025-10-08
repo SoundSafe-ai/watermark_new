@@ -302,17 +302,69 @@ class EnhancedDeterministicMapper:
         return window_symbols
 
 
+def _adaptive_stft(audio_window: torch.Tensor) -> torch.Tensor:
+    """
+    Compute STFT with parameters adapted to the window length.
+    
+    Args:
+        audio_window: Audio window [1, T] or [B, 1, T]
+        
+    Returns:
+        STFT coefficients [1, 2, F, T] (real and imaginary channels)
+    """
+    # Get the time dimension (last dimension)
+    T = audio_window.shape[-1]
+    
+    # Adaptive STFT parameters
+    win_length = T
+    # Next power of 2 >= win_length
+    n_fft = 1 << (win_length - 1).bit_length()  # 330 -> 512
+    
+    # Ensure reflect padding is valid: n_fft//2 < T
+    if (n_fft // 2) >= T:
+        n_fft = max(256, n_fft // 2)  # fallback safeguard
+    
+    hop_length = max(1, win_length // 2)  # ~50% overlap
+    
+    # Create window on same device and dtype as input
+    window = torch.hann_window(win_length, device=audio_window.device, dtype=audio_window.dtype)
+    
+    # Ensure input is 2D for STFT: [B, T]
+    if audio_window.dim() == 3:
+        audio_2d = audio_window.squeeze(1)  # [B, T]
+    else:
+        audio_2d = audio_window  # [1, T]
+    
+    # Compute STFT
+    X = torch.stft(
+        audio_2d,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=window,
+        center=True,
+        pad_mode="reflect",  # Now valid since n_fft//2 < T
+        return_complex=True,
+    )  # [B, F, T]
+    
+    # Convert to real/imaginary channels: [B, 2, F, T]
+    X_ri = torch.stack([X.real, X.imag], dim=1)
+    
+    return X_ri
+
+
 def apply_psychoacoustic_gate(audio_window: torch.Tensor, slots: List[Tuple[int, int]], 
                             model, n_fft: int = 1024, hop: int = 512) -> List[Tuple[int, int]]:
     """
     Apply psychoacoustic masking to filter slots based on audio content.
+    Uses adaptive STFT parameters that match the micro-window size.
     
     Args:
         audio_window: Audio window [1, T]
         slots: List of (freq_bin, time_frame) candidate slots
-        model: INNWatermarker model for STFT
-        n_fft: FFT size
-        hop: Hop length
+        model: INNWatermarker model (unused, kept for compatibility)
+        n_fft: FFT size (unused, kept for compatibility)
+        hop: Hop length (unused, kept for compatibility)
         
     Returns:
         Filtered list of slots that pass psychoacoustic masking
@@ -320,8 +372,8 @@ def apply_psychoacoustic_gate(audio_window: torch.Tensor, slots: List[Tuple[int,
     if not slots:
         return slots
         
-    # Get STFT of window
-    X = model.stft(audio_window)  # [1, 2, F, T]
+    # Use adaptive STFT instead of model.stft
+    X = _adaptive_stft(audio_window)  # [1, 2, F, T]
     mag = torch.sqrt(torch.clamp(X[:, 0]**2 + X[:, 1]**2, min=1e-12))  # [1, F, T]
     
     # Simple psychoacoustic gating: prefer slots with higher magnitude

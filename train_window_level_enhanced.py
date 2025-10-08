@@ -130,7 +130,7 @@ class TrainConfig:
     val_dir: str = "data/val"
     batch_size: int = 8  # Reduced for window-level processing
     num_workers: int = 2
-    epochs: int = 25
+    epochs: int = 30
     lr: float = 5e-5
     weight_decay: float = 1e-5
     mixed_precision: bool = True
