@@ -11,13 +11,44 @@ import torch.nn.functional as F
 
 # ---------- Helpers ----------
 
-def stft_mag(x: torch.Tensor, n_fft: int, hop: int, win: int) -> torch.Tensor:
-    # x: [B,T]
-    window = torch.hann_window(win, device=x.device)
-    X = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=win,
-                   window=window, return_complex=True)  # [B,F,T]
-    mag = torch.abs(X)
-    return mag
+def stft_mag(x: torch.Tensor, n_fft: int, hop: int, win: int,
+             center: bool = True, pad_mode: str = "reflect") -> torch.Tensor:
+    """Adaptive-parameter STFT magnitude that is safe for short windows.
+    Accepts x of shape [B,1,T] or [B,T] or [T]; returns |STFT| with
+    parameters adapted to T while preserving the hop ratio (hop/win).
+    """
+    # Normalize input to [B,1,T]
+    if x.dim() == 1:  # [T]
+        x = x.unsqueeze(0).unsqueeze(0)
+    elif x.dim() == 2:  # [B,T]
+        x = x.unsqueeze(1)
+    elif x.dim() != 3:
+        raise ValueError(f"stft_mag: unexpected ndim {x.dim()}")
+    if x.size(1) > 1:
+        x = x.mean(dim=1, keepdim=True)
+
+    B, _, T = x.shape
+    # Keep hop ratio
+    hop_ratio = float(hop) / max(1, float(win))
+    # Effective lengths based on T
+    win_eff = min(win, T)
+    nfft_from_T = 1 << (max(1, T) - 1).bit_length()  # next pow2 >= T
+    nfft_eff = min(n_fft, nfft_from_T)
+    # Fallback if reflect would be invalid
+    local_center = center
+    local_pad_mode = pad_mode
+    if local_center and (nfft_eff // 2) >= T:
+        local_center = False
+        local_pad_mode = "constant"
+    hop_eff = max(1, int(round(win_eff * hop_ratio)))
+
+    window = torch.hann_window(win_eff, device=x.device, dtype=x.dtype)
+    X = torch.stft(
+        x.squeeze(1), n_fft=nfft_eff, hop_length=hop_eff, win_length=win_eff,
+        window=window, center=local_center, pad_mode=local_pad_mode,
+        return_complex=True
+    )  # [B,F,Tf]
+    return X.abs()
 
 def build_mel_filter(sr: int, n_fft: int, n_mels: int, device) -> torch.Tensor:
     # Simple triangular mel filterbank (HTK-ish)
@@ -98,17 +129,21 @@ class MFCCCosineLoss:
     _fb: torch.Tensor = None  # type: ignore[assignment]
     _D: torch.Tensor = None   # type: ignore[assignment]
     _cache_device: torch.device | None = None
+    _n_fft_cached: int | None = None
 
     def __call__(self, x: torch.Tensor, y: torch.Tensor) -> Dict[str, torch.Tensor]:
         x_ = x.squeeze(1); y_ = y.squeeze(1)
         X = stft_mag(x_, self.n_fft, self.hop_length, self.n_fft)
         Y = stft_mag(y_, self.n_fft, self.hop_length, self.n_fft)
         device = x.device
-        # Reuse cached filterbank and DCT if device unchanged; else rebuild once
-        if self._fb is None or self._cache_device != device:
-            self._fb = build_mel_filter(self.sample_rate, self.n_fft, self.n_mels, device=device)
+        # Determine effective n_fft from STFT output (F = n_fft//2 + 1)
+        n_fft_eff = int((X.size(1) - 1) * 2)
+        # Reuse cached filterbank and DCT if device/n_fft unchanged; else rebuild once
+        if self._fb is None or self._cache_device != device or self._n_fft_cached != n_fft_eff:
+            self._fb = build_mel_filter(self.sample_rate, n_fft_eff, self.n_mels, device=device)
             self._D = dct_mat(self.n_mels, self.n_ceps, device)
             self._cache_device = device
+            self._n_fft_cached = n_fft_eff
         fb = self._fb
         D = self._D
         Xmel = torch.matmul(fb, X) + 1e-9
