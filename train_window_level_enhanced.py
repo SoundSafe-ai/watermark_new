@@ -281,7 +281,14 @@ class AdvancedWindowLevelTrainer(EnhancedWindowLevelTrainer):
                                   mapper_seed: int = 42, replan_every: int = 3,
                                   epoch_idx: int = 0, n_symbols: int = 100) -> Dict:
         """Build window-level plan using symbol-level redundancy or deterministic mapping."""
-        if x.dim() != 2 or x.size(0) != 1:
+        # Handle different input shapes
+        if x.dim() == 3 and x.size(0) == 1 and x.size(1) == 1:
+            # Shape [1, 1, T] -> squeeze to [1, T]
+            x = x.squeeze(1)
+        elif x.dim() == 3 and x.size(1) == 1:
+            # Shape [B, 1, T] -> squeeze to [B, T] then take first sample
+            x = x.squeeze(1)[:1]
+        elif x.dim() != 2 or x.size(0) != 1:
             raise ValueError(f"Expected x shape [1, T], got {x.shape}")
         
         if self.use_symbol_level:

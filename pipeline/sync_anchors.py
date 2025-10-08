@@ -126,7 +126,8 @@ class SyncAnchor:
         
         # Add sync pattern to beginning
         sync_region = audio_1s[:, :self.sync_samples]
-        sync_pattern_scaled = self.sync_pattern * sync_strength
+        # Move sync pattern to same device as audio
+        sync_pattern_scaled = (self.sync_pattern * sync_strength).to(audio_1s.device)
         
         # Mix with original audio (not replace)
         audio_with_sync[:, :self.sync_samples] = sync_region + sync_pattern_scaled
@@ -157,7 +158,8 @@ class SyncAnchor:
         
         # Cross-correlation between audio and sync pattern
         audio_flat = audio_1s.squeeze(0)  # [T]
-        sync_flat = self.sync_pattern.squeeze(0)  # [sync_samples]
+        # Move sync pattern to same device as audio
+        sync_flat = self.sync_pattern.squeeze(0).to(audio_1s.device)  # [sync_samples]
         
         # Normalize both signals
         audio_norm = (audio_flat - audio_flat.mean()) / (audio_flat.std() + 1e-8)
