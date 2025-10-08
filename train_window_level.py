@@ -150,8 +150,8 @@ class TrainConfig:
     
     # Advanced features from original system
     init_from: str | None = "inn_decode_best.pt"  # Initialize from old checkpoint
-    train_max_files: int | None = None
-    val_max_files: int | None = None
+    train_max_files: int | None = 40000
+    val_max_files: int | None = 15000
     file_seed: int = 42
     
     # Loss weights (from original)
@@ -614,7 +614,17 @@ def train_one_epoch_enhanced(model: INNWatermarker, trainer: AdvancedWindowLevel
                     base_model, window_plans, current_amp, loss_weights
                 )
             
-            batch_loss += window_losses['total_loss']
+            # For window-level API we keep using total_loss (float). If a grad-capable
+            # tensor is provided (loss_tensor), prefer that for backward.
+            if 'loss_tensor' in window_losses and torch.is_tensor(window_losses['loss_tensor']):
+                batch_loss += float(window_losses['loss_tensor'].detach().item())
+                # Accumulate a separate tensor for backward pass
+                if 'loss_tensor_accum' not in locals():
+                    loss_tensor_accum = window_losses['loss_tensor']
+                else:
+                    loss_tensor_accum = loss_tensor_accum + window_losses['loss_tensor']
+            else:
+                batch_loss += window_losses['total_loss']
             batch_ber += window_losses['ber']
             batch_ce += window_losses['ber']  # Approximate
             batch_mse += window_losses['ber']  # Approximate
@@ -633,12 +643,20 @@ def train_one_epoch_enhanced(model: INNWatermarker, trainer: AdvancedWindowLevel
         optimizer.zero_grad(set_to_none=True)
         
         if scaler is not None:
-            scaler.scale(torch.tensor(batch_loss, device=cfg.device)).backward()
+            if 'loss_tensor_accum' in locals():
+                scaler.scale(loss_tensor_accum / max(1, B)).backward()
+                del loss_tensor_accum
+            else:
+                scaler.scale(torch.tensor(batch_loss, device=cfg.device, requires_grad=True)).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
-            torch.tensor(batch_loss, device=cfg.device).backward()
+            if 'loss_tensor_accum' in locals():
+                (loss_tensor_accum / max(1, B)).backward()
+                del loss_tensor_accum
+            else:
+                torch.tensor(batch_loss, device=cfg.device, requires_grad=True).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
         

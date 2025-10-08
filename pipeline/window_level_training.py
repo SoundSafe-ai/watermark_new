@@ -258,6 +258,7 @@ class WindowLevelTrainer:
         Returns:
             Loss dictionary
         """
+        loss_terms: List[torch.Tensor] = []
         total_loss = 0.0
         total_bits = 0
         total_errors = 0
@@ -319,25 +320,28 @@ class WindowLevelTrainer:
                           loss_weights.get('mse', 0.25) * mse_loss + 
                           loss_weights.get('perceptual', 0.01) * perc_loss)
             
-            # Only count supervised bits for loss and metrics
-            supervised_slots = bit_mask.sum().item()
+            supervised_slots = int(bit_mask.sum().item())
             if supervised_slots > 0:
-                total_loss += window_loss * supervised_slots
+                loss_terms.append(window_loss * supervised_slots)
+                total_loss += float((window_loss * supervised_slots).detach().item())
                 total_bits += supervised_slots
-                total_errors += (rec_vals[bit_mask] > 0).long().ne(target_bits[bit_mask]).sum().item()
+                total_errors += int((rec_vals[bit_mask] > 0).long().ne(target_bits[bit_mask]).sum().item())
             total_perceptual += perc_loss.item()
         
         # Average losses
-        if total_bits > 0:
-            avg_loss = total_loss / total_bits
+        if total_bits > 0 and len(loss_terms) > 0:
+            loss_tensor = torch.stack(loss_terms).sum() / total_bits
+            avg_loss = float(loss_tensor.detach().item())
             ber = total_errors / total_bits
-            avg_perceptual = total_perceptual / len(window_plans)
+            avg_perceptual = total_perceptual / max(1, len(window_plans))
         else:
-            avg_loss = torch.tensor(0.0)
+            loss_tensor = torch.tensor(0.0, requires_grad=True)
+            avg_loss = 0.0
             ber = 0.0
             avg_perceptual = 0.0
         
         return {
+            'loss_tensor': loss_tensor,
             'total_loss': avg_loss,
             'ber': ber,
             'perceptual_loss': avg_perceptual,
@@ -647,7 +651,7 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
                              loss_weights.get('mse', 0.0) * mse_loss +
                              loss_weights.get('perceptual', 0.0) * perceptual_loss)
                 
-                total_loss += window_loss.item()
+                total_loss += float(window_loss.detach().item())
                 total_perceptual += perceptual_loss.item()
                 
                 # BER calculation (only for supervised bits)
