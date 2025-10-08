@@ -586,7 +586,9 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
         
         for plan in window_plans:
             if plan['n_slots'] == 0:
-                window_predictions.append(torch.zeros(1, 0, device=model.device))
+                # Use window tensor device if available; otherwise default to CPU
+                dev = plan.get('window').device if isinstance(plan.get('window'), torch.Tensor) else None
+                window_predictions.append(torch.zeros(1, 0, device=dev) if dev is not None else torch.zeros(1, 0))
                 continue
             
             window = plan['window']
