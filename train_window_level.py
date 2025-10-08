@@ -134,7 +134,7 @@ class TrainConfig:
     data_dir: str = "data/train"
     val_dir: str = "data/val"
     batch_size: int = 8  # Reduced for window-level processing
-    num_workers: int = 2
+    num_workers: int = 8
     epochs: int = 30
     lr: float = 5e-5
     weight_decay: float = 1e-5
@@ -393,7 +393,7 @@ def validate_enhanced_window_level(model: INNWatermarker, trainer: AdvancedWindo
                 payload_bits = payload_bits.to(cfg.device).unsqueeze(0)
                 
                 # Wrap hot paths with autocast for AMP optimization
-                with autocast(device_type="cuda", enabled=cfg.mixed_precision):
+                with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=cfg.mixed_precision):
                     # Build enhanced window-level plan
                     plan = trainer.build_enhanced_window_plan(
                         base_model, x_1s, cfg.target_bits_per_window, cfg.base_symbol_amp,
@@ -590,7 +590,7 @@ def train_one_epoch_enhanced(model: INNWatermarker, trainer: AdvancedWindowLevel
             payload_bits = payload_bits.to(cfg.device).unsqueeze(0)
             
             # Wrap hot paths with autocast for AMP optimization
-            with autocast(device_type="cuda", enabled=cfg.mixed_precision):
+            with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=cfg.mixed_precision):
                 # Build enhanced window-level plan
                 plan = trainer.build_enhanced_window_plan(
                     base_model, x_1s, cfg.target_bits_per_window, current_amp,
