@@ -215,14 +215,12 @@ class WindowLevelTrainer:
         bits = window_plan['bits']
         
         if not slots or bits.numel() == 0:
-            # Return empty spectrogram
-            X = torch.stft(window, n_fft=self.n_fft, hop_length=self.hop, 
-                          win_length=self.n_fft, return_complex=True)
-            return torch.zeros_like(X)
+            # Return empty spectrogram using adaptive STFT
+            X = self.stft_micro(window)
+            return torch.zeros(1, 2, X.shape[-2], X.shape[-1], device=window.device)
         
-        # Get STFT dimensions
-        X = torch.stft(window, n_fft=self.n_fft, hop_length=self.hop, 
-                      win_length=self.n_fft, return_complex=True)
+        # Get STFT dimensions using adaptive STFT
+        X = self.stft_micro(window)
         F_, T_ = X.shape[-2], X.shape[-1]
         
         # Create message spectrogram
@@ -347,6 +345,32 @@ class WindowLevelTrainer:
             'total_errors': total_errors
         }
     
+    def stft_micro(self, audio_window: torch.Tensor, overlap_ratio: float = None) -> torch.Tensor:
+        """
+        Compute STFT with parameters adapted to micro-window size.
+        
+        Args:
+            audio_window: Audio window [1, T] or [B, 1, T]
+            overlap_ratio: Overlap ratio (defaults to self.overlap_ratio)
+            
+        Returns:
+            STFT coefficients [B, F, T] (complex)
+        """
+        if overlap_ratio is None:
+            overlap_ratio = self.overlap_ratio
+            
+        T = audio_window.shape[-1]
+        win_len = T
+        n_fft = 1 << (win_len - 1).bit_length()  # next pow2, e.g., 330 -> 512
+        hop = max(1, int(round(win_len * (1.0 - overlap_ratio))))  # 50% overlap -> win_len//2
+        window = torch.hann_window(win_len, device=audio_window.device, dtype=audio_window.dtype)
+
+        # collapse to [B,T]
+        x = audio_window.squeeze(1) if audio_window.dim() == 3 else audio_window
+        X = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=win_len,
+                       window=window, center=True, pad_mode="reflect", return_complex=True)
+        return X
+
     def get_training_info(self) -> Dict:
         """Get information about training configuration."""
         return {

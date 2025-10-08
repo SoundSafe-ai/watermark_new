@@ -302,12 +302,13 @@ class EnhancedDeterministicMapper:
         return window_symbols
 
 
-def _adaptive_stft(audio_window: torch.Tensor) -> torch.Tensor:
+def _adaptive_stft(audio_window: torch.Tensor, overlap_ratio: float = 0.5) -> torch.Tensor:
     """
     Compute STFT with parameters adapted to the window length.
     
     Args:
         audio_window: Audio window [1, T] or [B, 1, T]
+        overlap_ratio: Overlap ratio for hop length calculation
         
     Returns:
         STFT coefficients [1, 2, F, T] (real and imaginary channels)
@@ -315,16 +316,10 @@ def _adaptive_stft(audio_window: torch.Tensor) -> torch.Tensor:
     # Get the time dimension (last dimension)
     T = audio_window.shape[-1]
     
-    # Adaptive STFT parameters
+    # Adaptive STFT parameters (consistent with stft_micro)
     win_length = T
-    # Next power of 2 >= win_length
-    n_fft = 1 << (win_length - 1).bit_length()  # 330 -> 512
-    
-    # Ensure reflect padding is valid: n_fft//2 < T
-    if (n_fft // 2) >= T:
-        n_fft = max(256, n_fft // 2)  # fallback safeguard
-    
-    hop_length = max(1, win_length // 2)  # ~50% overlap
+    n_fft = 1 << (win_length - 1).bit_length()  # next pow2, e.g., 330 -> 512
+    hop_length = max(1, int(round(win_length * (1.0 - overlap_ratio))))  # 50% overlap -> win_len//2
     
     # Create window on same device and dtype as input
     window = torch.hann_window(win_length, device=audio_window.device, dtype=audio_window.dtype)
@@ -373,7 +368,7 @@ def apply_psychoacoustic_gate(audio_window: torch.Tensor, slots: List[Tuple[int,
         return slots
         
     # Use adaptive STFT instead of model.stft
-    X = _adaptive_stft(audio_window)  # [1, 2, F, T]
+    X = _adaptive_stft(audio_window, overlap_ratio=0.5)  # [1, 2, F, T]
     mag = torch.sqrt(torch.clamp(X[:, 0]**2 + X[:, 1]**2, min=1e-12))  # [1, F, T]
     
     # Simple psychoacoustic gating: prefer slots with higher magnitude
