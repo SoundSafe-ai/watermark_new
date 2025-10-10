@@ -310,11 +310,14 @@ class WindowLevelTrainer:
             # Extract decoded spectrogram for this window
             M_rec = M_recs[i:i+1]  # [1, 1, F, T]
             
-            # Extract bits from slots
+            # Extract band-pooled values (slotless time)
             rec_vals = torch.zeros(1, len(slots), device=window.device)
-            for s, (f, t) in enumerate(slots):
-                if f < M_rec.size(2) and t < M_rec.size(3):
-                    rec_vals[0, s] = M_rec[0, 0, f, t]
+            for s, (f, _t_unused) in enumerate(slots):
+                if f < M_rec.size(2):
+                    f_start = max(0, f - 1)
+                    f_end = min(M_rec.size(2), f + 2)
+                    band_region = M_rec[0, 0, f_start:f_end, :]
+                    rec_vals[0, s] = band_region.mean()
             
             # Compute losses with bit mask
             target_bits = bits[:, :len(slots)]
@@ -375,11 +378,14 @@ class WindowLevelTrainer:
             window_wm, _ = model.encode(window.unsqueeze(0), M_spec.unsqueeze(0))
             M_rec = model.decode(window_wm)
             
-            # Extract values at slot positions
+            # Extract band-pooled values
             rec_vals = torch.zeros(1, len(slots), device=window.device)
-            for s, (f, t) in enumerate(slots):
-                if f < M_rec.size(2) and t < M_rec.size(3):
-                    rec_vals[0, s] = M_rec[0, 0, f, t]
+            for s, (f, _t_unused) in enumerate(slots):
+                if f < M_rec.size(2):
+                    f_start = max(0, f - 1)
+                    f_end = min(M_rec.size(2), f + 2)
+                    band_region = M_rec[0, 0, f_start:f_end, :]
+                    rec_vals[0, s] = band_region.mean()
             
             # Create bit mask for supervised slots
             bit_mask = torch.zeros_like(target_bits, dtype=torch.bool)
@@ -720,11 +726,14 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
                 window_wm = windows_wm[valid_idx:valid_idx+1]  # [1, 1, T]
                 valid_idx += 1
                 
-                # Extract predictions from slots
+                # Extract predictions via band pooling (no explicit time index)
                 rec_vals = torch.zeros(1, len(slots), device=window.device)
-                for s, (f, t) in enumerate(slots):
-                    if f < M_rec.size(2) and t < M_rec.size(3):
-                        rec_vals[0, s] = M_rec[0, 0, f, t]
+                for s, (f, _t_unused) in enumerate(slots):
+                    if f < M_rec.size(2):
+                        f_start = max(0, f - 1)
+                        f_end = min(M_rec.size(2), f + 2)
+                        band_region = M_rec[0, 0, f_start:f_end, :]
+                        rec_vals[0, s] = band_region.mean()
                 
                 window_predictions.append(rec_vals)
                 
