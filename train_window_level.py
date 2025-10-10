@@ -162,7 +162,7 @@ class TrainConfig:
     # Loss weights (from original)
     w_bits: float = 1.0
     w_mse: float = 0.25
-    w_perc: float = 0.009
+    w_perc: float = 0.01
     
     # Symbol settings with annealing
     base_symbol_amp: float = 0.18  # Will be annealed: 0.18 → 0.13 → 0.09

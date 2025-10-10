@@ -226,18 +226,18 @@ class WindowLevelTrainer:
         # Create message spectrogram
         M_spec = torch.zeros(1, 2, F_, T_, device=window.device)
         
-        # Place symbols at slots
+        # Place symbols at slots (keep ops on device, avoid .item() syncs)
         n_slots = min(len(slots), bits.size(1))
         for s in range(n_slots):
             f, t = slots[s]
             if f < F_ and t < T_:
-                # Convert bit to symbol
-                bit_val = bits[0, s].item()
-                symbol = (bit_val * 2 - 1) * base_symbol_amp  # -amp or +amp
+                # Convert bit to +/- amplitude on-device
+                bit_val_t = bits[0, s].float()
+                symbol = (bit_val_t * 2.0 - 1.0) * base_symbol_amp
                 
-                # Apply amplitude scaling
+                # Apply per-slot amplitude scaling if available
                 if s < amp_per_slot.size(0):
-                    symbol *= amp_per_slot[s].item()
+                    symbol = symbol * amp_per_slot[s].float()
                 
                 # Place in real channel
                 M_spec[0, 0, f, t] = symbol
@@ -275,6 +275,18 @@ class WindowLevelTrainer:
                 'loss_tensor': torch.tensor(0.0, device=next(iter(window_plans))['window'].device if window_plans else torch.device('cpu'))
             }
         
+        # Ensure plans are on the model device so M_specs are built on-device
+        model_device = next(iter(model.parameters())).device
+        for p in valid_plans:
+            if isinstance(p.get('window'), torch.Tensor):
+                p['window'] = p['window'].to(model_device, non_blocking=True)
+            if isinstance(p.get('amp_per_slot'), torch.Tensor):
+                p['amp_per_slot'] = p['amp_per_slot'].to(model_device, non_blocking=True)
+            if isinstance(p.get('bits'), torch.Tensor):
+                p['bits'] = p['bits'].to(model_device, non_blocking=True)
+            if isinstance(p.get('bit_mask'), torch.Tensor):
+                p['bit_mask'] = p['bit_mask'].to(model_device, non_blocking=True)
+
         # Batch windows and message spectrograms
         windows = torch.stack([plan['window'] for plan in valid_plans], dim=0)  # [N, 1, T]
         M_specs = torch.stack([
@@ -665,6 +677,20 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
             window_predictions.append(torch.zeros(1, 0, device=dev) if dev is not None else torch.zeros(1, 0))
         
         if valid_plans:
+            # Ensure plans are on the model device so M_specs are built on-device
+            model_device = next(iter(model.parameters())).device
+            for p in valid_plans:
+                if isinstance(p.get('window'), torch.Tensor):
+                    p['window'] = p['window'].to(model_device, non_blocking=True)
+                if isinstance(p.get('amp_per_slot'), torch.Tensor):
+                    p['amp_per_slot'] = p['amp_per_slot'].to(model_device, non_blocking=True)
+                if isinstance(p.get('bits'), torch.Tensor):
+                    p['bits'] = p['bits'].to(model_device, non_blocking=True)
+                if isinstance(p.get('bit_mask'), torch.Tensor):
+                    p['bit_mask'] = p['bit_mask'].to(model_device, non_blocking=True)
+                if isinstance(p.get('symbol_bits'), torch.Tensor):
+                    p['symbol_bits'] = p['symbol_bits'].to(model_device, non_blocking=True)
+
             # Batch windows and message spectrograms
             windows = torch.stack([plan['window'] for plan in valid_plans], dim=0)  # [N, 1, T]
             M_specs = torch.stack([
