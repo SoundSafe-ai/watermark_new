@@ -24,6 +24,7 @@ import math
 import random
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
+import argparse
 
 import torch
 import torch.nn as nn
@@ -32,6 +33,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.multiprocessing as mp
 
 import warnings
 import torchaudio
@@ -384,6 +386,8 @@ def compute_losses_and_metrics(
 	payload_bits: torch.Tensor,
 ) -> Dict:
 	"""Full forward for one 1 s segment with encode/decode and losses."""
+	# Unwrap DDP if present so we can call custom methods like encode/decode
+	base_model = getattr(model, "module", model)
 	# Sanitize inputs early
 	x_1s = torch.nan_to_num(x_1s, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
 	# Insert sync
@@ -424,10 +428,10 @@ def compute_losses_and_metrics(
 	# Build message spec for the whole second using window budgets
 	M_spec = build_message_spec_for_second(x_sync, gated_placements, bits_by_symbol, amp_budget_by_window)
 	# Encode with INN
-	x_wm, _ = model.encode(x_sync, M_spec)
+	x_wm, _ = base_model.encode(x_sync, M_spec)
 	x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
 	# Decode with INN
-	M_rec = model.decode(x_wm)
+	M_rec = base_model.decode(x_wm)
 	M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
 	# Extract predictions at placement slots and compute bit-wise BCE (masked)
 	all_logits: List[torch.Tensor] = []
@@ -508,12 +512,13 @@ def _make_payload_bits_tensor(cfg: TrainConfig, device) -> torch.Tensor:
 
 def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader) -> Dict:
 	model.eval()
+	base_model = getattr(model, "module", model)
 	metrics = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
 	with torch.no_grad():
 		for batch in loader:
 			x = batch.to(cfg.device, non_blocking=True)
 			bits = _make_payload_bits_tensor(cfg, x.device)
-			out = compute_losses_and_metrics(model, x, cfg, bits)
+			out = compute_losses_and_metrics(base_model, x, cfg, bits)
 			metrics["loss"] += float(out["loss"].detach().item()) * x.size(0)
 			metrics["ber"] += out["ber"] * x.size(0)
 			metrics["perc"] += out["perc"] * x.size(0)
@@ -525,6 +530,7 @@ def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader) -> Dic
 
 def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.optim.Optimizer, loader: DataLoader, scaler, epoch: int) -> Dict:
 	model.train()
+	base_model = getattr(model, "module", model)
 	running = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
 	pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
 	for step, batch in pbar:
@@ -534,7 +540,7 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
 		use_amp = cfg.mixed_precision and torch.cuda.is_available()
 		# Keep compute stable: do heavy math under AMP but sanitize outputs
 		with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-			out = compute_losses_and_metrics(model, x, cfg, bits)
+			out = compute_losses_and_metrics(base_model, x, cfg, bits)
 			loss = out["loss"]
 		# Skip non-finite losses
 		if not torch.isfinite(loss):
@@ -673,5 +679,22 @@ def main(cfg: TrainConfig) -> None:
 
 
 if __name__ == "__main__":
-	cfg = TrainConfig()
+	# Optional CLI/env overrides so you can do:
+	# python training_new.py --batch_size 8 --epochs 10
+	parser = argparse.ArgumentParser(description="Phase-1 INN training (DDP-ready)")
+	parser.add_argument("--data_dir", type=str, default=None)
+	parser.add_argument("--val_dir", type=str, default=None)
+	parser.add_argument("--save_dir", type=str, default=None)
+	parser.add_argument("--epochs", type=int, default=None)
+	parser.add_argument("--batch_size", type=int, default=None, help="Per-process batch size")
+	args, _ = parser.parse_known_args()
+
+	_defaults = TrainConfig()
+	cfg = TrainConfig(
+		data_dir=(args.data_dir or os.environ.get("DATA_DIR", _defaults.data_dir)),
+		val_dir=(args.val_dir or os.environ.get("VAL_DIR", _defaults.val_dir)),
+		save_dir=(args.save_dir or os.environ.get("SAVE_DIR", _defaults.save_dir)),
+		epochs=(args.epochs if args.epochs is not None else int(os.environ.get("EPOCHS", _defaults.epochs))),
+		batch_size=(args.batch_size if args.batch_size is not None else int(os.environ.get("PER_DEVICE_BATCH", _defaults.batch_size))),
+	)
 	main(cfg)
