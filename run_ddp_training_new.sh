@@ -95,12 +95,6 @@ torchrun --nnodes ${NODES} \
          --node_rank ${NODE_RANK} \
          --master_addr ${MASTER_ADDR} \
          --master_port ${MASTER_PORT} \
-  python -c "import os; from training_new import TrainConfig, main; cfg = TrainConfig(\
-    data_dir=os.environ.get('DATA_DIR','data/train'), \
-    val_dir=os.environ.get('VAL_DIR','data/val'), \
-    save_dir=os.environ.get('SAVE_DIR','checkpoints_phase1'), \
-    epochs=int(os.environ.get('EPOCHS','20')), \
-    batch_size=int(os.environ.get('PER_DEVICE_BATCH','6'))\
-  ); main(cfg)"
+  training_new.py
 
 
