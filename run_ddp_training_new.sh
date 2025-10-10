@@ -22,12 +22,13 @@ GPUS=8
 NODE_RANK=${NODE_RANK:-0}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29500}
-GLOBAL_BATCH=48
+GLOBAL_BATCH=64
 EPOCHS=20
 DATA_DIR="data/train"
 VAL_DIR="data/val"
 SAVE_DIR="checkpoints_phase1"
 PER_DEVICE_BATCH=""
+REPO_DIR="watermark_new"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -42,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     --master-addr) MASTER_ADDR="$2"; shift 2;;
     --master-port) MASTER_PORT="$2"; shift 2;;
     --node-rank) NODE_RANK="$2"; shift 2;;
+    --repo-dir) REPO_DIR="$2"; shift 2;;
     *) echo "Unknown arg: $1"; exit 1;;
   esac
 done
@@ -62,6 +64,14 @@ export MASTER_PORT
 export NODE_RANK
 export WORLD_SIZE
 
+# Ensure Python can import training_new.py by changing into repo and setting PYTHONPATH
+if [[ ! -d "${REPO_DIR}" ]]; then
+  echo "ERROR: REPO_DIR does not exist: ${REPO_DIR}" >&2
+  exit 1
+fi
+cd "${REPO_DIR}"
+export PYTHONPATH="${REPO_DIR}:${PYTHONPATH:-}"
+
 # Expose run-time config via env (the Python launcher reads these)
 export DATA_DIR
 export VAL_DIR
@@ -77,7 +87,7 @@ export OMP_NUM_THREADS=4
 
 echo "Launching training_new.py with: nodes=${NODES}, gpus=${GPUS}, world_size=${WORLD_SIZE}, global_batch=${GLOBAL_BATCH}, per_device_batch=${PER_DEVICE_BATCH}" \
      " master=${MASTER_ADDR}:${MASTER_PORT} node_rank=${NODE_RANK}" \
-     " data_dir=${DATA_DIR} val_dir=${VAL_DIR} save_dir=${SAVE_DIR} epochs=${EPOCHS}"
+     " data_dir=${DATA_DIR} val_dir=${VAL_DIR} save_dir=${SAVE_DIR} epochs=${EPOCHS} repo_dir=${REPO_DIR}"
 
 # Use torchrun to spawn DDP processes. We invoke python -c so we can override TrainConfig at runtime.
 torchrun --nnodes ${NODES} \
