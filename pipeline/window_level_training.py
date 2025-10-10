@@ -85,7 +85,7 @@ class WindowLevelTrainer:
                 audio_content=window
             )
             
-            # Apply psychoacoustic gating
+            # Apply psychoacoustic gating (batched path available upstream)
             masked_slots = apply_psychoacoustic_gate(window, slots, model, self.n_fft, self.hop)
             
             # Calculate per-slot amplitudes
@@ -557,7 +557,7 @@ class EnhancedWindowLevelTrainer(WindowLevelTrainer):
                         slots.append((band_idx, time_frame))
                         break
             
-            # Apply psychoacoustic gating
+            # Apply psychoacoustic gating (batched path available upstream)
             masked_slots = apply_psychoacoustic_gate(window, slots, model, self.n_fft, self.hop)
             
             # Create amplitude per slot (simple equal allocation)

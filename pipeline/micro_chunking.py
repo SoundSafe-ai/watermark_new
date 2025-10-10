@@ -430,6 +430,48 @@ def apply_psychoacoustic_gate(audio_window: torch.Tensor, slots: List[Tuple[int,
     return filtered_slots
 
 
+def apply_psychoacoustic_gate_batched(audio_windows: torch.Tensor, all_slots: List[List[Tuple[int, int]]],
+                                     overlap_ratio: float = 0.5) -> List[List[Tuple[int, int]]]:
+    """Batched psychoacoustic gate for multiple windows at once.
+    Args:
+        audio_windows: [N, 1, T]
+        all_slots: list of slot lists per window
+    Returns: filtered slot lists per window
+    """
+    if audio_windows.dim() == 2:
+        audio_windows = audio_windows.unsqueeze(1)
+    if audio_windows.numel() == 0:
+        return all_slots
+    # Compute batched STFT once
+    X = _adaptive_stft(audio_windows, overlap_ratio=overlap_ratio)  # [N, 2, F, T]
+    mag = torch.sqrt(torch.clamp(X[:, 0]**2 + X[:, 1]**2, min=1e-12))  # [N, F, T]
+    out: List[List[Tuple[int, int]]] = []
+    N = audio_windows.size(0)
+    for n in range(N):
+        slots = all_slots[n]
+        if not slots:
+            out.append([])
+            continue
+        Fdim, Tdim = mag.size(1), mag.size(2)
+        scored: List[Tuple[float, int, int]] = []
+        for (f, t) in slots:
+            if f < Fdim and t < Tdim:
+                # 3x3 local region stats
+                f0, f1 = max(0, f-1), min(Fdim, f+2)
+                t0, t1 = max(0, t-1), min(Tdim, t+2)
+                local = mag[n, f0:f1, t0:t1]
+                slot_mag = mag[n, f, t]
+                local_mean = local.mean()
+                local_std = local.std()
+                rel = slot_mag / (local_mean + 1e-12)
+                var_score = torch.clamp(local_std / (local_mean + 1e-12), max=2.0)
+                score = (slot_mag * 0.4 + rel * 0.4 + var_score * 0.2).item()
+                scored.append((score, f, t))
+        scored.sort(reverse=True)
+        keep = max(1, len(slots) // 2)
+        out.append([(f, t) for _, f, t in scored[:keep]])
+    return out
+
 def fuse_overlapping_windows(window_bits_list: List[torch.Tensor], 
                            overlap_ratio: float = 0.5) -> torch.Tensor:
     """
