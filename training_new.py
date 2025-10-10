@@ -84,12 +84,12 @@ class TrainConfig:
 	# Data
 	data_dir: str = "data/train"
 	val_dir: str = "data/val"
-	batch_size: int = 6
+	batch_size: int = 8
 	num_workers: int = 6
 	device: str = "cuda" if torch.cuda.is_available() else "cpu"
 	mixed_precision: bool = True
 	log_interval: int = 25
-	save_dir: str = "checkpoints_phase1"
+	save_dir: str = "Watermark_new_pipeline_test"
 
 	# Micro-windowing
 	window_ms: int = 20           # 10–20 ms (use 20 ms default)
@@ -384,8 +384,8 @@ def compute_losses_and_metrics(
 	payload_bits: torch.Tensor,
 ) -> Dict:
 	"""Full forward for one 1 s segment with encode/decode and losses."""
-    # Sanitize inputs early
-    x_1s = torch.nan_to_num(x_1s, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+	# Sanitize inputs early
+	x_1s = torch.nan_to_num(x_1s, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
 	# Insert sync
 	x_sync = embed_sync_marker(x_1s, cfg.sync_strength, TARGET_SR, cfg.mapper_seed)
 	# Micro-windowing
@@ -424,11 +424,11 @@ def compute_losses_and_metrics(
 	# Build message spec for the whole second using window budgets
 	M_spec = build_message_spec_for_second(x_sync, gated_placements, bits_by_symbol, amp_budget_by_window)
 	# Encode with INN
-    x_wm, _ = model.encode(x_sync, M_spec)
-    x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+	x_wm, _ = model.encode(x_sync, M_spec)
+	x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
 	# Decode with INN
-    M_rec = model.decode(x_wm)
-    M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
+	M_rec = model.decode(x_wm)
+	M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
 	# Extract predictions at placement slots and compute bit-wise BCE (masked)
 	all_logits: List[torch.Tensor] = []
 	all_targets: List[torch.Tensor] = []
@@ -442,13 +442,13 @@ def compute_losses_and_metrics(
 	if len(all_logits) == 0:
 		bit_loss = torch.tensor(0.0, device=x_1s.device)
 		ber = 1.0
-    else:
-        logits = torch.cat(all_logits, dim=0)
-        targets = torch.cat(all_targets, dim=0)
-        # Clamp/sanitize logits to avoid NaN/Inf in BCE
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=6.0, neginf=-6.0).clamp(-6.0, 6.0)
-        bit_loss = F.binary_cross_entropy_with_logits(logits, targets)
-        pred_bits = (logits > 0).float()
+	else:
+		logits = torch.cat(all_logits, dim=0)
+		targets = torch.cat(all_targets, dim=0)
+		# Clamp/sanitize logits to avoid NaN/Inf in BCE
+		logits = torch.nan_to_num(logits, nan=0.0, posinf=6.0, neginf=-6.0).clamp(-6.0, 6.0)
+		bit_loss = F.binary_cross_entropy_with_logits(logits, targets)
+		pred_bits = (logits > 0).float()
 		ber = float((pred_bits != targets).float().mean().item())
 	# Amplitude budget penalty: sum of placed amplitudes relative to budget
 	amp_penalty_terms: List[torch.Tensor] = []
@@ -468,18 +468,18 @@ def compute_losses_and_metrics(
 			amp_penalty_terms.append(excess)
 	amp_penalty = torch.stack(amp_penalty_terms).mean() if amp_penalty_terms else torch.tensor(0.0, device=x_1s.device)
 	# Perceptual loss (optional; start at 0 in bring-up)
-    # Compute perceptual loss in full precision to reduce fp16/bf16 NaNs
-    if x_sync.dtype != torch.float32:
-        x_sync_fp = x_sync.float()
-    else:
-        x_sync_fp = x_sync
-    if x_wm.dtype != torch.float32:
-        x_wm_fp = x_wm.float()
-    else:
-        x_wm_fp = x_wm
-    with torch.amp.autocast(device_type="cuda", enabled=False):
-        perc = CombinedPerceptualLoss()(x_sync_fp, x_wm_fp)
-        perc_total = perc["total_perceptual_loss"]
+	# Compute perceptual loss in full precision to reduce fp16/bf16 NaNs
+	if x_sync.dtype != torch.float32:
+		x_sync_fp = x_sync.float()
+	else:
+		x_sync_fp = x_sync
+	if x_wm.dtype != torch.float32:
+		x_wm_fp = x_wm.float()
+	else:
+		x_wm_fp = x_wm
+	with torch.amp.autocast(device_type="cuda", enabled=False):
+		perc = CombinedPerceptualLoss()(x_sync_fp, x_wm_fp)
+		perc_total = perc["total_perceptual_loss"]
 	# Total loss
 	total = cfg.w_bits * bit_loss + cfg.w_amp * amp_penalty + cfg.w_perc * perc_total
 	return {
@@ -532,13 +532,13 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
 		bits = _make_payload_bits_tensor(cfg, x.device)
 		optimizer.zero_grad(set_to_none=True)
 		use_amp = cfg.mixed_precision and torch.cuda.is_available()
-        # Keep compute stable: do heavy math under AMP but sanitize outputs
-        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+		# Keep compute stable: do heavy math under AMP but sanitize outputs
+		with torch.amp.autocast(device_type="cuda", enabled=use_amp):
 			out = compute_losses_and_metrics(model, x, cfg, bits)
 			loss = out["loss"]
-        # Skip non-finite losses
-        if not torch.isfinite(loss):
-            continue
+		# Skip non-finite losses
+		if not torch.isfinite(loss):
+			continue
 		if scaler is not None and use_amp:
 			scaler.scale(loss).backward()
 			scaler.unscale_(optimizer)
