@@ -673,23 +673,5 @@ def main(cfg: TrainConfig) -> None:
 
 
 if __name__ == "__main__":
-	# Allow environment overrides for DDP launch scripts
-	def _get_env(key: str, default: str) -> str:
-		val = os.environ.get(key)
-		return val if val is not None and len(val) > 0 else default
-	def _get_env_int(key: str, default_val: int) -> int:
-		val = os.environ.get(key)
-		try:
-			return int(val) if val is not None and val != "" else default_val
-		except Exception:
-			return default_val
-
-	_defaults = TrainConfig()
-	cfg = TrainConfig(
-		data_dir=_get_env("DATA_DIR", _defaults.data_dir),
-		val_dir=_get_env("VAL_DIR", _defaults.val_dir),
-		save_dir=_get_env("SAVE_DIR", _defaults.save_dir),
-		epochs=_get_env_int("EPOCHS", _defaults.epochs),
-		batch_size=_get_env_int("PER_DEVICE_BATCH", _defaults.batch_size),
-	)
+	cfg = TrainConfig()
 	main(cfg)

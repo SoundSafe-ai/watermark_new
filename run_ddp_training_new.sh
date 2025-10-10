@@ -1,34 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage examples:
-#   bash run_ddp_training_new.sh \
-#     --nodes 1 --gpus 8 \
-#     --global-batch 48 \
-#     --data-dir /path/train --val-dir /path/val \
-#     --save-dir checkpoints_phase1 \
-#     --epochs 20
-#
-# Multi-node example (run on each node with appropriate node rank):
-#   MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 NODE_RANK=0 \
-#   bash run_ddp_training_new.sh --nodes 2 --gpus 8 --global-batch 64 \
-#        --data-dir /path/train --val-dir /path/val
-#   MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 NODE_RANK=1 \
-#   bash run_ddp_training_new.sh --nodes 2 --gpus 8 --global-batch 64 \
-#        --data-dir /path/train --val-dir /path/val
+# Minimal single-node DDP launcher for training_new.py
+# Usage: bash run_ddp_training_new.sh [NUM_GPUS]
+# Defaults to 8 GPUs if not provided. Uses config inside training_new.py.
 
-NODES=1
-GPUS=8
-NODE_RANK=${NODE_RANK:-0}
-MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
-MASTER_PORT=${MASTER_PORT:-29500}
-GLOBAL_BATCH=64
-EPOCHS=20
-DATA_DIR="data/train"
-VAL_DIR="data/val"
-SAVE_DIR="checkpoints_phase1"
-PER_DEVICE_BATCH=""
-REPO_DIR="watermark_new"
+GPUS=${1:-8}
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -48,53 +26,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-WORLD_SIZE=$(( NODES * GPUS ))
-
-# Derive per-device batch if not provided
-if [[ -z "${PER_DEVICE_BATCH}" ]]; then
-  # Floor division; ensure at least 1
-  PER_DEVICE_BATCH=$(( GLOBAL_BATCH / WORLD_SIZE ))
-  if [[ ${PER_DEVICE_BATCH} -lt 1 ]]; then
-    PER_DEVICE_BATCH=1
-  fi
-fi
-
-export MASTER_ADDR
-export MASTER_PORT
-export NODE_RANK
-export WORLD_SIZE
-
-# Ensure Python can import training_new.py by changing into repo and setting PYTHONPATH
-if [[ ! -d "${REPO_DIR}" ]]; then
-  echo "ERROR: REPO_DIR does not exist: ${REPO_DIR}" >&2
-  exit 1
-fi
 cd "${REPO_DIR}"
 export PYTHONPATH="${REPO_DIR}:${PYTHONPATH:-}"
 
-# Expose run-time config via env (the Python launcher reads these)
-export DATA_DIR
-export VAL_DIR
-export SAVE_DIR
-export EPOCHS
-export PER_DEVICE_BATCH
+echo "Launching training_new.py with --standalone DDP on ${GPUS} GPU(s)"
 
-# Optional: improve NCCL stability
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_NSOCKS_PERTHREAD=2
-export NCCL_SOCKET_NTHREADS=2
-export OMP_NUM_THREADS=4
-
-echo "Launching training_new.py with: nodes=${NODES}, gpus=${GPUS}, world_size=${WORLD_SIZE}, global_batch=${GLOBAL_BATCH}, per_device_batch=${PER_DEVICE_BATCH}" \
-     " master=${MASTER_ADDR}:${MASTER_PORT} node_rank=${NODE_RANK}" \
-     " data_dir=${DATA_DIR} val_dir=${VAL_DIR} save_dir=${SAVE_DIR} epochs=${EPOCHS} repo_dir=${REPO_DIR}"
-
-# Use torchrun to spawn DDP processes. We invoke python -c so we can override TrainConfig at runtime.
-torchrun --nnodes ${NODES} \
-         --nproc_per_node ${GPUS} \
-         --node_rank ${NODE_RANK} \
-         --master_addr ${MASTER_ADDR} \
-         --master_port ${MASTER_PORT} \
-  training_new.py
+torchrun --standalone --nproc_per_node=${GPUS} training_new.py
 
 
