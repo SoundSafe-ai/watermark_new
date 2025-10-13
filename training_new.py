@@ -122,9 +122,17 @@ class TrainConfig:
 	w_bits: float = 1.0
 	w_amp: float = 0.05
 	w_perc: float = 0.01            # start at 0.0 for bring-up; increase later
+	# Early-easy settings and thresholds
+	early_amp_budget_scale: float = 0.5  # use 0.4–0.6 initially
+	early_psy_mask_margin: float = 1.8   # relax mask in epochs 1–2
+	capacity_warn_threshold: float = 0.35
+	warmup_perc_epochs: int = 2          # disable perceptual first N epochs
 
 	# Optim
-	lr: float = 5e-5
+	lr: float = 9e-5
+	peak_lr: float = 1e-4
+	min_lr: float = 3e-5
+	warmup_steps: int = 2000
 	weight_decay: float = 1e-5
 	epochs: int = 20
 
@@ -444,16 +452,33 @@ def compute_losses_and_metrics(
 	amp_budget_by_window: Dict[int, float] = {}
 	for i, w in enumerate(windows):
 		Xw = adaptive_stft(w)  # [1,2,F,T]
-		mask = psycho_gate_accept_mask(Xw, cfg.psy_mask_margin)
+		mask = psycho_gate_accept_mask(Xw, psy_margin_local)
 		window_specs.append(Xw)
 		accept_masks.append(mask)
-		amp_budget_by_window[i] = per_window_amp_budget(Xw, mask, cfg.amp_budget_scale)
+		amp_budget_by_window[i] = per_window_amp_budget(Xw, mask, amp_scale_local)
 	# Determine bit-level training: 64 bytes -> 512 bits; train bit-wise BCE per mapped placement
 	n_symbols = cfg.rs_payload_bytes * 8  # treat each bit as a logical symbol index
 	bits_by_symbol = []
 	for s in range(n_symbols):
 		b = int(payload_bits[s % payload_bits.numel()].item())
 		bits_by_symbol.append(b)
+
+	# Early-easy phase: relax psycho mask and increase amp budget for first epochs
+	if epoch <= cfg.warmup_perc_epochs:
+		# swap psy margin and amp budget used to build M_spec
+		cfg_psy_margin = getattr(cfg, "_tmp_psy_margin", cfg.psy_mask_margin)
+		cfg_amp_scale = getattr(cfg, "_tmp_amp_scale", cfg.amp_budget_scale)
+		try:
+			cfg._tmp_psy_margin = cfg.psy_mask_margin
+			cfg._tmp_amp_scale = cfg.amp_budget_scale
+		except Exception:
+			pass
+		# apply early-easy
+		psy_margin_local = cfg.early_psy_mask_margin
+		amp_scale_local = cfg.early_amp_budget_scale
+	else:
+		psy_margin_local = cfg.psy_mask_margin
+		amp_scale_local = cfg.amp_budget_scale
 	# Build deterministic placements with repetition
 	F_bins = window_specs[0].size(-2)
 	T_frames = window_specs[0].size(-1)
@@ -608,11 +633,27 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
 	base_model = getattr(model, "module", model)
 	running = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
 	local_samples = 0
+
+	# Per-step LR scheduler with warmup then cosine decay
+	total_steps = len(loader)
+	global_step = 0
 	pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
 	for step, batch in pbar:
 		x = batch.to(cfg.device, non_blocking=True)
 		bits = _make_payload_bits_tensor(cfg, x.device, epoch=epoch, batch_idx=step)
 		optimizer.zero_grad(set_to_none=True)
+		# LR warmup and cosine
+		if hasattr(cfg, "warmup_steps"):
+			if global_step < cfg.warmup_steps:
+				# linear warmup to peak_lr
+				lr_now = float(cfg.lr) + (float(cfg.peak_lr) - float(cfg.lr)) * (global_step / max(1, cfg.warmup_steps))
+			else:
+				# cosine decay to min_lr over the rest of the epoch schedule
+				progress = min(1.0, (global_step - cfg.warmup_steps) / max(1, (total_steps - cfg.warmup_steps)))
+				cos = 0.5 * (1.0 + math.cos(math.pi * progress))
+				lr_now = float(cfg.min_lr) + (float(cfg.peak_lr) - float(cfg.min_lr)) * cos
+			for pg in optimizer.param_groups:
+				pg["lr"] = lr_now
 		use_amp = cfg.mixed_precision and torch.cuda.is_available()
 		# Keep compute stable: do heavy math under AMP but sanitize outputs
 		with torch.amp.autocast(device_type="cuda", enabled=use_amp):
@@ -641,6 +682,7 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
 				"ber": f"{running['ber'] / ((step+1)*loader.batch_size):.4f}",
 				"perc": f"{running['perc'] / ((step+1)*loader.batch_size):.4f}",
 			})
+		global_step += 1
 	# All-reduce across ranks for true global averages
 	if dist.is_available() and dist.is_initialized():
 		vals = torch.tensor([running["loss"], running["ber"], running["perc"]], device=cfg.device, dtype=torch.float64)
