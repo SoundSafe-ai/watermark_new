@@ -14,12 +14,17 @@ if REPO_ROOT not in sys.path:
 	sys.path.append(REPO_ROOT)
 
 from training_new import (
-	INNWatermarker,
-	TARGET_SR,
-	adaptive_stft,
-	chunk_into_micro_windows,
-	DeterministicTFMapper,
-	psycho_gate_accept_mask,
+    INNWatermarker,
+    TARGET_SR,
+    adaptive_stft,
+    chunk_into_micro_windows,
+    DeterministicTFMapper,
+    psycho_gate_accept_mask,
+)
+# RS/Interleave helpers to invert training-time encoding
+from pipeline.ingest_and_chunk import (
+    rs_decode_167_125,
+    deinterleave_bytes,
 )
 
 
@@ -63,6 +68,8 @@ def main() -> None:
 	parser.add_argument("--hop_ms", type=int, default=10)
 	parser.add_argument("--mapper_seed", type=int, default=42)
 	parser.add_argument("--repetition", type=int, default=3)
+	parser.add_argument("--min_time_spacing", type=int, default=1)
+	parser.add_argument("--min_freq_spacing", type=int, default=2)
 	parser.add_argument("--psy_mask_margin", type=float, default=1.0)
 	parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
 	args = parser.parse_args()
@@ -92,7 +99,9 @@ def main() -> None:
 
 		F_bins = window_specs[0].size(-2)
 		T_frames = window_specs[0].size(-1)
-		mapper = DeterministicTFMapper(args.mapper_seed, args.repetition, 1, 2)
+		mapper = DeterministicTFMapper(
+			args.mapper_seed, args.repetition, args.min_time_spacing, args.min_freq_spacing
+		)
 		n_symbols = 512
 		placements = mapper.map_symbols(n_symbols, len(windows), F_bins, T_frames)
 		gated = {}
@@ -108,31 +117,36 @@ def main() -> None:
 			M_rec = model.decode(seg)
 			M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
 
-		# CRITICAL FIX: Use same bit extraction strategy as training (individual BCE per placement)
-		# instead of averaging across repetitions
-		segment_logits = []
+		# Group logits by symbol and fuse across placements (mean), matching symbol-level decision
+		symbol_logits = torch.zeros(n_symbols, device=device)
+		symbol_counts = torch.zeros(n_symbols, device=device)
 		for sym_idx, places in gated.items():
 			for (w_idx, f, t) in places:
 				if f < M_rec.size(-2) and t < M_rec.size(-1):
-					val = M_rec[0, 0, f, t]
-					segment_logits.append(val.unsqueeze(0))
-		
-		if len(segment_logits) > 0:
-			logits = torch.cat(segment_logits, dim=0)
-			# Clamp logits like in training to avoid extreme values
-			logits = torch.nan_to_num(logits, nan=0.0, posinf=6.0, neginf=-6.0).clamp(-6.0, 6.0)
-			# Convert to bit predictions using same threshold as training (> 0)
-			pred_bits = (logits > 0).float()
-			all_logits.append(pred_bits)
+					symbol_logits[sym_idx] += M_rec[0, 0, f, t]
+					symbol_counts[sym_idx] += 1.0
+		mask = symbol_counts > 0
+		symbol_logits[mask] = symbol_logits[mask] / symbol_counts[mask]
+		# Clamp logits like in training to avoid extreme values
+		symbol_logits = torch.nan_to_num(symbol_logits, nan=0.0, posinf=6.0, neginf=-6.0).clamp(-6.0, 6.0)
+		all_logits.append(symbol_logits)
 
 	if not all_logits:
 		print("No gated placements found; cannot decode.")
 		return
 
-	logits_cat = torch.cat(all_logits, dim=0)  # concat per-second bit logits
+	# Concatenate per-second logits, threshold to bits for the first 512 symbols
+	logits_cat = torch.cat(all_logits, dim=0)
 	pred_bits = (logits_cat > 0).long().cpu().tolist()
-	pred_bits = pred_bits[:512]  # first 512 bits reconstruct the 64-byte payload
-	decoded_bytes = _bits_to_bytes_lsb_first(pred_bits)
+	pred_bits = pred_bits[:512]
+	bytes_rs = _bits_to_bytes_lsb_first(pred_bits)
+	# Invert interleave + RS coding to recover original 64-byte payload
+	try:
+		bytes_deint = deinterleave_bytes(bytes_rs, 1)
+		decoded_bytes = rs_decode_167_125(bytes_deint)
+	except Exception:
+		# Fallback to raw bytes if RS decode fails
+		decoded_bytes = bytes_rs
 	trimmed = decoded_bytes.rstrip(b"\x00")
 	try:
 		decoded_text = trimmed.decode("utf-8", errors="strict")

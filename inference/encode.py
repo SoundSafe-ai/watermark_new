@@ -15,16 +15,21 @@ if REPO_ROOT not in sys.path:
 
 # Reuse the exact pipeline pieces from training to ensure consistency
 from training_new import (
-	INNWatermarker,
-	TrainConfig,
-	TARGET_SR,
-	adaptive_stft,
-	chunk_into_micro_windows,
-	DeterministicTFMapper,
-	psycho_gate_accept_mask,
-	per_window_amp_budget,
-	embed_sync_marker,
-	build_message_spec_for_second,
+    INNWatermarker,
+    TrainConfig,
+    TARGET_SR,
+    adaptive_stft,
+    chunk_into_micro_windows,
+    DeterministicTFMapper,
+    psycho_gate_accept_mask,
+    per_window_amp_budget,
+    embed_sync_marker,
+    build_message_spec_for_second,
+)
+# RS/Interleave helpers (same as training)
+from pipeline.ingest_and_chunk import (
+    rs_encode_167_125,
+    interleave_bytes,
 )
 
 
@@ -85,6 +90,8 @@ def main() -> None:
 	parser.add_argument("--hop_ms", type=int, default=10)
 	parser.add_argument("--mapper_seed", type=int, default=42)
 	parser.add_argument("--repetition", type=int, default=3)
+	parser.add_argument("--min_time_spacing", type=int, default=1)
+	parser.add_argument("--min_freq_spacing", type=int, default=2)
 	parser.add_argument("--psy_mask_margin", type=float, default=1.0)
 	parser.add_argument("--amp_budget_scale", type=float, default=0.25)
 	parser.add_argument("--sync_strength", type=float, default=0.05)
@@ -107,13 +114,16 @@ def main() -> None:
 			seg = F.pad(seg, (0, sec_len - seg.size(-1)))
 		segments.append(seg)
 
-	# Build user payload bytes (64 bytes, zero-padded) -> 512 LSB-first bits
+	# Build user payload bytes (64 bytes, zero-padded), then RS-encode + interleave
 	payload_bytes = args.payload.encode("utf-8")
 	if len(payload_bytes) > 64:
 		raise ValueError("--payload exceeds 64 bytes when UTF-8 encoded")
 	if len(payload_bytes) < 64:
 		payload_bytes = payload_bytes + bytes(64 - len(payload_bytes))
-	payload_bits_list = _bytes_to_bits_lsb_first(payload_bytes)
+	# RS encode + interleave to match training
+	payload_bytes_rs = rs_encode_167_125(payload_bytes)
+	payload_bytes_rs = interleave_bytes(payload_bytes_rs, 1)
+	payload_bits_list = _bytes_to_bits_lsb_first(payload_bytes_rs)
 
 	outs = []
 	for seg in segments:
@@ -133,7 +143,9 @@ def main() -> None:
 		# 3) Deterministic placements with repetition (exactly like training)
 		F_bins = window_specs[0].size(-2)
 		T_frames = window_specs[0].size(-1)
-		mapper = DeterministicTFMapper(args.mapper_seed, args.repetition, 1, 2)
+		mapper = DeterministicTFMapper(
+			args.mapper_seed, args.repetition, args.min_time_spacing, args.min_freq_spacing
+		)
 		n_symbols = 512
 		placements = mapper.map_symbols(n_symbols, len(windows), F_bins, T_frames)
 		# Gate placements
@@ -146,7 +158,13 @@ def main() -> None:
 					kept.append((w_idx, f, t))
 			gated[sym_idx] = kept
 		# 4) Build bits-per-symbol vector exactly as training expects
-		bits_by_symbol = payload_bits_list[:n_symbols]
+		# If encoded bitstream is shorter than n_symbols, repeat; otherwise truncate
+		if len(payload_bits_list) < n_symbols:
+			reps = (n_symbols + len(payload_bits_list) - 1) // len(payload_bits_list)
+			bits_stream = (payload_bits_list * reps)[:n_symbols]
+		else:
+			bits_stream = payload_bits_list[:n_symbols]
+		bits_by_symbol = bits_stream
 		# 5) Build message spec via the same helper used in training
 		M_spec = build_message_spec_for_second(seg_sync, gated, bits_by_symbol, amp_budget_by_window)
 		# 6) Encode

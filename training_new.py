@@ -577,25 +577,37 @@ def _make_payload_bits_tensor(cfg: TrainConfig, device, epoch: int = 0, batch_id
 def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader) -> Dict:
 	model.eval()
 	base_model = getattr(model, "module", model)
-	metrics = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
-	with torch.no_grad():
-		for batch_idx, batch in enumerate(loader):
-			x = batch.to(cfg.device, non_blocking=True)
-			bits = _make_payload_bits_tensor(cfg, x.device, epoch=0, batch_idx=batch_idx)
-			out = compute_losses_and_metrics(base_model, x, cfg, bits)
-			metrics["loss"] += float(out["loss"].detach().item()) * x.size(0)
-			metrics["ber"] += out["ber"] * x.size(0)
-			metrics["perc"] += out["perc"] * x.size(0)
-	N = len(loader.dataset)
-	for k in metrics:
-		metrics[k] = metrics[k] / max(1, N)
-	return metrics
+    metrics = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
+    local_samples = 0
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(loader):
+            x = batch.to(cfg.device, non_blocking=True)
+            bits = _make_payload_bits_tensor(cfg, x.device, epoch=0, batch_idx=batch_idx)
+            out = compute_losses_and_metrics(base_model, x, cfg, bits)
+            metrics["loss"] += float(out["loss"].detach().item()) * x.size(0)
+            metrics["ber"] += out["ber"] * x.size(0)
+            metrics["perc"] += out["perc"] * x.size(0)
+            local_samples += int(x.size(0))
+    # All-reduce across ranks for true global averages
+    if dist.is_available() and dist.is_initialized():
+        vals = torch.tensor([metrics["loss"], metrics["ber"], metrics["perc"]], device=cfg.device, dtype=torch.float64)
+        cnt = torch.tensor([float(local_samples)], device=cfg.device, dtype=torch.float64)
+        dist.all_reduce(vals, op=dist.ReduceOp.SUM)
+        dist.all_reduce(cnt, op=dist.ReduceOp.SUM)
+        global_samples = max(1.0, cnt.item())
+        metrics["loss"], metrics["ber"], metrics["perc"] = [float(v/global_samples) for v in vals.tolist()]
+    else:
+        global_samples = max(1, local_samples)
+        for k in metrics:
+            metrics[k] = metrics[k] / global_samples
+    return metrics
 
 
 def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.optim.Optimizer, loader: DataLoader, scaler, epoch: int) -> Dict:
 	model.train()
 	base_model = getattr(model, "module", model)
-	running = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
+    running = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
+    local_samples = 0
 	pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
 	for step, batch in pbar:
 		x = batch.to(cfg.device, non_blocking=True)
@@ -622,15 +634,25 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
 		running["loss"] += float(loss.detach().item()) * x.size(0)
 		running["ber"] += out["ber"] * x.size(0)
 		running["perc"] += out["perc"] * x.size(0)
+        local_samples += int(x.size(0))
 		if (step + 1) % cfg.log_interval == 0:
 			pbar.set_postfix({
 				"loss": f"{running['loss'] / ((step+1)*loader.batch_size):.4f}",
 				"ber": f"{running['ber'] / ((step+1)*loader.batch_size):.4f}",
 				"perc": f"{running['perc'] / ((step+1)*loader.batch_size):.4f}",
 			})
-	N = len(loader.dataset)
-	for k in running:
-		running[k] = running[k] / max(1, N)
+    # All-reduce across ranks for true global averages
+    if dist.is_available() and dist.is_initialized():
+        vals = torch.tensor([running["loss"], running["ber"], running["perc"]], device=cfg.device, dtype=torch.float64)
+        cnt = torch.tensor([float(local_samples)], device=cfg.device, dtype=torch.float64)
+        dist.all_reduce(vals, op=dist.ReduceOp.SUM)
+        dist.all_reduce(cnt, op=dist.ReduceOp.SUM)
+        global_samples = max(1.0, cnt.item())
+        running["loss"], running["ber"], running["perc"] = [float(v/global_samples) for v in vals.tolist()]
+    else:
+        global_samples = max(1, local_samples)
+        for k in running:
+            running[k] = running[k] / global_samples
 	return running
 
 
@@ -685,6 +707,25 @@ def main(cfg: TrainConfig) -> None:
 	)
 	# Model
 	model = _build_model(cfg).to(cfg.device)
+	# Resume logic
+	start_epoch = 1
+	best_ber = float("inf")
+	if hasattr(cfg, "resume") and isinstance(cfg.resume, str) and os.path.isfile(cfg.resume):
+		try:
+			ckpt = torch.load(cfg.resume, map_location=cfg.device)
+			state = ckpt.get("model_state", ckpt)
+			model.load_state_dict(state, strict=False)
+			if "best_ber" in ckpt:
+				best_ber = float(ckpt["best_ber"])  # carry forward best metric if available
+			if "epoch" in ckpt:
+				start_epoch = int(ckpt["epoch"]) + 1
+			# optimizer/scaler will be restored after creation below
+			_resume_blob = ckpt  # stash for later
+			if (not is_distributed) or rank == 0:
+				log(f"Resumed model weights from {cfg.resume} (start_epoch={start_epoch})")
+		except Exception as e:
+			if (not is_distributed) or rank == 0:
+				log(f"Warning: failed to load resume checkpoint {cfg.resume}: {e}")
 	if is_distributed:
 		model = DDP(
 			model,
@@ -700,6 +741,15 @@ def main(cfg: TrainConfig) -> None:
 	except Exception:
 		from torch.cuda.amp import GradScaler  # type: ignore
 	scaler = GradScaler(enabled=(cfg.mixed_precision and torch.cuda.is_available()))
+	# Restore optimizer/scaler if available in resume
+	if "_resume_blob" in locals():
+		try:
+			if _resume_blob.get("optimizer_state") is not None:
+				optimizer.load_state_dict(_resume_blob["optimizer_state"])
+			if _resume_blob.get("scaler_state") is not None and scaler is not None:
+				scaler.load_state_dict(_resume_blob["scaler_state"])  # type: ignore[arg-type]
+		except Exception:
+			pass
 	# Logger
 	log_path = os.path.join(cfg.save_dir, cfg.log_file)
 	def log(msg: str) -> None:
@@ -714,7 +764,7 @@ def main(cfg: TrainConfig) -> None:
 		log(f"Files: train={len(train_ds)} | val={len(val_ds)} | SR={TARGET_SR} | win={cfg.window_ms}ms hop={cfg.hop_ms}ms r={cfg.repetition}")
 	# Epochs
 	best_ber = float("inf")
-	for epoch in range(1, cfg.epochs + 1):
+	for epoch in range(start_epoch, cfg.epochs + 1):
 		if is_distributed and train_sampler is not None:
 			train_sampler.set_epoch(epoch)
 		if (not is_distributed) or rank == 0:
@@ -751,6 +801,7 @@ if __name__ == "__main__":
 	parser.add_argument("--save_dir", type=str, default=None)
 	parser.add_argument("--epochs", type=int, default=None)
 	parser.add_argument("--batch_size", type=int, default=None, help="Per-process batch size")
+	parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint (.pt) to resume from")
 	args, _ = parser.parse_known_args()
 
 	_defaults = TrainConfig()
@@ -761,4 +812,7 @@ if __name__ == "__main__":
 		epochs=(args.epochs if args.epochs is not None else int(os.environ.get("EPOCHS", _defaults.epochs))),
 		batch_size=(args.batch_size if args.batch_size is not None else int(os.environ.get("PER_DEVICE_BATCH", _defaults.batch_size))),
 	)
+	# Attach resume path if provided
+	if args.resume:
+		setattr(cfg, "resume", args.resume)
 	main(cfg)
