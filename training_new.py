@@ -722,10 +722,10 @@ def main(cfg: TrainConfig) -> None:
 			# optimizer/scaler will be restored after creation below
 			_resume_blob = ckpt  # stash for later
 			if (not is_distributed) or rank == 0:
-				log(f"Resumed model weights from {cfg.resume} (start_epoch={start_epoch})")
+				print(f"Resumed model weights from {cfg.resume} (start_epoch={start_epoch})")
 		except Exception as e:
 			if (not is_distributed) or rank == 0:
-				log(f"Warning: failed to load resume checkpoint {cfg.resume}: {e}")
+				print(f"Warning: failed to load resume checkpoint {cfg.resume}: {e}")
 	if is_distributed:
 		model = DDP(
 			model,
