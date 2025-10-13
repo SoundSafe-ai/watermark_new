@@ -435,8 +435,15 @@ def compute_losses_and_metrics(
 	x_1s: torch.Tensor,
 	cfg: TrainConfig,
 	payload_bits: torch.Tensor,
+	epoch: int = 0,
 ) -> Dict:
 	"""Full forward for one 1 s segment with encode/decode and losses."""
+	# Defaults for psycho mask margin and amplitude scale; overridable by warmup curriculum
+	psy_margin_local = getattr(cfg, "psy_mask_margin", 1.0)
+	amp_scale_local = getattr(cfg, "amp_budget_scale", 0.25)
+	if epoch <= getattr(cfg, "warmup_perc_epochs", 0):
+		psy_margin_local = getattr(cfg, "early_psy_mask_margin", psy_margin_local)
+		amp_scale_local = getattr(cfg, "early_amp_budget_scale", amp_scale_local)
 	# Unwrap DDP if present so we can call custom methods like encode/decode
 	base_model = getattr(model, "module", model)
 	# Sanitize inputs early
@@ -462,23 +469,6 @@ def compute_losses_and_metrics(
 	for s in range(n_symbols):
 		b = int(payload_bits[s % payload_bits.numel()].item())
 		bits_by_symbol.append(b)
-
-	# Early-easy phase: relax psycho mask and increase amp budget for first epochs
-	if epoch <= cfg.warmup_perc_epochs:
-		# swap psy margin and amp budget used to build M_spec
-		cfg_psy_margin = getattr(cfg, "_tmp_psy_margin", cfg.psy_mask_margin)
-		cfg_amp_scale = getattr(cfg, "_tmp_amp_scale", cfg.amp_budget_scale)
-		try:
-			cfg._tmp_psy_margin = cfg.psy_mask_margin
-			cfg._tmp_amp_scale = cfg.amp_budget_scale
-		except Exception:
-			pass
-		# apply early-easy
-		psy_margin_local = cfg.early_psy_mask_margin
-		amp_scale_local = cfg.early_amp_budget_scale
-	else:
-		psy_margin_local = cfg.psy_mask_margin
-		amp_scale_local = cfg.amp_budget_scale
 	# Build deterministic placements with repetition
 	F_bins = window_specs[0].size(-2)
 	T_frames = window_specs[0].size(-1)
@@ -608,7 +598,7 @@ def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader) -> Dic
 		for batch_idx, batch in enumerate(loader):
 			x = batch.to(cfg.device, non_blocking=True)
 			bits = _make_payload_bits_tensor(cfg, x.device, epoch=0, batch_idx=batch_idx)
-			out = compute_losses_and_metrics(base_model, x, cfg, bits)
+			out = compute_losses_and_metrics(base_model, x, cfg, bits, epoch=0)
 			metrics["loss"] += float(out["loss"].detach().item()) * x.size(0)
 			metrics["ber"] += out["ber"] * x.size(0)
 			metrics["perc"] += out["perc"] * x.size(0)
@@ -657,7 +647,7 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
 		use_amp = cfg.mixed_precision and torch.cuda.is_available()
 		# Keep compute stable: do heavy math under AMP but sanitize outputs
 		with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-			out = compute_losses_and_metrics(base_model, x, cfg, bits)
+			out = compute_losses_and_metrics(base_model, x, cfg, bits, epoch=epoch)
 			loss = out["loss"]
 		# Skip non-finite losses
 		if not torch.isfinite(loss):
