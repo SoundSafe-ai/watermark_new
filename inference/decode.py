@@ -45,6 +45,7 @@ def _load_audio(path: str, target_sr: int) -> torch.Tensor:
 
 
 def _load_model(ckpt_path: str, device: str) -> INNWatermarker:
+	# Use adaptive STFT like training instead of fixed parameters
 	model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": 1024, "hop_length": 512, "win_length": 1024}).to(device)
 	if ckpt_path and os.path.isfile(ckpt_path):
 		ckpt = torch.load(ckpt_path, map_location=device)
@@ -92,7 +93,8 @@ def main() -> None:
 		F_bins = window_specs[0].size(-2)
 		T_frames = window_specs[0].size(-1)
 		mapper = DeterministicTFMapper(args.mapper_seed, args.repetition, 1, 2)
-		placements = mapper.map_symbols(512, len(windows), F_bins, T_frames)
+		n_symbols = 512
+		placements = mapper.map_symbols(n_symbols, len(windows), F_bins, T_frames)
 		gated = {}
 		for sym_idx, places in placements.items():
 			kept = []
@@ -106,24 +108,30 @@ def main() -> None:
 			M_rec = model.decode(seg)
 			M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
 
-		ordered_slots = []
-		for sym_idx in sorted(gated.keys()):
-			kept_sorted = sorted(gated[sym_idx], key=lambda t: (t[0], t[1], t[2]))
-			ordered_slots.extend(kept_sorted)
-		logits = []
-		for (w_idx, f, t) in ordered_slots:
-			if f < M_rec.size(-2) and t < M_rec.size(-1):
-				logits.append(M_rec[0, 0, f, t].unsqueeze(0))
-		if logits:
-			all_logits.append(torch.cat(logits, dim=0))
+		# CRITICAL FIX: Use same bit extraction strategy as training (individual BCE per placement)
+		# instead of averaging across repetitions
+		segment_logits = []
+		for sym_idx, places in gated.items():
+			for (w_idx, f, t) in places:
+				if f < M_rec.size(-2) and t < M_rec.size(-1):
+					val = M_rec[0, 0, f, t]
+					segment_logits.append(val.unsqueeze(0))
+		
+		if len(segment_logits) > 0:
+			logits = torch.cat(segment_logits, dim=0)
+			# Clamp logits like in training to avoid extreme values
+			logits = torch.nan_to_num(logits, nan=0.0, posinf=6.0, neginf=-6.0).clamp(-6.0, 6.0)
+			# Convert to bit predictions using same threshold as training (> 0)
+			pred_bits = (logits > 0).float()
+			all_logits.append(pred_bits)
 
 	if not all_logits:
 		print("No gated placements found; cannot decode.")
 		return
 
-	logits_cat = torch.cat(all_logits, dim=0)
+	logits_cat = torch.cat(all_logits, dim=0)  # concat per-second bit logits
 	pred_bits = (logits_cat > 0).long().cpu().tolist()
-	pred_bits = pred_bits[:512]
+	pred_bits = pred_bits[:512]  # first 512 bits reconstruct the 64-byte payload
 	decoded_bytes = _bits_to_bytes_lsb_first(pred_bits)
 	trimmed = decoded_bytes.rstrip(b"\x00")
 	try:

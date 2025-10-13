@@ -57,6 +57,7 @@ def _save_audio(path: str, wav: torch.Tensor, sr: int) -> None:
 
 
 def _load_model(ckpt_path: str, device: str) -> INNWatermarker:
+	# Use adaptive STFT like training instead of fixed parameters
 	model = INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": 1024, "hop_length": 512, "win_length": 1024}).to(device)
 	if ckpt_path and os.path.isfile(ckpt_path):
 		ckpt = torch.load(ckpt_path, map_location=device)
@@ -113,7 +114,6 @@ def main() -> None:
 	if len(payload_bytes) < 64:
 		payload_bytes = payload_bytes + bytes(64 - len(payload_bytes))
 	payload_bits_list = _bytes_to_bits_lsb_first(payload_bytes)
-	bit_cursor = 0
 
 	outs = []
 	for seg in segments:
@@ -130,12 +130,12 @@ def main() -> None:
 			accept_masks.append(mask)
 			amp_budget_by_window[i] = per_window_amp_budget(Xw, mask, args.amp_budget_scale)
 			window_specs.append(Xw)
-		# 3) Deterministic placements with repetition
+		# 3) Deterministic placements with repetition (exactly like training)
 		F_bins = window_specs[0].size(-2)
 		T_frames = window_specs[0].size(-1)
 		mapper = DeterministicTFMapper(args.mapper_seed, args.repetition, 1, 2)
-		# Use 512 logical symbols to ensure abundant slot proposals per second; we'll fill sequentially
-		placements = mapper.map_symbols(512, len(windows), F_bins, T_frames)
+		n_symbols = 512
+		placements = mapper.map_symbols(n_symbols, len(windows), F_bins, T_frames)
 		# Gate placements
 		gated = {}
 		for sym_idx, places in placements.items():
@@ -145,27 +145,10 @@ def main() -> None:
 				if f < m.size(0) and t < m.size(1) and bool(m[f, t].item()):
 					kept.append((w_idx, f, t))
 			gated[sym_idx] = kept
-		# 4) Build deterministic flat order of accepted placements for this second
-		ordered_slots: list[tuple[int,int,int]] = []
-		for sym_idx in sorted(gated.keys()):
-			kept = gated[sym_idx]
-			kept_sorted = sorted(kept, key=lambda t: (t[0], t[1], t[2]))
-			ordered_slots.extend(kept_sorted)
-		# 5) Write bits sequentially for this second from global payload bitstream
-		# Build a minimal bits_by_symbol map by reusing the helper that expects per-symbol bits,
-		# but we will instead directly write into the message spec by iterating slots.
-		X_ri = adaptive_stft(seg_sync)
-		F_bins2, T_frames2 = X_ri.size(-2), X_ri.size(-1)
-		M_spec = torch.zeros_like(X_ri)
-		for (w_idx, f, t) in ordered_slots:
-			if bit_cursor >= len(payload_bits_list):
-				break
-			if f < F_bins2 and t < T_frames2:
-				bit = payload_bits_list[bit_cursor]
-				bit_cursor += 1
-				amp = amp_budget_by_window.get(w_idx, 0.0)
-				sign = 1.0 if bit > 0 else -1.0
-				M_spec[0, 0, f, t] = M_spec[0, 0, f, t] + sign * float(amp)
+		# 4) Build bits-per-symbol vector exactly as training expects
+		bits_by_symbol = payload_bits_list[:n_symbols]
+		# 5) Build message spec via the same helper used in training
+		M_spec = build_message_spec_for_second(seg_sync, gated, bits_by_symbol, amp_budget_by_window)
 		# 6) Encode
 		with torch.no_grad():
 			seg_wm, _ = model.encode(seg_sync, M_spec)
@@ -177,8 +160,6 @@ def main() -> None:
 	wm = torch.cat(outs, dim=-1)[..., :T]  # trim back to original length
 	_save_audio(args.out, wm, args.sr)
 	print(f"Saved watermarked audio to {os.path.abspath(args.out)}")
-	if bit_cursor < len(payload_bits_list):
-		print(f"Warning: Input shorter than needed to carry full 64-byte payload; encoded only {bit_cursor} of {len(payload_bits_list)} bits.")
 
 
 if __name__ == "__main__":

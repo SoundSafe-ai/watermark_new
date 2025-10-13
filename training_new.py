@@ -106,6 +106,7 @@ class TrainConfig:
 	repetition: int = 3            # r placements per symbol
 	use_fixed_payload: bool = True # Phase-1 may use fixed payload for simplicity
 	payload_seed: int = 12345
+	payload_variation: str = "per_epoch"  # "per_epoch", "per_batch", "per_sample"
 
 	# Mapper and gating
 	mapper_seed: int = 42
@@ -336,12 +337,54 @@ def _rand_payload_bytes(n: int, rng: random.Random) -> bytes:
 	return bytes([rng.randrange(0, 256) for _ in range(n)])
 
 
+def _generate_structured_payload(rng: random.Random) -> bytes:
+	"""Generate a structured 64-byte payload with variable content.
+	
+	Structure: "ISRC{12_digits}ISFR{12_digits}N{name_8_chars}D{4_digits}"
+	- ISRC: 12 random digits
+	- ISFR: 12 random digits  
+	- N: 8-character name (letters/numbers)
+	- D: 4-digit duration
+	
+	Total: 4 + 12 + 4 + 12 + 1 + 8 + 1 + 4 = 46 bytes
+	Remaining 18 bytes: padded with random alphanumeric
+	"""
+	# ISRC: 12 random digits
+	isrc = ''.join([str(rng.randint(0, 9)) for _ in range(12)])
+	
+	# ISFR: 12 random digits
+	isfr = ''.join([str(rng.randint(0, 9)) for _ in range(12)])
+	
+	# Name: 8 random alphanumeric characters
+	name_chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+	name = ''.join([rng.choice(name_chars) for _ in range(8)])
+	
+	# Duration: 4 random digits (0000-9999)
+	duration = ''.join([str(rng.randint(0, 9)) for _ in range(4)])
+	
+	# Construct payload
+	payload_str = f"ISRC{isrc}ISFR{isfr}N{name}D{duration}"
+	
+	# Pad to 64 bytes with random alphanumeric
+	while len(payload_str) < 64:
+		payload_str += rng.choice(name_chars)
+	
+	# Truncate to exactly 64 bytes
+	payload_str = payload_str[:64]
+	
+	return payload_str.encode('utf-8')
+
+
 def build_payload_bits(cfg: TrainConfig) -> torch.Tensor:
+	"""Build payload bits with structured content to prevent overfitting."""
 	rng = random.Random(cfg.payload_seed)
+	
 	if cfg.use_fixed_payload:
-		payload = bytes([i % 256 for i in range(cfg.rs_payload_bytes)])
+		# Use structured payload instead of sequential bytes
+		payload = _generate_structured_payload(rng)
 	else:
 		payload = _rand_payload_bytes(cfg.rs_payload_bytes, rng)
+	
 	if _HAS_RS:
 		enc = rs_encode_167_125(payload)
 		enc = interleave_bytes(enc, 1)  # simple interleave depth=1 for Phase-1
@@ -505,8 +548,29 @@ def _build_model(cfg: TrainConfig) -> INNWatermarker:
 	return INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": 1024, "hop_length": 512, "win_length": 1024})
 
 
-def _make_payload_bits_tensor(cfg: TrainConfig, device) -> torch.Tensor:
-	bits = build_payload_bits(cfg)
+def _make_payload_bits_tensor(cfg: TrainConfig, device, epoch: int = 0, batch_idx: int = 0) -> torch.Tensor:
+	"""Create payload bits with configurable variation strategy."""
+	if cfg.payload_variation == "per_sample":
+		# Most aggressive: different payload for each sample
+		seed = cfg.payload_seed + epoch * 10000 + batch_idx * 100 + random.randint(0, 99)
+	elif cfg.payload_variation == "per_batch":
+		# Moderate: different payload for each batch
+		seed = cfg.payload_seed + epoch * 1000 + batch_idx
+	elif cfg.payload_variation == "per_epoch":
+		# Conservative: different payload for each epoch
+		seed = cfg.payload_seed + epoch
+	else:
+		# Fallback to original behavior
+		seed = cfg.payload_seed
+	
+	# Create temporary config with modified seed
+	temp_cfg = TrainConfig()
+	for attr in dir(cfg):
+		if not attr.startswith('_'):
+			setattr(temp_cfg, attr, getattr(cfg, attr))
+	temp_cfg.payload_seed = seed
+	
+	bits = build_payload_bits(temp_cfg)
 	return bits.to(device)
 
 
@@ -515,9 +579,9 @@ def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader) -> Dic
 	base_model = getattr(model, "module", model)
 	metrics = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
 	with torch.no_grad():
-		for batch in loader:
+		for batch_idx, batch in enumerate(loader):
 			x = batch.to(cfg.device, non_blocking=True)
-			bits = _make_payload_bits_tensor(cfg, x.device)
+			bits = _make_payload_bits_tensor(cfg, x.device, epoch=0, batch_idx=batch_idx)
 			out = compute_losses_and_metrics(base_model, x, cfg, bits)
 			metrics["loss"] += float(out["loss"].detach().item()) * x.size(0)
 			metrics["ber"] += out["ber"] * x.size(0)
@@ -535,7 +599,7 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
 	pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
 	for step, batch in pbar:
 		x = batch.to(cfg.device, non_blocking=True)
-		bits = _make_payload_bits_tensor(cfg, x.device)
+		bits = _make_payload_bits_tensor(cfg, x.device, epoch=epoch, batch_idx=step)
 		optimizer.zero_grad(set_to_none=True)
 		use_amp = cfg.mixed_precision and torch.cuda.is_available()
 		# Keep compute stable: do heavy math under AMP but sanitize outputs
