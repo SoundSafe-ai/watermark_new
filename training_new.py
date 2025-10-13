@@ -133,6 +133,10 @@ class TrainConfig:
 	peak_lr: float = 1e-4
 	min_lr: float = 3e-5
 	warmup_steps: int = 2000
+	# Plateau and LR bump
+	plateau_eps: float = 1e-3
+	plateau_patience_epochs: int = 1
+	lr_bump_mult: float = 1.5
 	weight_decay: float = 1e-5
 	epochs: int = 20
 
@@ -463,6 +467,11 @@ def compute_losses_and_metrics(
 		window_specs.append(Xw)
 		accept_masks.append(mask)
 		amp_budget_by_window[i] = per_window_amp_budget(Xw, mask, amp_scale_local)
+
+	# Diagnostics: capacity (accepted slots) fraction
+	accepted_slots = sum(len(v) for v in gated_placements.values()) if 'gated_placements' in locals() else 0
+	expected_slots = 512 * getattr(cfg, 'repetition', 1)
+	capacity_fraction = float(accepted_slots) / float(max(1, expected_slots))
 	# Determine bit-level training: 64 bytes -> 512 bits; train bit-wise BCE per mapped placement
 	n_symbols = cfg.rs_payload_bytes * 8  # treat each bit as a logical symbol index
 	bits_by_symbol = []
@@ -491,6 +500,23 @@ def compute_losses_and_metrics(
 	# Decode with INN
 	M_rec = base_model.decode(x_wm)
 	M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
+
+	# Diagnostics: average fused logit magnitude across r placements per bit on this segment
+	# (computationally light; used for debugging/telemetry only)
+	try:
+		fused_logits = []
+		for sym_idx, places in gated_placements.items():
+			acc = 0.0
+			cnt = 0
+			for (w, f, t) in places:
+				if f < M_rec.size(-2) and t < M_rec.size(-1):
+					acc += float(M_rec[0, 0, f, t].item())
+					cnt += 1
+			if cnt > 0:
+				fused_logits.append(abs(acc / cnt))
+		avg_fused_logit_mag = float(sum(fused_logits) / max(1, len(fused_logits))) if fused_logits else 0.0
+	except Exception:
+		avg_fused_logit_mag = 0.0
 	# Extract predictions at placement slots and compute bit-wise BCE (masked)
 	all_logits: List[torch.Tensor] = []
 	all_targets: List[torch.Tensor] = []
@@ -807,6 +833,20 @@ def main(cfg: TrainConfig) -> None:
 		val_metrics = validate(model, cfg, val_loader)
 		if (not is_distributed) or rank == 0:
 			log(f"val  : loss={val_metrics['loss']:.4f} ber={val_metrics['ber']:.4f} perc={val_metrics['perc']:.4f}")
+			# LR bump on plateau: if no improvement > epsilon over patience, bump LR briefly
+			if "_last_val_loss" not in locals():
+				_last_val_loss = val_metrics["loss"]
+				_stagnant_epochs = 0
+			else:
+				if abs(val_metrics["loss"] - _last_val_loss) < cfg.plateau_eps:
+					_stagnant_epochs += 1
+				else:
+					_stagnant_epochs = 0
+				_last_val_loss = val_metrics["loss"]
+			if _stagnant_epochs >= cfg.plateau_patience_epochs:
+				for pg in optimizer.param_groups:
+					pg["lr"] = min(cfg.peak_lr * cfg.lr_bump_mult, pg["lr"] * cfg.lr_bump_mult)
+				log(f"LR bump applied due to plateau (new lr ~ {optimizer.param_groups[0]['lr']:.2e})")
 			# Save best by BER
 			if val_metrics["ber"] < best_ber:
 				best_ber = val_metrics["ber"]
