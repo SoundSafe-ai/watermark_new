@@ -405,11 +405,11 @@ def compute_losses_and_metrics(
 		window_specs.append(Xw)
 		accept_masks.append(mask)
 		amp_budget_by_window[i] = per_window_amp_budget(Xw, mask, cfg.amp_budget_scale)
-	# Determine symbolization: 64 bytes -> 64 symbols (GF(256) view), train bit-wise BCE
-	n_symbols = cfg.rs_payload_bytes
-	bits_by_symbol = []  # pick 1 bit per symbol for Phase-1 BCE bring-up (can expand later)
+	# Determine bit-level training: 64 bytes -> 512 bits; train bit-wise BCE per mapped placement
+	n_symbols = cfg.rs_payload_bytes * 8  # treat each bit as a logical symbol index
+	bits_by_symbol = []
 	for s in range(n_symbols):
-		b = int(payload_bits[(s * 8) % payload_bits.numel()].item())
+		b = int(payload_bits[s % payload_bits.numel()].item())
 		bits_by_symbol.append(b)
 	# Build deterministic placements with repetition
 	F_bins = window_specs[0].size(-2)
