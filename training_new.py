@@ -577,37 +577,37 @@ def _make_payload_bits_tensor(cfg: TrainConfig, device, epoch: int = 0, batch_id
 def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader) -> Dict:
 	model.eval()
 	base_model = getattr(model, "module", model)
-    metrics = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
-    local_samples = 0
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
-            x = batch.to(cfg.device, non_blocking=True)
-            bits = _make_payload_bits_tensor(cfg, x.device, epoch=0, batch_idx=batch_idx)
-            out = compute_losses_and_metrics(base_model, x, cfg, bits)
-            metrics["loss"] += float(out["loss"].detach().item()) * x.size(0)
-            metrics["ber"] += out["ber"] * x.size(0)
-            metrics["perc"] += out["perc"] * x.size(0)
-            local_samples += int(x.size(0))
-    # All-reduce across ranks for true global averages
-    if dist.is_available() and dist.is_initialized():
-        vals = torch.tensor([metrics["loss"], metrics["ber"], metrics["perc"]], device=cfg.device, dtype=torch.float64)
-        cnt = torch.tensor([float(local_samples)], device=cfg.device, dtype=torch.float64)
-        dist.all_reduce(vals, op=dist.ReduceOp.SUM)
-        dist.all_reduce(cnt, op=dist.ReduceOp.SUM)
-        global_samples = max(1.0, cnt.item())
-        metrics["loss"], metrics["ber"], metrics["perc"] = [float(v/global_samples) for v in vals.tolist()]
-    else:
-        global_samples = max(1, local_samples)
-        for k in metrics:
-            metrics[k] = metrics[k] / global_samples
-    return metrics
+	metrics = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
+	local_samples = 0
+	with torch.no_grad():
+		for batch_idx, batch in enumerate(loader):
+			x = batch.to(cfg.device, non_blocking=True)
+			bits = _make_payload_bits_tensor(cfg, x.device, epoch=0, batch_idx=batch_idx)
+			out = compute_losses_and_metrics(base_model, x, cfg, bits)
+			metrics["loss"] += float(out["loss"].detach().item()) * x.size(0)
+			metrics["ber"] += out["ber"] * x.size(0)
+			metrics["perc"] += out["perc"] * x.size(0)
+			local_samples += int(x.size(0))
+	# All-reduce across ranks for true global averages
+	if dist.is_available() and dist.is_initialized():
+		vals = torch.tensor([metrics["loss"], metrics["ber"], metrics["perc"]], device=cfg.device, dtype=torch.float64)
+		cnt = torch.tensor([float(local_samples)], device=cfg.device, dtype=torch.float64)
+		dist.all_reduce(vals, op=dist.ReduceOp.SUM)
+		dist.all_reduce(cnt, op=dist.ReduceOp.SUM)
+		global_samples = max(1.0, cnt.item())
+		metrics["loss"], metrics["ber"], metrics["perc"] = [float(v/global_samples) for v in vals.tolist()]
+	else:
+		global_samples = max(1, local_samples)
+		for k in metrics:
+			metrics[k] = metrics[k] / global_samples
+	return metrics
 
 
 def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.optim.Optimizer, loader: DataLoader, scaler, epoch: int) -> Dict:
 	model.train()
 	base_model = getattr(model, "module", model)
-    running = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
-    local_samples = 0
+	running = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
+	local_samples = 0
 	pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
 	for step, batch in pbar:
 		x = batch.to(cfg.device, non_blocking=True)
@@ -634,25 +634,25 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
 		running["loss"] += float(loss.detach().item()) * x.size(0)
 		running["ber"] += out["ber"] * x.size(0)
 		running["perc"] += out["perc"] * x.size(0)
-        local_samples += int(x.size(0))
+		local_samples += int(x.size(0))
 		if (step + 1) % cfg.log_interval == 0:
 			pbar.set_postfix({
 				"loss": f"{running['loss'] / ((step+1)*loader.batch_size):.4f}",
 				"ber": f"{running['ber'] / ((step+1)*loader.batch_size):.4f}",
 				"perc": f"{running['perc'] / ((step+1)*loader.batch_size):.4f}",
 			})
-    # All-reduce across ranks for true global averages
-    if dist.is_available() and dist.is_initialized():
-        vals = torch.tensor([running["loss"], running["ber"], running["perc"]], device=cfg.device, dtype=torch.float64)
-        cnt = torch.tensor([float(local_samples)], device=cfg.device, dtype=torch.float64)
-        dist.all_reduce(vals, op=dist.ReduceOp.SUM)
-        dist.all_reduce(cnt, op=dist.ReduceOp.SUM)
-        global_samples = max(1.0, cnt.item())
-        running["loss"], running["ber"], running["perc"] = [float(v/global_samples) for v in vals.tolist()]
-    else:
-        global_samples = max(1, local_samples)
-        for k in running:
-            running[k] = running[k] / global_samples
+	# All-reduce across ranks for true global averages
+	if dist.is_available() and dist.is_initialized():
+		vals = torch.tensor([running["loss"], running["ber"], running["perc"]], device=cfg.device, dtype=torch.float64)
+		cnt = torch.tensor([float(local_samples)], device=cfg.device, dtype=torch.float64)
+		dist.all_reduce(vals, op=dist.ReduceOp.SUM)
+		dist.all_reduce(cnt, op=dist.ReduceOp.SUM)
+		global_samples = max(1.0, cnt.item())
+		running["loss"], running["ber"], running["perc"] = [float(v/global_samples) for v in vals.tolist()]
+	else:
+		global_samples = max(1, local_samples)
+		for k in running:
+			running[k] = running[k] / global_samples
 	return running
 
 
