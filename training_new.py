@@ -42,6 +42,7 @@ from tqdm import tqdm
 
 from models.inn_encoder_decoder import INNWatermarker
 from pipeline.perceptual_losses import CombinedPerceptualLoss
+from pipeline.micro_chunking import MicroChunker, DeterministicMapper, apply_psychoacoustic_gate
 
 # Silence known TorchAudio warnings (2.9 migration and deprecations)
 warnings.filterwarnings(
@@ -454,8 +455,12 @@ def compute_losses_and_metrics(
 	x_1s = torch.nan_to_num(x_1s, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
 	# Insert sync
 	x_sync = embed_sync_marker(x_1s, cfg.sync_strength, TARGET_SR, cfg.mapper_seed)
-	# Micro-windowing
-	windows = chunk_into_micro_windows(x_sync, cfg.window_ms, cfg.hop_ms, TARGET_SR)
+	# Instantiate micro-chunking and deterministic mapper (external implementations)
+	overlap_ratio = 1.0 - (float(cfg.hop_ms) / float(max(1, cfg.window_ms)))
+	micro_chunker = MicroChunker(window_ms=cfg.window_ms, overlap_ratio=overlap_ratio, sr=TARGET_SR)
+	det_mapper = DeterministicMapper(seed=cfg.mapper_seed, n_fft=1024, hop=512, sr=TARGET_SR, window_ms=cfg.window_ms)
+	# Micro-windowing via MicroChunker on a single 1s sample (keep downstream expectations)
+	windows = micro_chunker.chunk_1s_segment(x_sync[0])  # [1, T] -> list of [1, T_w]
 	n_windows = len(windows)
 	# Establish per-window STFT and masks
 	window_specs: List[torch.Tensor] = []
@@ -468,30 +473,35 @@ def compute_losses_and_metrics(
 		accept_masks.append(mask)
 		amp_budget_by_window[i] = per_window_amp_budget(Xw, mask, amp_scale_local)
 
-	# Diagnostics: capacity (accepted slots) fraction
-	accepted_slots = sum(len(v) for v in gated_placements.values()) if 'gated_placements' in locals() else 0
-	expected_slots = 512 * getattr(cfg, 'repetition', 1)
-	capacity_fraction = float(accepted_slots) / float(max(1, expected_slots))
 	# Determine bit-level training: 64 bytes -> 512 bits; train bit-wise BCE per mapped placement
 	n_symbols = cfg.rs_payload_bytes * 8  # treat each bit as a logical symbol index
 	bits_by_symbol = []
 	for s in range(n_symbols):
 		b = int(payload_bits[s % payload_bits.numel()].item())
 		bits_by_symbol.append(b)
-	# Build deterministic placements with repetition
-	F_bins = window_specs[0].size(-2)
-	T_frames = window_specs[0].size(-1)
-	mapper = DeterministicTFMapper(cfg.mapper_seed, cfg.repetition, cfg.min_time_spacing, cfg.min_freq_spacing)
-	placements = mapper.map_symbols(n_symbols, n_windows, F_bins, T_frames)
-	# Gate placements by psycho mask; if rejected, drop that copy
+	# Map per-window candidate slots using DeterministicMapper and gate by psycho mask + content-aware gate
+	bits_per_window = int(math.ceil(float(n_symbols) / float(max(1, n_windows))))
+	concatenated_slots: List[Tuple[int,int,int]] = []  # (w_idx, f, t)
+	for i in range(n_windows):
+		slots = det_mapper.map_window_to_slots(window_idx=i, n_windows=n_windows, target_bits=bits_per_window, audio_content=windows[i])
+		# Content-aware psychoacoustic gating for this window
+		psy_filtered = apply_psychoacoustic_gate(windows[i], slots, base_model, n_fft=1024, hop=512)
+		# Optional conservative intersection with boolean accept mask
+		mask = accept_masks[i]
+		filtered = [(i, f, t) for (f, t) in psy_filtered if f < mask.size(0) and t < mask.size(1) and bool(mask[f, t].item())]
+		concatenated_slots.extend(filtered)
+	# Assign slots sequentially to symbols; one placement per symbol
 	gated_placements: Dict[int, List[Tuple[int,int,int]]] = {}
-	for sym_idx, places in placements.items():
-		kept: List[Tuple[int,int,int]] = []
-		for (w, f, t) in places:
-			mask = accept_masks[w]
-			if f < mask.size(0) and t < mask.size(1) and bool(mask[f, t].item()):
-				kept.append((w, f, t))
-		gated_placements[sym_idx] = kept
+	_sym = 0
+	for (w, f, t) in concatenated_slots:
+		if _sym >= n_symbols:
+			break
+		gated_placements[_sym] = [(w, f, t)]
+		_sym += 1
+	# Diagnostics: capacity (accepted slots) fraction
+	accepted_slots = sum(len(v) for v in gated_placements.values())
+	expected_slots = n_symbols  # one slot per symbol target
+	capacity_fraction = float(accepted_slots) / float(max(1, expected_slots))
 	# Build message spec for the whole second using window budgets
 	M_spec = build_message_spec_for_second(x_sync, gated_placements, bits_by_symbol, amp_budget_by_window)
 	# Encode with INN
