@@ -116,12 +116,11 @@ class STFT(nn.Module):
 
         # x_wave: [B, 1, T]
         B, _, T = x_wave.shape
-        # Derive adaptive STFT parameters from window length T
-        win_length = int(T)
-        # Next power of two >= win_length (efficient FFT)
-        n_fft = 1 << (max(1, win_length) - 1).bit_length()
-        # Maintain original overlap via base hop ratio
-        hop_length = max(1, int(round(win_length * self.base_hop_ratio)))
+
+        # Use fixed configured params, capped by T for safety
+        n_fft = self.n_fft
+        win_length = min(self.win, T)
+        hop_length = self.hop
 
         # Prefer reflect padding when valid; otherwise disable centering
         center = True
@@ -176,14 +175,13 @@ class ISTFT(nn.Module):
 
         if stft_params is not None:
             n_fft = stft_params.get("n_fft", self.n_fft)
-            win_length = stft_params.get("win_length", min(self.win, n_fft))
-            hop_length = stft_params.get("hop_length", max(1, int(round(win_length * self.base_hop_ratio))))
+            win_length = stft_params.get("win_length", self.win)
+            hop_length = stft_params.get("hop_length", self.hop)
         else:
-            # Infer n_fft from frequency bins when possible
-            inferred_n_fft = int((X.size(1) - 1) * 2)
-            n_fft = inferred_n_fft if inferred_n_fft > 0 else self.n_fft
-            win_length = min(self.win, n_fft)
-            hop_length = max(1, int(round(win_length * self.base_hop_ratio)))
+            # Prefer configured fixed params
+            n_fft = self.n_fft
+            win_length = self.win
+            hop_length = self.hop
 
         # hann_window must be real-valued; use real dtype even if X is complex
         real_dtype = X.real.dtype if torch.is_complex(X) else X.dtype

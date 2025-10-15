@@ -23,7 +23,7 @@ import os
 import math
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import argparse
 
 import torch
@@ -41,8 +41,13 @@ from torchaudio.transforms import Resample
 from tqdm import tqdm
 
 from models.inn_encoder_decoder import INNWatermarker
-from pipeline.perceptual_losses import CombinedPerceptualLoss
-from pipeline.micro_chunking import MicroChunker, DeterministicMapper, apply_psychoacoustic_gate
+from pipeline.perceptual_losses import CombinedPerceptualLoss, MFCCCosineLoss
+from pipeline.moore_galsberg import MooreGlasbergAnalyzer
+from pipeline.adaptive_bit_allocation import (
+	PerceptualSignificanceMetric,
+	AdaptiveBitAllocator,
+	expand_allocation_to_slots,
+)
 
 # Silence known TorchAudio warnings (2.9 migration and deprecations)
 warnings.filterwarnings(
@@ -77,7 +82,7 @@ except Exception:
 # Config
 # =========================
 
-TARGET_SR = 48000  # Phase-1 target sample rate per spec examples (yields ~99 windows/sec @ 20ms/10ms)
+TARGET_SR = 44100
 CHUNK_SECONDS = 1.0
 CHUNK_SAMPLES = int(TARGET_SR * CHUNK_SECONDS)
 
@@ -102,26 +107,27 @@ class TrainConfig:
 	# Will be derived from window length dynamically; these are upper bounds
 	n_fft_max: int = 1024
 
-	# Payload
+    # Payload
 	rs_payload_bytes: int = 64     # per second
-	repetition: int = 3            # r placements per symbol
+    repetition: int = 3            # r placements per symbol (redundancy)
 	use_fixed_payload: bool = True # Phase-1 may use fixed payload for simplicity
 	payload_seed: int = 12345
 	payload_variation: str = "per_epoch"  # "per_epoch", "per_batch", "per_sample"
 
-	# Mapper and gating
+    # Mapper and gating
 	mapper_seed: int = 42
-	min_time_spacing: int = 1      # min frames between placements for same symbol
-	min_freq_spacing: int = 2      # min bins between placements for same symbol
+    min_time_spacing: int = 2      # min frames between placements for same symbol
+    min_freq_spacing: int = 4      # min bins between placements for same symbol
 	psy_mask_margin: float = 1.0   # margin below threshold to consider safe
 	amp_budget_scale: float = 0.25 # fraction of masking margin per window
+    base_symbol_amp: float = 0.12  # base +/- amplitude per placement
 
 	# Sync
 	sync_strength: float = 0.05    # faint, masked sync per second
 
-	# Loss weights
+    # Loss weights
 	w_bits: float = 1.0
-	w_amp: float = 0.05
+    w_amp: float = 0.0
 	w_perc: float = 0.01            # start at 0.0 for bring-up; increase later
 	# Early-easy settings and thresholds
 	early_amp_budget_scale: float = 0.5  # use 0.4–0.6 initially
@@ -144,6 +150,10 @@ class TrainConfig:
 	# Logging
 	log_file: str = "phase1_train_log.txt"
 
+	# Dataset limits (optional)
+	max_train_files: Optional[int] = None
+	max_val_files: Optional[int] = None
+
 
 # =========================
 # Data
@@ -160,8 +170,11 @@ def _list_audio_files(root: str) -> List[str]:
 
 
 class OneSecondDataset(Dataset):
-	def __init__(self, root: str, target_sr: int = TARGET_SR):
+	def __init__(self, root: str, target_sr: int = TARGET_SR, max_files: Optional[int] = None):
 		self.files = _list_audio_files(root)
+		# Optionally limit dataset size to speed up experiments
+		if max_files is not None and max_files > 0 and len(self.files) > max_files:
+			self.files = self.files[:max_files]
 		if len(self.files) == 0:
 			raise RuntimeError(f"No audio files found in {root}")
 		self.target_sr = target_sr
@@ -455,55 +468,69 @@ def compute_losses_and_metrics(
 	x_1s = torch.nan_to_num(x_1s, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
 	# Insert sync
 	x_sync = embed_sync_marker(x_1s, cfg.sync_strength, TARGET_SR, cfg.mapper_seed)
-	# Instantiate micro-chunking and deterministic mapper (external implementations)
-	overlap_ratio = 1.0 - (float(cfg.hop_ms) / float(max(1, cfg.window_ms)))
-	micro_chunker = MicroChunker(window_ms=cfg.window_ms, overlap_ratio=overlap_ratio, sr=TARGET_SR)
-	det_mapper = DeterministicMapper(seed=cfg.mapper_seed, n_fft=1024, hop=512, sr=TARGET_SR, window_ms=cfg.window_ms)
-	# Micro-windowing via MicroChunker on a single 1s sample (keep downstream expectations)
-	windows = micro_chunker.chunk_1s_segment(x_sync[0])  # [1, T] -> list of [1, T_w]
-	n_windows = len(windows)
-	# Establish per-window STFT and masks
-	window_specs: List[torch.Tensor] = []
-	accept_masks: List[torch.Tensor] = []
-	amp_budget_by_window: Dict[int, float] = {}
-	for i, w in enumerate(windows):
-		Xw = adaptive_stft(w)  # [1,2,F,T]
-		mask = psycho_gate_accept_mask(Xw, psy_margin_local)
-		window_specs.append(Xw)
-		accept_masks.append(mask)
-		amp_budget_by_window[i] = per_window_amp_budget(Xw, mask, amp_scale_local)
 
-	# Determine bit-level training: 64 bytes -> 512 bits; train bit-wise BCE per mapped placement
-	n_symbols = cfg.rs_payload_bytes * 8  # treat each bit as a logical symbol index
+	# Build the model STFT grid (fixed n_fft/hop) and message spec on the same grid
+	X_grid = base_model.stft(x_sync)  # [1,2,F,T]
+	F_bins, T_frames = X_grid.size(-2), X_grid.size(-1)
+	M_spec = torch.zeros_like(X_grid)
+
+	# Determine bit-level training: 64 bytes -> 512 bits
+	n_symbols = cfg.rs_payload_bytes * 8
 	bits_by_symbol = []
 	for s in range(n_symbols):
 		b = int(payload_bits[s % payload_bits.numel()].item())
 		bits_by_symbol.append(b)
-	# Map per-window candidate slots using DeterministicMapper and gate by psycho mask + content-aware gate
-	bits_per_window = int(math.ceil(float(n_symbols) / float(max(1, n_windows))))
-	concatenated_slots: List[Tuple[int,int,int]] = []  # (w_idx, f, t)
-	for i in range(n_windows):
-		slots = det_mapper.map_window_to_slots(window_idx=i, n_windows=n_windows, target_bits=bits_per_window, audio_content=windows[i])
-		# Content-aware psychoacoustic gating for this window
-		psy_filtered = apply_psychoacoustic_gate(windows[i], slots, base_model, n_fft=1024, hop=512)
-		# Optional conservative intersection with boolean accept mask
-		mask = accept_masks[i]
-		filtered = [(i, f, t) for (f, t) in psy_filtered if f < mask.size(0) and t < mask.size(1) and bool(mask[f, t].item())]
-		concatenated_slots.extend(filtered)
-	# Assign slots sequentially to symbols; one placement per symbol
-	gated_placements: Dict[int, List[Tuple[int,int,int]]] = {}
-	_sym = 0
-	for (w, f, t) in concatenated_slots:
-		if _sym >= n_symbols:
-			break
-		gated_placements[_sym] = [(w, f, t)]
-		_sym += 1
-	# Diagnostics: capacity (accepted slots) fraction
-	accepted_slots = sum(len(v) for v in gated_placements.values())
-	expected_slots = n_symbols  # one slot per symbol target
-	capacity_fraction = float(accepted_slots) / float(max(1, expected_slots))
-	# Build message spec for the whole second using window budgets
-	M_spec = build_message_spec_for_second(x_sync, gated_placements, bits_by_symbol, amp_budget_by_window)
+
+	# Content-adaptive budgeting on the model grid (Moore–Glasberg + adaptive allocation)
+	mag = torch.sqrt(torch.clamp(X_grid[:,0]**2 + X_grid[:,1]**2, min=1e-12))[0]  # [F,T]
+	mag_ft = mag.detach().cpu().numpy()
+	mga = MooreGlasbergAnalyzer(sample_rate=TARGET_SR, n_fft=882, hop_length=441, n_critical_bands=24)
+	band_thr_bt = mga.band_thresholds(mag_ft)  # [BANDS,T]
+	band_idx_f = mga.band_indices  # [F]
+	# Per-band significance -> allocate total placements (~ n_symbols * r)
+	psm = PerceptualSignificanceMetric(method="inverse")
+	sig_b = psm.compute(band_thr_bt)
+	total_slots = int(n_symbols * max(1, cfg.repetition))
+	alloc = AdaptiveBitAllocator(total_bits=total_slots, allocation_strategy="optimal")
+	bits_per_band = alloc.allocate_bits(sig_b)["bit_allocation"]
+	# Expand to concrete (f,t) slots (content-adaptive, deterministic given audio)
+	slots = expand_allocation_to_slots(
+		mag_ft=mag_ft,
+		band_indices_f=band_idx_f,
+		bits_per_band=bits_per_band,
+		per_frame_weight_bt=None,
+	)
+
+	# Seeded deterministic selection of r placements per bit from the candidate slots with spacing constraints
+	rng = random.Random(cfg.mapper_seed)
+	placements: Dict[int, List[Tuple[int,int]]] = {}
+	# Simple stride over slots to ensure coverage; apply spacing constraints per bit
+	stride = max(1, len(slots) // max(1, total_slots))
+	def violates_spacing(sel: List[Tuple[int,int]], f: int, t: int) -> bool:
+		for (ff, tt) in sel:
+			if abs(ff - f) <= cfg.min_freq_spacing and abs(tt - t) <= cfg.min_time_spacing:
+				return True
+		return False
+	idx = 0
+	for sym_idx in range(n_symbols):
+		selected: List[Tuple[int,int]] = []
+		tries = 0
+		while len(selected) < max(1, cfg.repetition) and tries < len(slots) * 2:
+			(f, t) = slots[(idx + tries) % len(slots)] if len(slots) > 0 else (0, 0)
+			if len(slots) == 0:
+				break
+			if not violates_spacing(selected, f, t):
+				selected.append((f, t))
+			tries += 1
+		idx = (idx + stride) % max(1, len(slots))
+		placements[sym_idx] = selected
+
+	# Place +/- base_symbol_amp on the real channel for each selected placement
+	for sym_idx, sel in placements.items():
+		sign = 1.0 if bits_by_symbol[sym_idx] > 0 else -1.0
+		for (f, t) in sel:
+			if f < F_bins and t < T_frames:
+				M_spec[0, 0, f, t] = M_spec[0, 0, f, t] + sign * cfg.base_symbol_amp
 	# Encode with INN
 	x_wm, _ = base_model.encode(x_sync, M_spec)
 	x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
@@ -511,40 +538,29 @@ def compute_losses_and_metrics(
 	M_rec = base_model.decode(x_wm)
 	M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
 
-	# Diagnostics: average fused logit magnitude across r placements per bit on this segment
-	# (computationally light; used for debugging/telemetry only)
-	try:
-		fused_logits = []
-		for sym_idx, places in gated_placements.items():
-			acc = 0.0
-			cnt = 0
-			for (w, f, t) in places:
-				if f < M_rec.size(-2) and t < M_rec.size(-1):
-					acc += float(M_rec[0, 0, f, t].item())
-					cnt += 1
-			if cnt > 0:
-				fused_logits.append(abs(acc / cnt))
-		avg_fused_logit_mag = float(sum(fused_logits) / max(1, len(fused_logits))) if fused_logits else 0.0
-	except Exception:
-		avg_fused_logit_mag = 0.0
-	# Extract predictions at placement slots and compute bit-wise BCE (masked)
-	all_logits: List[torch.Tensor] = []
-	all_targets: List[torch.Tensor] = []
-	for sym_idx, places in gated_placements.items():
-		for (w, f, t) in places:
+	# Fuse r placements per bit into a single logit, then compute BCE
+	fused_logits_list: List[float] = []
+	targets_list: List[float] = []
+	for sym_idx, sel in placements.items():
+		if not sel:
+			continue
+		acc = 0.0
+		cnt = 0
+		for (f, t) in sel:
 			if f < M_rec.size(-2) and t < M_rec.size(-1):
-				val = M_rec[0, 0, f, t]
-				all_logits.append(val.unsqueeze(0))
-				target = torch.tensor(1.0 if bits_by_symbol[sym_idx] > 0 else 0.0, device=val.device)
-				all_targets.append(target.unsqueeze(0))
-	if len(all_logits) == 0:
+				acc += float(M_rec[0, 0, f, t].item())
+				cnt += 1
+		if cnt > 0:
+			fused = acc / cnt
+			fused_logits_list.append(fused)
+			targets_list.append(1.0 if bits_by_symbol[sym_idx] > 0 else 0.0)
+
+	if len(fused_logits_list) == 0:
 		bit_loss = torch.tensor(0.0, device=x_1s.device)
 		ber = 1.0
 	else:
-		logits = torch.cat(all_logits, dim=0)
-		targets = torch.cat(all_targets, dim=0)
-		# Clamp/sanitize logits to avoid NaN/Inf in BCE
-		logits = torch.nan_to_num(logits, nan=0.0, posinf=6.0, neginf=-6.0).clamp(-6.0, 6.0)
+		logits = torch.tensor(fused_logits_list, device=x_1s.device, dtype=torch.float32).clamp(-6.0, 6.0)
+		targets = torch.tensor(targets_list, device=x_1s.device, dtype=torch.float32)
 		bit_loss = F.binary_cross_entropy_with_logits(logits, targets)
 		pred_bits = (logits > 0).float()
 		ber = float((pred_bits != targets).float().mean().item())
@@ -576,7 +592,7 @@ def compute_losses_and_metrics(
 	else:
 		x_wm_fp = x_wm
 	with torch.amp.autocast(device_type="cuda", enabled=False):
-		perc = CombinedPerceptualLoss()(x_sync_fp, x_wm_fp)
+		perc = CombinedPerceptualLoss(mfcc=MFCCCosineLoss(sample_rate=TARGET_SR))(x_sync_fp, x_wm_fp)
 		perc_total = perc["total_perceptual_loss"]
 	# Total loss
 	total = cfg.w_bits * bit_loss + cfg.w_amp * amp_penalty + cfg.w_perc * perc_total
@@ -595,8 +611,8 @@ def compute_losses_and_metrics(
 # =========================
 
 def _build_model(cfg: TrainConfig) -> INNWatermarker:
-	# Use INN with default block count; its internal STFT is adaptive-aware
-	return INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": 1024, "hop_length": 512, "win_length": 1024})
+	# Fixed STFT grid at 44.1 kHz: n_fft=882, hop=441, win=882
+	return INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": 882, "hop_length": 441, "win_length": 882})
 
 
 def _make_payload_bits_tensor(cfg: TrainConfig, device, epoch: int = 0, batch_idx: int = 0) -> torch.Tensor:
@@ -745,8 +761,8 @@ def main(cfg: TrainConfig) -> None:
 		else:
 			cfg.device = "cpu"
 	# Dataset & loaders
-	train_ds = OneSecondDataset(cfg.data_dir, TARGET_SR)
-	val_ds = OneSecondDataset(cfg.val_dir, TARGET_SR)
+	train_ds = OneSecondDataset(cfg.data_dir, TARGET_SR, max_files=getattr(cfg, "max_train_files", None))
+	val_ds = OneSecondDataset(cfg.val_dir, TARGET_SR, max_files=getattr(cfg, "max_val_files", None))
 	train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True) if is_distributed else None
 	val_sampler = DistributedSampler(val_ds, shuffle=False, drop_last=False) if is_distributed else None
 	pin = (cfg.device.startswith("cuda"))
@@ -884,6 +900,8 @@ if __name__ == "__main__":
 	parser.add_argument("--epochs", type=int, default=None)
 	parser.add_argument("--batch_size", type=int, default=None, help="Per-process batch size")
 	parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint (.pt) to resume from")
+	parser.add_argument("--max_train_files", type=int, default=None, help="Limit number of training files")
+	parser.add_argument("--max_val_files", type=int, default=None, help="Limit number of validation files")
 	args, _ = parser.parse_known_args()
 
 	_defaults = TrainConfig()
@@ -893,6 +911,8 @@ if __name__ == "__main__":
 		save_dir=(args.save_dir or os.environ.get("SAVE_DIR", _defaults.save_dir)),
 		epochs=(args.epochs if args.epochs is not None else int(os.environ.get("EPOCHS", _defaults.epochs))),
 		batch_size=(args.batch_size if args.batch_size is not None else int(os.environ.get("PER_DEVICE_BATCH", _defaults.batch_size))),
+		max_train_files=(args.max_train_files if args.max_train_files is not None else (int(os.environ.get("MAX_TRAIN_FILES")) if os.environ.get("MAX_TRAIN_FILES") else _defaults.max_train_files)),
+		max_val_files=(args.max_val_files if args.max_val_files is not None else (int(os.environ.get("MAX_VAL_FILES")) if os.environ.get("MAX_VAL_FILES") else _defaults.max_val_files)),
 	)
 	# Attach resume path if provided
 	if args.resume:
