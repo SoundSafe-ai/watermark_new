@@ -36,6 +36,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.multiprocessing as mp
 
 import warnings
+# Prefer legacy backends to avoid TorchCodec dependency unless explicitly installed
+os.environ.setdefault("TORCHAUDIO_USE_BACKEND_DISPATCHER", "0")
 import torchaudio
 from torchaudio.transforms import Resample
 from tqdm import tqdm
@@ -48,6 +50,12 @@ from pipeline.adaptive_bit_allocation import (
 	AdaptiveBitAllocator,
 	expand_allocation_to_slots,
 )
+
+# Select a backend that does not require TorchCodec
+try:
+	torchaudio.set_audio_backend("sox_io")
+except Exception:
+	pass
 
 # Silence known TorchAudio warnings (2.9 migration and deprecations)
 warnings.filterwarnings(
@@ -97,7 +105,7 @@ class TrainConfig:
 	device: str = "cuda" if torch.cuda.is_available() else "cpu"
 	mixed_precision: bool = True
 	log_interval: int = 25
-	save_dir: str = "Watermark_new_pipeline_test"
+	save_dir: str = "new_pipeline_test"
 
 	# Micro-windowing
 	window_ms: int = 20           # 10–20 ms (use 20 ms default)
@@ -107,27 +115,27 @@ class TrainConfig:
 	# Will be derived from window length dynamically; these are upper bounds
 	n_fft_max: int = 1024
 
-    # Payload
+	# Payload
 	rs_payload_bytes: int = 64     # per second
-    repetition: int = 3            # r placements per symbol (redundancy)
+	repetition: int = 3            # r placements per symbol (redundancy)
 	use_fixed_payload: bool = True # Phase-1 may use fixed payload for simplicity
-	payload_seed: int = 12345
+	payload_seed: int = 420
 	payload_variation: str = "per_epoch"  # "per_epoch", "per_batch", "per_sample"
 
-    # Mapper and gating
+	# Mapper and gating
 	mapper_seed: int = 42
-    min_time_spacing: int = 2      # min frames between placements for same symbol
-    min_freq_spacing: int = 4      # min bins between placements for same symbol
+	min_time_spacing: int = 2      # min frames between placements for same symbol
+	min_freq_spacing: int = 4      # min bins between placements for same symbol
 	psy_mask_margin: float = 1.0   # margin below threshold to consider safe
 	amp_budget_scale: float = 0.25 # fraction of masking margin per window
-    base_symbol_amp: float = 0.12  # base +/- amplitude per placement
+	base_symbol_amp: float = 0.12  # base +/- amplitude per placement
 
 	# Sync
 	sync_strength: float = 0.05    # faint, masked sync per second
 
-    # Loss weights
+	# Loss weights
 	w_bits: float = 1.0
-    w_amp: float = 0.0
+	w_amp: float = 0.0
 	w_perc: float = 0.01            # start at 0.0 for bring-up; increase later
 	# Early-easy settings and thresholds
 	early_amp_budget_scale: float = 0.5  # use 0.4–0.6 initially
@@ -183,13 +191,28 @@ class OneSecondDataset(Dataset):
 		return len(self.files)
 
 	def _load_audio(self, path: str) -> torch.Tensor:
-		wav, sr = torchaudio.load(path)  # [C, T]
+		try:
+			wav, sr = torchaudio.load(path)  # [C, T]
+		except ImportError:
+			# Try forcing sox_io backend if available
+			try:
+				torchaudio.set_audio_backend("sox_io")
+				wav, sr = torchaudio.load(path)
+			except Exception as backend_err:
+				# Optional fallback via soundfile if installed
+				try:
+					import soundfile as sf
+					data, sr = sf.read(path, dtype="float32", always_2d=True)
+					wav = torch.from_numpy(data.T)
+				except Exception as sf_err:
+					raise ImportError(
+						"Audio loading requires either torchcodec installed, a working sox_io backend, or soundfile."
+					) from sf_err
 		if wav.size(0) > 1:
 			wav = wav.mean(dim=0, keepdim=True)
 		if sr != self.target_sr:
 			wav = Resample(orig_freq=sr, new_freq=self.target_sr)(wav)
-		# normalize
-		wav = wav / (wav.abs().max() + 1e-9)
+		# Do not normalize: preserve original mastering loudness and dynamics
 		return wav  # [1, T]
 
 	def _random_1s_chunk(self, wav: torch.Tensor) -> torch.Tensor:
@@ -564,23 +587,26 @@ def compute_losses_and_metrics(
 		bit_loss = F.binary_cross_entropy_with_logits(logits, targets)
 		pred_bits = (logits > 0).float()
 		ber = float((pred_bits != targets).float().mean().item())
-	# Amplitude budget penalty: sum of placed amplitudes relative to budget
-	amp_penalty_terms: List[torch.Tensor] = []
-	for w_idx, budget in amp_budget_by_window.items():
-		if budget <= 0.0:
-			continue
-		# Estimate used amplitude as average absolute target placed in that window
-		used_vals: List[torch.Tensor] = []
-		for sym_idx, places in gated_placements.items():
-			for (w, f, t) in places:
-				if w == w_idx and f < M_spec.size(-2) and t < M_spec.size(-1):
-					used_vals.append(M_spec[0, 0, f, t].abs())
-		if used_vals:
-			used = torch.stack(used_vals).mean()
-			budget_t = torch.tensor(budget, device=x_1s.device, dtype=used.dtype)
-			excess = (used - budget_t).clamp(min=0.0)
-			amp_penalty_terms.append(excess)
-	amp_penalty = torch.stack(amp_penalty_terms).mean() if amp_penalty_terms else torch.tensor(0.0, device=x_1s.device)
+	# Amplitude budget penalty: compute only if enabled to avoid undefined deps
+	if getattr(cfg, "w_amp", 0.0) > 0.0:
+		amp_penalty_terms: List[torch.Tensor] = []
+		for w_idx, budget in amp_budget_by_window.items():
+			if budget <= 0.0:
+				continue
+			# Estimate used amplitude as average absolute target placed in that window
+			used_vals: List[torch.Tensor] = []
+			for sym_idx, places in gated_placements.items():
+				for (w, f, t) in places:
+					if w == w_idx and f < M_spec.size(-2) and t < M_spec.size(-1):
+						used_vals.append(M_spec[0, 0, f, t].abs())
+			if used_vals:
+				used = torch.stack(used_vals).mean()
+				budget_t = torch.tensor(budget, device=x_1s.device, dtype=used.dtype)
+				excess = (used - budget_t).clamp(min=0.0)
+				amp_penalty_terms.append(excess)
+		amp_penalty = torch.stack(amp_penalty_terms).mean() if amp_penalty_terms else torch.tensor(0.0, device=x_1s.device)
+	else:
+		amp_penalty = torch.tensor(0.0, device=x_1s.device)
 	# Perceptual loss (optional; start at 0 in bring-up)
 	# Compute perceptual loss in full precision to reduce fp16/bf16 NaNs
 	if x_sync.dtype != torch.float32:
