@@ -1,0 +1,98 @@
+Epoch 1/20
+train: loss=0.5832 ber=0.3290 perc=-0.3232 byte_acc=0.016 payload_ok=0.000
+val  : loss=0.4886 ber=0.2391 perc=-0.1997 byte_acc=0.072 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 2/20
+train: loss=0.4800 ber=0.2309 perc=-0.2549 byte_acc=0.028 payload_ok=0.000
+val  : loss=0.4689 ber=0.2290 perc=-0.2934 byte_acc=0.085 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 3/20
+train: loss=0.4683 ber=0.2247 perc=-0.2849 byte_acc=0.031 payload_ok=0.000
+val  : loss=0.4595 ber=0.2240 perc=-0.3014 byte_acc=0.092 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 4/20
+train: loss=0.4632 ber=0.2204 perc=-0.3015 byte_acc=0.025 payload_ok=0.000
+val  : loss=0.4575 ber=0.2211 perc=-0.3086 byte_acc=0.096 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 5/20
+train: loss=0.4390 ber=0.2048 perc=-0.2858 byte_acc=0.041 payload_ok=0.000
+val  : loss=0.4553 ber=0.2144 perc=-0.2920 byte_acc=0.117 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 6/20
+train: loss=0.4406 ber=0.2082 perc=-0.2961 byte_acc=0.046 payload_ok=0.000
+val  : loss=0.4488 ber=0.2112 perc=-0.3131 byte_acc=0.125 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 7/20
+train: loss=0.4431 ber=0.2045 perc=-0.3080 byte_acc=0.048 payload_ok=0.000
+val  : loss=0.4472 ber=0.2085 perc=-0.3209 byte_acc=0.129 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 8/20
+train: loss=0.4315 ber=0.2000 perc=-0.3262 byte_acc=0.060 payload_ok=0.000
+val  : loss=0.4426 ber=0.2066 perc=-0.3419 byte_acc=0.136 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 9/20
+train: loss=0.4298 ber=0.2014 perc=-0.3417 byte_acc=0.043 payload_ok=0.000
+val  : loss=0.4432 ber=0.2065 perc=-0.3507 byte_acc=0.136 payload_ok=0.000
+LR bump applied due to plateau (new lr ~ 1.28e-04)
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 10/20
+train: loss=0.4363 ber=0.1998 perc=-0.3568 byte_acc=0.041 payload_ok=0.000
+val  : loss=0.4400 ber=0.2056 perc=-0.3519 byte_acc=0.138 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 11/20
+train: loss=0.4221 ber=0.1932 perc=-0.3687 byte_acc=0.051 payload_ok=0.000
+val  : loss=0.4389 ber=0.2046 perc=-0.3751 byte_acc=0.141 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 12/20
+train: loss=0.4303 ber=0.1987 perc=-0.3834 byte_acc=0.055 payload_ok=0.000
+val  : loss=0.4389 ber=0.2037 perc=-0.3862 byte_acc=0.144 payload_ok=0.000
+LR bump applied due to plateau (new lr ~ 9.90e-05)
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 13/20
+train: loss=0.4267 ber=0.1947 perc=-0.3946 byte_acc=0.049 payload_ok=0.000
+val  : loss=0.4431 ber=0.2062 perc=-0.4010 byte_acc=0.137 payload_ok=0.000
+
+Epoch 14/20
+train: loss=0.4181 ber=0.1895 perc=-0.4075 byte_acc=0.058 payload_ok=0.000
+val  : loss=0.4334 ber=0.2024 perc=-0.4139 byte_acc=0.144 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 15/20
+train: loss=0.4131 ber=0.1877 perc=-0.4238 byte_acc=0.056 payload_ok=0.000
+val  : loss=0.4342 ber=0.2018 perc=-0.4208 byte_acc=0.148 payload_ok=0.000
+LR bump applied due to plateau (new lr ~ 6.91e-05)
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 16/20
+train: loss=0.4174 ber=0.1880 perc=-0.4311 byte_acc=0.043 payload_ok=0.000
+val  : loss=0.4368 ber=0.2045 perc=-0.4234 byte_acc=0.140 payload_ok=0.000
+
+Epoch 17/20
+train: loss=0.4199 ber=0.1912 perc=-0.4411 byte_acc=0.045 payload_ok=0.000
+val  : loss=0.4335 ber=0.2034 perc=-0.4401 byte_acc=0.144 payload_ok=0.000
+
+Epoch 18/20
+train: loss=0.4174 ber=0.1922 perc=-0.4509 byte_acc=0.053 payload_ok=0.000
+val  : loss=0.4313 ber=0.2008 perc=-0.4456 byte_acc=0.150 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
+
+Epoch 19/20
+train: loss=0.4121 ber=0.1877 perc=-0.4551 byte_acc=0.051 payload_ok=0.000
+val  : loss=0.4295 ber=0.2018 perc=-0.4585 byte_acc=0.146 payload_ok=0.000
+
+Epoch 20/20
+train: loss=0.4225 ber=0.1957 perc=-0.4628 byte_acc=0.051 payload_ok=0.000
+val  : loss=0.4264 ber=0.2007 perc=-0.4625 byte_acc=0.147 payload_ok=0.000
+Saved best checkpoint to new_pipeline_test/phase1_best.pt
