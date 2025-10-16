@@ -424,26 +424,44 @@ def _generate_structured_payload(rng: random.Random) -> bytes:
 	return payload_str.encode('utf-8')
 
 
-def build_payload_bits(cfg: TrainConfig) -> torch.Tensor:
-	"""Build payload bits with structured content to prevent overfitting."""
+def _bytes_to_bits_lsb_first(data: bytes) -> List[int]:
+	bits: List[int] = []
+	for b in data:
+		for k in range(8):
+			bits.append((b >> k) & 1)
+	return bits
+
+
+def _bits_to_bytes_lsb_first(bits: List[int]) -> bytes:
+	if len(bits) % 8 != 0:
+		bits = bits[: (len(bits) // 8) * 8]
+	out = bytearray()
+	for i in range(0, len(bits), 8):
+		byte = 0
+		for k in range(8):
+			if bits[i + k]:
+				byte |= (1 << k)
+		out.append(byte)
+	return bytes(out)
+
+
+def build_payload_bits_and_bytes(cfg: TrainConfig) -> Tuple[torch.Tensor, bytes, bytes]:
+	"""Return (bits_tensor, gt_payload_bytes, coded_bytes).
+	- bits_tensor: full coded bitstream (LSB-first) as torch.LongTensor
+	- gt_payload_bytes: original (pre-RS) 64 bytes
+	- coded_bytes: RS/interleaved bytes actually embedded
+	"""
 	rng = random.Random(cfg.payload_seed)
-	
 	if cfg.use_fixed_payload:
-		# Use structured payload instead of sequential bytes
 		payload = _generate_structured_payload(rng)
 	else:
 		payload = _rand_payload_bytes(cfg.rs_payload_bytes, rng)
-	
 	if _HAS_RS:
-		enc = rs_encode_167_125(payload)
-		enc = interleave_bytes(enc, 1)  # simple interleave depth=1 for Phase-1
+		coded = interleave_bytes(rs_encode_167_125(payload), 1)
 	else:
-		enc = payload
-	bits: List[int] = []
-	for b in enc:
-		for k in range(8):
-			bits.append((b >> k) & 1)
-	return torch.tensor(bits, dtype=torch.long)
+		coded = payload
+	bits = _bytes_to_bits_lsb_first(coded)
+	return torch.tensor(bits, dtype=torch.long), payload, coded
 
 
 # =========================
@@ -497,12 +515,10 @@ def compute_losses_and_metrics(
 	F_bins, T_frames = X_grid.size(-2), X_grid.size(-1)
 	M_spec = torch.zeros_like(X_grid)
 
-	# Determine bit-level training: 64 bytes -> 512 bits
-	n_symbols = cfg.rs_payload_bytes * 8
-	bits_by_symbol = []
-	for s in range(n_symbols):
-		b = int(payload_bits[s % payload_bits.numel()].item())
-		bits_by_symbol.append(b)
+	# Determine bit-level training from coded bitstream length
+	# Align symbol count to available coded bits
+	n_symbols = int(min(cfg.rs_payload_bytes * 8, int(payload_bits.numel())))
+	bits_by_symbol = [int(payload_bits[s].item()) for s in range(n_symbols)]
 
 	# Content-adaptive budgeting on the model grid (Moore–Glasberg + adaptive allocation)
 	mag = torch.sqrt(torch.clamp(X_grid[:,0]**2 + X_grid[:,1]**2, min=1e-12))[0]  # [F,T]
@@ -561,32 +577,30 @@ def compute_losses_and_metrics(
 	M_rec = base_model.decode(x_wm)
 	M_rec = torch.nan_to_num(M_rec, nan=0.0, posinf=1.0, neginf=-1.0)
 
-	# Fuse r placements per bit into a single logit, then compute BCE
-	fused_logits_list: List[float] = []
-	targets_list: List[float] = []
+	# Fuse r placements per bit into a single logit, then compute BCE (keep gradients)
+	fused_logits_tensors: List[torch.Tensor] = []
+	targets_tensors: List[torch.Tensor] = []
 	for sym_idx, sel in placements.items():
 		if not sel:
 			continue
-		acc = 0.0
-		cnt = 0
+		vals: List[torch.Tensor] = []
 		for (f, t) in sel:
 			if f < M_rec.size(-2) and t < M_rec.size(-1):
-				acc += float(M_rec[0, 0, f, t].item())
-				cnt += 1
-		if cnt > 0:
-			fused = acc / cnt
-			fused_logits_list.append(fused)
-			targets_list.append(1.0 if bits_by_symbol[sym_idx] > 0 else 0.0)
+				vals.append(M_rec[0, 0, f, t])
+		if len(vals) > 0:
+			fused = torch.stack(vals).mean()
+			fused_logits_tensors.append(fused)
+			targets_tensors.append(torch.tensor(1.0 if bits_by_symbol[sym_idx] > 0 else 0.0, device=x_1s.device, dtype=torch.float32))
 
-	if len(fused_logits_list) == 0:
+	if len(fused_logits_tensors) == 0:
 		bit_loss = torch.tensor(0.0, device=x_1s.device)
-		ber = 1.0
+		ber_tensor = torch.tensor(1.0, device=x_1s.device)
 	else:
-		logits = torch.tensor(fused_logits_list, device=x_1s.device, dtype=torch.float32).clamp(-6.0, 6.0)
-		targets = torch.tensor(targets_list, device=x_1s.device, dtype=torch.float32)
+		logits = torch.stack(fused_logits_tensors).to(dtype=torch.float32).clamp(-6.0, 6.0)
+		targets = torch.stack(targets_tensors).to(dtype=torch.float32)
 		bit_loss = F.binary_cross_entropy_with_logits(logits, targets)
 		pred_bits = (logits > 0).float()
-		ber = float((pred_bits != targets).float().mean().item())
+		ber_tensor = (pred_bits != targets).float().mean()
 	# Amplitude budget penalty: compute only if enabled to avoid undefined deps
 	if getattr(cfg, "w_amp", 0.0) > 0.0:
 		amp_penalty_terms: List[torch.Tensor] = []
@@ -620,14 +634,41 @@ def compute_losses_and_metrics(
 	with torch.amp.autocast(device_type="cuda", enabled=False):
 		perc = CombinedPerceptualLoss(mfcc=MFCCCosineLoss(sample_rate=TARGET_SR))(x_sync_fp, x_wm_fp)
 		perc_total = perc["total_perceptual_loss"]
+	# Byte-level and payload-level decode metrics (non-differentiable)
+	with torch.no_grad():
+		pred_bits_full: List[int] = [int((logit > 0).item()) for logit in logits] if len(fused_logits_tensors) > 0 else []
+		pred_bytes = _bits_to_bytes_lsb_first(pred_bits_full)
+		# Attempt RS decode if available
+		payload_success = 0.0
+		byte_acc = 0.0
+		if len(pred_bytes) > 0:
+			try:
+				decoded_bytes = pred_bytes
+				if _HAS_RS:
+					decoded_bytes = rs_decode_167_125(deinterleave_bytes(pred_bytes, 1))
+				# Re-build target bytes to compare against (use current seed/strategy)
+				# Note: we only need GT for metrics; this call mirrors bits creation
+				_, gt_payload, coded = build_payload_bits_and_bytes(cfg)
+				# Byte-level accuracy vs coded stream length
+				L = min(len(pred_bytes), len(coded))
+				if L > 0:
+					byte_acc = float(sum(1 for i in range(L) if pred_bytes[i] == coded[i]) / L)
+				# End-to-end success if decoded RS payload equals GT payload
+				if len(decoded_bytes) == len(gt_payload) and decoded_bytes == gt_payload:
+					payload_success = 1.0
+			except Exception:
+				payload_success = 0.0
+				byte_acc = 0.0
 	# Total loss
 	total = cfg.w_bits * bit_loss + cfg.w_amp * amp_penalty + cfg.w_perc * perc_total
 	return {
 		"loss": total,
-		"bit_loss": bit_loss.detach().item() if torch.is_tensor(bit_loss) else float(bit_loss),
-		"amp_penalty": float(amp_penalty.detach().item()),
-		"perc": float(perc_total.detach().item()),
-		"ber": float(ber),
+		"bit_loss": bit_loss,
+		"amp_penalty": amp_penalty,
+		"perc": perc_total,
+		"ber": ber_tensor,
+		"byte_acc": torch.tensor(byte_acc, device=x_1s.device, dtype=torch.float32),
+		"payload_ok": torch.tensor(payload_success, device=x_1s.device, dtype=torch.float32),
 		"x_wm": x_wm.detach(),
 	}
 
@@ -642,7 +683,7 @@ def _build_model(cfg: TrainConfig) -> INNWatermarker:
 
 
 def _make_payload_bits_tensor(cfg: TrainConfig, device, epoch: int = 0, batch_idx: int = 0) -> torch.Tensor:
-	"""Create payload bits with configurable variation strategy."""
+	"""Create payload bits with configurable variation strategy (bits only)."""
 	if cfg.payload_variation == "per_sample":
 		# Most aggressive: different payload for each sample
 		seed = cfg.payload_seed + epoch * 10000 + batch_idx * 100 + random.randint(0, 99)
@@ -663,14 +704,34 @@ def _make_payload_bits_tensor(cfg: TrainConfig, device, epoch: int = 0, batch_id
 			setattr(temp_cfg, attr, getattr(cfg, attr))
 	temp_cfg.payload_seed = seed
 	
-	bits = build_payload_bits(temp_cfg)
+	bits, _, _ = build_payload_bits_and_bytes(temp_cfg)
 	return bits.to(device)
+
+
+def _make_payload_bits_and_bytes(cfg: TrainConfig, device, epoch: int = 0, batch_idx: int = 0) -> Tuple[torch.Tensor, bytes, bytes]:
+	"""Create bits plus GT/original bytes and coded bytes, matching training variation."""
+	if cfg.payload_variation == "per_sample":
+		seed = cfg.payload_seed + epoch * 10000 + batch_idx * 100 + random.randint(0, 99)
+	elif cfg.payload_variation == "per_batch":
+		seed = cfg.payload_seed + epoch * 1000 + batch_idx
+	elif cfg.payload_variation == "per_epoch":
+		seed = cfg.payload_seed + epoch
+	else:
+		seed = cfg.payload_seed
+	# Clone cfg with modified seed
+	temp_cfg = TrainConfig()
+	for attr in dir(cfg):
+		if not attr.startswith('_'):
+			setattr(temp_cfg, attr, getattr(cfg, attr))
+	temp_cfg.payload_seed = seed
+	bits, gt_payload, coded = build_payload_bits_and_bytes(temp_cfg)
+	return bits.to(device), gt_payload, coded
 
 
 def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader) -> Dict:
 	model.eval()
 	base_model = getattr(model, "module", model)
-	metrics = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
+	metrics = {"loss": 0.0, "ber": 0.0, "perc": 0.0, "byte_acc": 0.0, "payload_ok": 0.0}
 	local_samples = 0
 	with torch.no_grad():
 		for batch_idx, batch in enumerate(loader):
@@ -678,17 +739,19 @@ def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader) -> Dic
 			bits = _make_payload_bits_tensor(cfg, x.device, epoch=0, batch_idx=batch_idx)
 			out = compute_losses_and_metrics(base_model, x, cfg, bits, epoch=0)
 			metrics["loss"] += float(out["loss"].detach().item()) * x.size(0)
-			metrics["ber"] += out["ber"] * x.size(0)
-			metrics["perc"] += out["perc"] * x.size(0)
+			metrics["ber"] += float(out["ber"].detach().item()) * x.size(0)
+			metrics["perc"] += float(out["perc"].detach().item()) * x.size(0)
+			metrics["byte_acc"] += float(out.get("byte_acc", torch.tensor(0.0)).detach().item()) * x.size(0)
+			metrics["payload_ok"] += float(out.get("payload_ok", torch.tensor(0.0)).detach().item()) * x.size(0)
 			local_samples += int(x.size(0))
 	# All-reduce across ranks for true global averages
 	if dist.is_available() and dist.is_initialized():
-		vals = torch.tensor([metrics["loss"], metrics["ber"], metrics["perc"]], device=cfg.device, dtype=torch.float64)
+		vals = torch.tensor([metrics["loss"], metrics["ber"], metrics["perc"], metrics["byte_acc"], metrics["payload_ok"]], device=cfg.device, dtype=torch.float64)
 		cnt = torch.tensor([float(local_samples)], device=cfg.device, dtype=torch.float64)
 		dist.all_reduce(vals, op=dist.ReduceOp.SUM)
 		dist.all_reduce(cnt, op=dist.ReduceOp.SUM)
 		global_samples = max(1.0, cnt.item())
-		metrics["loss"], metrics["ber"], metrics["perc"] = [float(v/global_samples) for v in vals.tolist()]
+		metrics["loss"], metrics["ber"], metrics["perc"], metrics["byte_acc"], metrics["payload_ok"] = [float(v/global_samples) for v in vals.tolist()]
 	else:
 		global_samples = max(1, local_samples)
 		for k in metrics:
@@ -699,12 +762,18 @@ def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader) -> Dic
 def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.optim.Optimizer, loader: DataLoader, scaler, epoch: int) -> Dict:
 	model.train()
 	base_model = getattr(model, "module", model)
-	running = {"loss": 0.0, "ber": 0.0, "perc": 0.0}
+	running = {"loss": 0.0, "ber": 0.0, "perc": 0.0, "byte_acc": 0.0, "payload_ok": 0.0}
 	local_samples = 0
 
-	# Per-step LR scheduler with warmup then cosine decay
-	total_steps = len(loader)
-	global_step = 0
+	# Per-step LR scheduler with warmup then cosine decay over the whole run
+	steps_per_epoch = len(loader)
+	if not hasattr(cfg, "_global_step"):
+		cfg._global_step = 0
+	if not hasattr(cfg, "_total_steps_planned"):
+		try:
+			cfg._total_steps_planned = int(cfg.epochs) * int(steps_per_epoch)
+		except Exception:
+			cfg._total_steps_planned = steps_per_epoch
 	pbar = tqdm(enumerate(loader), total=len(loader), desc="train", leave=False)
 	for step, batch in pbar:
 		x = batch.to(cfg.device, non_blocking=True)
@@ -712,12 +781,13 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
 		optimizer.zero_grad(set_to_none=True)
 		# LR warmup and cosine
 		if hasattr(cfg, "warmup_steps"):
-			if global_step < cfg.warmup_steps:
+			if cfg._global_step < cfg.warmup_steps:
 				# linear warmup to peak_lr
-				lr_now = float(cfg.lr) + (float(cfg.peak_lr) - float(cfg.lr)) * (global_step / max(1, cfg.warmup_steps))
+				lr_now = float(cfg.lr) + (float(cfg.peak_lr) - float(cfg.lr)) * (cfg._global_step / max(1, cfg.warmup_steps))
 			else:
-				# cosine decay to min_lr over the rest of the epoch schedule
-				progress = min(1.0, (global_step - cfg.warmup_steps) / max(1, (total_steps - cfg.warmup_steps)))
+				# cosine decay to min_lr over the rest of the total training schedule
+				denom = max(1, int(cfg._total_steps_planned) - int(cfg.warmup_steps))
+				progress = min(1.0, max(0.0, (cfg._global_step - int(cfg.warmup_steps)) / denom))
 				cos = 0.5 * (1.0 + math.cos(math.pi * progress))
 				lr_now = float(cfg.min_lr) + (float(cfg.peak_lr) - float(cfg.min_lr)) * cos
 			for pg in optimizer.param_groups:
@@ -741,24 +811,28 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
 			torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 			optimizer.step()
 		running["loss"] += float(loss.detach().item()) * x.size(0)
-		running["ber"] += out["ber"] * x.size(0)
-		running["perc"] += out["perc"] * x.size(0)
+		running["ber"] += float(out["ber"].detach().item()) * x.size(0)
+		running["perc"] += float(out["perc"].detach().item()) * x.size(0)
+		running["byte_acc"] += float(out.get("byte_acc", torch.tensor(0.0)).detach().item()) * x.size(0)
+		running["payload_ok"] += float(out.get("payload_ok", torch.tensor(0.0)).detach().item()) * x.size(0)
 		local_samples += int(x.size(0))
 		if (step + 1) % cfg.log_interval == 0:
 			pbar.set_postfix({
 				"loss": f"{running['loss'] / ((step+1)*loader.batch_size):.4f}",
 				"ber": f"{running['ber'] / ((step+1)*loader.batch_size):.4f}",
 				"perc": f"{running['perc'] / ((step+1)*loader.batch_size):.4f}",
+				"byte_acc": f"{running['byte_acc'] / ((step+1)*loader.batch_size):.3f}",
+				"payload_ok": f"{running['payload_ok'] / ((step+1)*loader.batch_size):.3f}",
 			})
-		global_step += 1
+		cfg._global_step += 1
 	# All-reduce across ranks for true global averages
 	if dist.is_available() and dist.is_initialized():
-		vals = torch.tensor([running["loss"], running["ber"], running["perc"]], device=cfg.device, dtype=torch.float64)
+		vals = torch.tensor([running["loss"], running["ber"], running["perc"], running["byte_acc"], running["payload_ok"]], device=cfg.device, dtype=torch.float64)
 		cnt = torch.tensor([float(local_samples)], device=cfg.device, dtype=torch.float64)
 		dist.all_reduce(vals, op=dist.ReduceOp.SUM)
 		dist.all_reduce(cnt, op=dist.ReduceOp.SUM)
 		global_samples = max(1.0, cnt.item())
-		running["loss"], running["ber"], running["perc"] = [float(v/global_samples) for v in vals.tolist()]
+		running["loss"], running["ber"], running["perc"], running["byte_acc"], running["payload_ok"] = [float(v/global_samples) for v in vals.tolist()]
 	else:
 		global_samples = max(1, local_samples)
 		for k in running:
@@ -881,10 +955,10 @@ def main(cfg: TrainConfig) -> None:
 			log(f"\nEpoch {epoch}/{cfg.epochs}")
 		train_metrics = train_one_epoch(model, cfg, optimizer, train_loader, scaler, epoch)
 		if (not is_distributed) or rank == 0:
-			log(f"train: loss={train_metrics['loss']:.4f} ber={train_metrics['ber']:.4f} perc={train_metrics['perc']:.4f}")
+			log(f"train: loss={train_metrics['loss']:.4f} ber={train_metrics['ber']:.4f} perc={train_metrics['perc']:.4f} byte_acc={train_metrics.get('byte_acc',0.0):.3f} payload_ok={train_metrics.get('payload_ok',0.0):.3f}")
 		val_metrics = validate(model, cfg, val_loader)
 		if (not is_distributed) or rank == 0:
-			log(f"val  : loss={val_metrics['loss']:.4f} ber={val_metrics['ber']:.4f} perc={val_metrics['perc']:.4f}")
+			log(f"val  : loss={val_metrics['loss']:.4f} ber={val_metrics['ber']:.4f} perc={val_metrics['perc']:.4f} byte_acc={val_metrics.get('byte_acc',0.0):.3f} payload_ok={val_metrics.get('payload_ok',0.0):.3f}")
 			# LR bump on plateau: if no improvement > epsilon over patience, bump LR briefly
 			if "_last_val_loss" not in locals():
 				_last_val_loss = val_metrics["loss"]
