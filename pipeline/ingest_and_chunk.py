@@ -303,6 +303,8 @@ class EULDriver:
             use_anchor_seeding=self.use_anchor_seeding
         )
         S = min(len(slots), bits_t.shape[1])
+        # Persist slots used for this encode for downstream supervised losses/metrics
+        self._last_slots = slots[:S]
 
         # Build message spectrogram
         F_, T_ = X.shape[-2], X.shape[-1]

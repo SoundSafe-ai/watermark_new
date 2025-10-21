@@ -407,6 +407,9 @@ def compute_losses_and_metrics(
     )
 
     payload_bytes = _bits_to_bytes_lsb_first(payload_bits.tolist())
+    # Build coded/interleaved reference for metrics (trainer-side copy matches driver scheme RS(106,64)+interleave)
+    from pipeline.ingest_and_chunk import rs_encode_106_64, interleave_bytes, deinterleave_bytes, rs_decode_106_64
+    coded_ref = interleave_bytes(rs_encode_106_64(payload_bytes), cfg.interleave_depth)
     x_wm = eul_driver.encode_eul(base_model, x_sync, payload_bytes)
     x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
 
@@ -416,6 +419,22 @@ def compute_losses_and_metrics(
         # EULDriver/INN use model dtype for STFT internally; this sets decode path to fp64
     decoded_bytes = eul_driver.decode_eul(base_model, x_wm, expected_bytes=cfg.rs_payload_bytes)
     original_payload_bytes = payload_bytes
+    # Also compute coded-domain roundtrip for diagnostic parity
+    rec_bits = base_model.decode(x_wm)  # [1,2,F,T]
+    # Read back bits at the same slots used during encode if available
+    slots_used = getattr(eul_driver, "_last_slots", None)
+    coded_match_acc = 0.0
+    if slots_used is not None:
+        from pipeline.ingest_and_chunk import message_spec_to_bits
+        bits_rec = message_spec_to_bits(rec_bits, slots_used)[0].tolist()
+        rec_bytes = _bits_to_bytes_lsb_first(bits_rec)
+        # deinterleave + RS decode
+        deintl = deinterleave_bytes(rec_bytes, cfg.interleave_depth)
+        rec_raw = rs_decode_106_64(deintl)
+        # also compute interleaved coded comparison
+        coded_match_len = min(len(rec_bytes), len(coded_ref))
+        if coded_match_len > 0:
+            coded_match_acc = float(sum(1 for i in range(coded_match_len) if rec_bytes[i] == coded_ref[i]) / coded_match_len)
 
     # Compute stability loss
     stability_loss = compute_slot_stability_loss(x_sync, x_wm, cfg, base_model)
@@ -470,6 +489,7 @@ def compute_losses_and_metrics(
         "payload_ok": torch.tensor(payload_success, device=x_1s.device, dtype=torch.float32),
         "w_stab": torch.tensor(w_stab, device=x_1s.device, dtype=torch.float32),
         "x_wm": x_wm.detach(),
+        "coded_acc": torch.tensor(coded_match_acc, device=x_1s.device, dtype=torch.float32),
     }
 
 
