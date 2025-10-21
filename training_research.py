@@ -421,20 +421,37 @@ def compute_losses_and_metrics(
     original_payload_bytes = payload_bytes
     # Also compute coded-domain roundtrip for diagnostic parity
     rec_bits = base_model.decode(x_wm)  # [1,2,F,T]
-    # Read back bits at the same slots used during encode if available
+    # Read back bits at the same slots used during encode if available; build differentiable message loss
     slots_used = getattr(eul_driver, "_last_slots", None)
     coded_match_acc = 0.0
-    if slots_used is not None:
+    msg_logits_loss = torch.tensor(0.0, device=x_1s.device)
+    if slots_used is not None and len(slots_used) > 0:
         from pipeline.ingest_and_chunk import message_spec_to_bits
+        # Logging: coded-domain match for diagnostics
         bits_rec = message_spec_to_bits(rec_bits, slots_used)[0].tolist()
         rec_bytes = _bits_to_bytes_lsb_first(bits_rec)
-        # deinterleave + RS decode
         deintl = deinterleave_bytes(rec_bytes, cfg.interleave_depth)
         rec_raw = rs_decode_106_64(deintl)
-        # also compute interleaved coded comparison
         coded_match_len = min(len(rec_bytes), len(coded_ref))
         if coded_match_len > 0:
             coded_match_acc = float(sum(1 for i in range(coded_match_len) if rec_bytes[i] == coded_ref[i]) / coded_match_len)
+        # Differentiable loss: use real-channel logits at slots against RS-coded interleaved bits
+        # Build reference bits from coded_ref bytes
+        ref_bits = []
+        for b in coded_ref:
+            for k in range(8):
+                ref_bits.append((b >> k) & 1)
+        S = min(len(slots_used), len(ref_bits))
+        if S > 0:
+            logits = []
+            targets = []
+            for s in range(S):
+                f_bin, t_idx = slots_used[s]
+                logits.append(rec_bits[0, 0, f_bin, t_idx])
+                targets.append(1.0 if ref_bits[s] == 1 else -1.0)
+            logits_t = torch.stack(logits, dim=0)
+            targets_t = torch.tensor(targets, dtype=torch.float32, device=logits_t.device)
+            msg_logits_loss = F.softplus(-logits_t * targets_t).mean()
 
     # Compute stability loss
     stability_loss = compute_slot_stability_loss(x_sync, x_wm, cfg, base_model)
@@ -473,8 +490,8 @@ def compute_losses_and_metrics(
         ramp_progress = (epoch - cfg.stability_ramp_start) / (cfg.stability_ramp_end - cfg.stability_ramp_start)
         w_stab = cfg.w_stab + ramp_progress * (0.5 - cfg.w_stab)
 
-    # Total loss with all components
-    total = (cfg.w_msg * byte_loss + 
+    # Total loss with all components (use differentiable message-writing loss)
+    total = (cfg.w_msg * msg_logits_loss + 
              cfg.w_perc * perc_total + 
              cfg.w_inv * inv_loss + 
              w_stab * stability_loss)
@@ -490,6 +507,7 @@ def compute_losses_and_metrics(
         "w_stab": torch.tensor(w_stab, device=x_1s.device, dtype=torch.float32),
         "x_wm": x_wm.detach(),
         "coded_acc": torch.tensor(coded_match_acc, device=x_1s.device, dtype=torch.float32),
+        "msg_loss": msg_logits_loss.detach(),
     }
 
 
@@ -516,7 +534,13 @@ def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader, epoch:
             for i in range(batch_size):
                 x_item = x[i:i+1]
                 bits_item = bits[i:i+1]
-                out = compute_losses_and_metrics(model, x_item, cfg, bits_item, epoch)
+                # Normalize epoch into [0,1] fraction for ramping
+                epoch_frac = 0.0
+                try:
+                    epoch_frac = float(max(0.0, min(1.0, (epoch - 1) / max(1, cfg.epochs - 1))))
+                except Exception:
+                    epoch_frac = 0.0
+                out = compute_losses_and_metrics(model, x_item, cfg, bits_item, epoch_frac)
                 running["loss"] += float(out["loss"].detach().item())
                 running["byte_loss"] += float(out.get("byte_loss", torch.tensor(0.0)).detach().item())
                 running["perc"] += float(out.get("perc", torch.tensor(0.0)).detach().item())
@@ -574,10 +598,22 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
             
             if use_amp and scaler is not None:
                 with torch.amp.autocast(device_type="cuda", enabled=True):
-                    out = compute_losses_and_metrics(model, x_item, cfg, bits_item, epoch)
+                    # Normalize epoch into [0,1] fraction for ramping (validation)
+                    epoch_frac = 0.0
+                    try:
+                        epoch_frac = float(max(0.0, min(1.0, (epoch - 1) / max(1, cfg.epochs - 1))))
+                    except Exception:
+                        epoch_frac = 0.0
+                    out = compute_losses_and_metrics(model, x_item, cfg, bits_item, epoch_frac)
                     loss = out["loss"]
             else:
-                out = compute_losses_and_metrics(model, x_item, cfg, bits_item, epoch)
+                # Normalize epoch into [0,1] fraction for ramping (validation)
+                epoch_frac = 0.0
+                try:
+                    epoch_frac = float(max(0.0, min(1.0, (epoch - 1) / max(1, cfg.epochs - 1))))
+                except Exception:
+                    epoch_frac = 0.0
+                out = compute_losses_and_metrics(model, x_item, cfg, bits_item, epoch_frac)
                 loss = out["loss"]
             
             if not torch.isfinite(loss):
