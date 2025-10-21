@@ -1,21 +1,25 @@
 # soundsafe/pipeline/ingest_and_chunk.py
 # Rewritten to use:
 #  - Moore–Glasberg psychoacoustics for per-band thresholds
-#  - Adaptive bit allocation to distribute ~1336 bits/EUL
+#  - Adaptive bit allocation to distribute ~2040 bits/EUL (255 bytes RS-coded)
 #  - Slot expansion to concrete (freq-bin, frame) positions
-#  - RS(167,125) with interleaving
+#  - RS(255,191) with interleaving
+#  - Quantized thresholds for robust allocation
+#  - Deterministic anchor-seeded allocation
 #
 # Assumes:
-#   - sr=22050, n_fft=1024, hop=512 (≈23.2 ms hop, ~43 frames per 1 s EUL)
+#   - sr=44100, n_fft=882, hop=441 (≈10 ms hop, ~100 frames per 1 s EUL)
 #   - INNWatermarker model uses RI channels and message-spec concat per block
 #
 # NOTE: This file does NOT include training stubs per your request.
 
 from __future__ import annotations
 import math
-from typing import List, Tuple
+import hashlib
+from typing import List, Tuple, Optional
 import numpy as np
 import torch
+import torchaudio
 
 from models.inn_encoder_decoder import INNWatermarker, STFT, ISTFT
 from pipeline.payload_codec import pack_fields, unpack_fields  # left as-is for payload packing
@@ -34,23 +38,23 @@ try:
 except Exception:
     reedsolo = None
 
-def rs_encode_167_125(msg_bytes: bytes) -> bytes:
+def rs_encode_255_191(msg_bytes: bytes) -> bytes:
     if reedsolo is None:
         raise RuntimeError("reedsolo not installed. `pip install reedsolo`")
-    rsc = reedsolo.RSCodec(42)  # (n-k)=42 parity -> RS(167,125)
+    rsc = reedsolo.RSCodec(64)  # (n-k)=64 parity -> RS(255,191)
     return bytes(rsc.encode(msg_bytes))
 
-def rs_decode_167_125(code_bytes: bytes) -> bytes:
+def rs_decode_255_191(code_bytes: bytes) -> bytes:
     if reedsolo is None:
         raise RuntimeError("reedsolo not installed. `pip install reedsolo`")
-    rsc = reedsolo.RSCodec(42)
+    rsc = reedsolo.RSCodec(64)
     try:
         data, _, _ = rsc.decode(bytearray(code_bytes))
         return bytes(data)
     except reedsolo.ReedSolomonError:
-        # Too many errors to correct, return original data (first 125 bytes)
+        # Too many errors to correct, return original data (first 191 bytes)
         # This allows the system to continue with partial recovery
-        return code_bytes[:125] if len(code_bytes) >= 125 else code_bytes
+        return code_bytes[:191] if len(code_bytes) >= 191 else code_bytes
 
 def interleave_bytes(b: bytes, depth: int) -> bytes:
     if depth <= 1: return b
@@ -124,6 +128,8 @@ def allocate_slots_and_amplitudes(
     n_fft: int,
     target_bits: int,
     amp_safety: float = 1.0,
+    thr_step: float = 1e-6,          # Quantization step for thresholds
+    use_anchor_seeding: bool = True,  # Use deterministic anchor-based seeding
 ) -> tuple[list[tuple[int,int]], np.ndarray]:
     """
     1) Compute per-band thresholds via Moore–Glasberg
@@ -145,27 +151,59 @@ def allocate_slots_and_amplitudes(
     mg = MooreGlasbergAnalyzer(sample_rate=sr, n_fft=n_fft, hop_length=n_fft//2, n_critical_bands=24)
     band_thr_bt = mg.band_thresholds(mag)        # [BANDS, T]
     band_idx_f = mg.band_indices                 # [F]
+    
+    # Quantize thresholds for robustness
+    quantized_thr_bt = np.floor(band_thr_bt / thr_step) * thr_step
+    
+    # Compute anchor seed if requested
+    seed = None
+    if use_anchor_seeding:
+        # Find 4 highest-energy critical bands
+        band_energies = np.mean(quantized_thr_bt, axis=1)  # [BANDS]
+        top_4_bands = np.argsort(band_energies)[-4:]
+        
+        # Create deterministic hash from top bands
+        anchor_data = b''.join([
+            int(quantized_thr_bt[band, 0] * 1e6).to_bytes(4, 'big') 
+            for band in top_4_bands
+        ])
+        seed_hash = hashlib.sha256(anchor_data).digest()
+        seed = int.from_bytes(seed_hash[:8], 'big')  # 64-bit seed
+        
+        # Set random seed for deterministic allocation
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
-    # Significance & allocation
-    psm = PerceptualSignificanceMetric(method="inverse")
-    sig_b = psm.compute(band_thr_bt)             # [BANDS], normalized
+    # Significance & allocation using quantized thresholds
+    psm = PerceptualSignificanceMetric(method="inverse", use_median=True)
+    sig_b = psm.compute(quantized_thr_bt)             # [BANDS], normalized
 
-    allocator = AdaptiveBitAllocator(total_bits=target_bits, allocation_strategy="optimal")
-    alloc_b = allocator.allocate_bits(sig_b)["bit_allocation"]  # [BANDS] ints
+    # Compute quantized band thresholds for tie-breaking
+    quantized_thr_b = np.median(quantized_thr_bt, axis=1).astype(np.int64)
+    
+    allocator = AdaptiveBitAllocator(
+        total_bits=target_bits, 
+        allocation_strategy="optimal",
+        seed=seed  # Use anchor seed for deterministic allocation
+    )
+    alloc_b = allocator.allocate_bits(sig_b, quantized_thr_b)["bit_allocation"]  # [BANDS] ints
 
     # Expand allocation to concrete slots
     slots = expand_allocation_to_slots(
         mag_ft=mag,
         band_indices_f=band_idx_f,
         bits_per_band=alloc_b,
-        per_frame_weight_bt=None  # default: magnitude-weighted per frame
+        per_frame_weight_bt=None,  # default: magnitude-weighted per frame
+        seed=seed,  # Use anchor seed for deterministic slot expansion
+        quantize_magnitude=True  # Use quantized magnitude for deterministic ranking
     )  # ≈ target_bits slots
 
     # Build per-slot amplitude scaling (relative). Higher band threshold → more headroom → allow more amplitude.
+    # Use quantized thresholds for consistency
     amp_per_slot = []
     for (f, t) in slots:
         band = band_idx_f[f]
-        thr = max(1e-9, float(band_thr_bt[band, t]))
+        thr = max(1e-9, float(quantized_thr_bt[band, t]))
         amp_per_slot.append(amp_safety * thr)   # you can normalize across EUL if you want a fixed global scale
     # Normalize so median is 1.0 (keeps amplitudes stable across EULs)
     if len(amp_per_slot) > 0:
@@ -192,13 +230,15 @@ class EULDriver:
 
     def __init__(
         self,
-        sr: int = 22050,
-        n_fft: int = 1024,
-        hop: int = 512,
+        sr: int = 44100,
+        n_fft: int = 882,
+        hop: int = 441,
         rs_interleave: int = 4,
-        per_eul_bits_target: int = 167 * 8,  # 1336 bits to match RS(167,125)
+        per_eul_bits_target: int = 255 * 8,  # 2040 bits to match RS-coded payload (255 bytes)
         base_symbol_amp: float = 0.1,
         amp_safety: float = 1.0,
+        thr_step: float = 1e-6,  # Quantization step for thresholds
+        use_anchor_seeding: bool = True,  # Use deterministic anchor-based seeding
     ):
         self.sr = sr
         self.stft = STFT(n_fft=n_fft, hop_length=hop, win_length=n_fft)
@@ -209,18 +249,49 @@ class EULDriver:
         self.per_eul_bits_target = per_eul_bits_target
         self.base_symbol_amp = base_symbol_amp
         self.amp_safety = amp_safety
+        self.thr_step = thr_step
+        self.use_anchor_seeding = use_anchor_seeding
+
+    def _resample_to_target_sr(self, x_wave: torch.Tensor, orig_sr: Optional[int] = None) -> torch.Tensor:
+        """Resample audio to target sample rate if needed."""
+        # If original sample rate is provided and it's already 44100, return as-is
+        if orig_sr is not None and orig_sr == self.sr:
+            return x_wave
+            
+        # If no original sample rate provided, try to infer from length
+        # This is a fallback - ideally the caller should provide orig_sr
+        if orig_sr is None:
+            current_length = x_wave.shape[-1]
+            # Heuristic: if length is close to 44100, assume it's already at 44100 Hz
+            if abs(current_length - self.sr) <= 100:  # Allow some tolerance
+                return x_wave
+            # Otherwise, we can't reliably determine the sample rate
+            # In this case, we'll assume it needs resampling
+            orig_sr = current_length  # This is a rough estimate
+        
+        # Only resample if the original sample rate is different from target
+        if orig_sr != self.sr:
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=orig_sr,
+                new_freq=self.sr
+            )
+            x_wave = resampler(x_wave)
+        return x_wave
 
     # ----- Encoder path -----
-    def encode_eul(self, model: INNWatermarker, x_wave: torch.Tensor, payload_bytes: bytes) -> torch.Tensor:
+    def encode_eul(self, model: INNWatermarker, x_wave: torch.Tensor, payload_bytes: bytes, orig_sr: Optional[int] = None) -> torch.Tensor:
         """
-        x_wave: [1,1,T] waveform of ~1 s @ 22.05 kHz
-        payload_bytes: 125 raw bytes -> RS(167,125) -> 1336 bits target
+        x_wave: [1,1,T] waveform of ~1 s @ any sample rate (will be resampled to 44100)
+        payload_bytes: 191 raw bytes -> RS(255,191) -> 2040 bits target
         returns: watermarked waveform [1,1,T]
         """
         assert x_wave.shape[0] == 1, "Call EULDriver per item (B=1) for deterministic slot planning."
+        
+        # Resample to target sample rate if needed
+        x_wave = self._resample_to_target_sr(x_wave, orig_sr)
 
         # RS encode + interleave -> bytes
-        code = rs_encode_167_125(payload_bytes)              # 167 bytes
+        code = rs_encode_255_191(payload_bytes)              # 255 bytes
         code = interleave_bytes(code, self.rs_interleave)
 
         # bytes -> bits
@@ -234,7 +305,9 @@ class EULDriver:
         X = model.stft(x_wave)  # [1,2,F,T]
         slots, amp_per_slot = allocate_slots_and_amplitudes(
             X, self.sr, self.n_fft, target_bits=min(self.per_eul_bits_target, bits_t.shape[1]),
-            amp_safety=self.amp_safety
+            amp_safety=self.amp_safety,
+            thr_step=self.thr_step,
+            use_anchor_seeding=self.use_anchor_seeding
         )
         S = min(len(slots), bits_t.shape[1])
 
@@ -253,12 +326,15 @@ class EULDriver:
         return x_wm_wave
 
     # ----- Decoder path -----
-    def decode_eul(self, model: INNWatermarker, x_wm_wave: torch.Tensor, expected_bytes: int = 125, slots: List[Tuple[int, int]] | None = None) -> bytes:
+    def decode_eul(self, model: INNWatermarker, x_wm_wave: torch.Tensor, expected_bytes: int = 191, slots: List[Tuple[int, int]] | None = None, orig_sr: Optional[int] = None) -> bytes:
         """
-        Returns recovered raw payload bytes (should be 125 if no RS errors after decode)
+        Returns recovered raw payload bytes (should be 191 if no RS errors after decode)
         If slots is provided, use those instead of recomputing from audio.
         """
         assert x_wm_wave.shape[0] == 1, "Call EULDriver per item (B=1) for deterministic slot planning."
+        
+        # Resample to target sample rate if needed
+        x_wm_wave = self._resample_to_target_sr(x_wm_wave, orig_sr)
 
         # Recover message spectrogram from watermarked audio
         M_rec = model.decode(x_wm_wave)   # [1,2,F,T]
@@ -267,7 +343,10 @@ class EULDriver:
         if slots is None:
             Xrx = model.stft(x_wm_wave)       # [1,2,F,T]
             slots, _ = allocate_slots_and_amplitudes(
-                Xrx, self.sr, self.n_fft, target_bits=self.per_eul_bits_target, amp_safety=self.amp_safety
+                Xrx, self.sr, self.n_fft, target_bits=self.per_eul_bits_target, 
+                amp_safety=self.amp_safety,
+                thr_step=self.thr_step,
+                use_anchor_seeding=self.use_anchor_seeding
             )
 
         # Read bits at those slots
@@ -285,5 +364,5 @@ class EULDriver:
 
         # deinterleave + RS decode
         deintl = deinterleave_bytes(bytes(by), self.rs_interleave)
-        data = rs_decode_167_125(deintl)
+        data = rs_decode_255_191(deintl)
         return data[:expected_bytes]

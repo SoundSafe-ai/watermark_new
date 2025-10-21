@@ -38,17 +38,20 @@ from models.inn_encoder_decoder import INNWatermarker
 from pipeline.perceptual_losses import CombinedPerceptualLoss, MFCCCosineLoss
 from pipeline.ingest_and_chunk import (
     EULDriver,
-    rs_encode_167_125,
+    rs_encode_255_191,
     deinterleave_bytes,
     interleave_bytes,
 )
+from pipeline.moore_galsberg import MooreGlasbergAnalyzer
+from pipeline.adaptive_bit_allocation import PerceptualSignificanceMetric
+import hashlib
 
 
 # =========================
 # Global constants
 # =========================
 
-TARGET_SR = 22050
+TARGET_SR = 44100  # Updated to match INN model
 CHUNK_SECONDS = 1
 CHUNK_SAMPLES = TARGET_SR * CHUNK_SECONDS
 
@@ -77,7 +80,7 @@ class TrainConfig:
     log_interval: int = 50
 
     # Payload / RS
-    rs_payload_bytes: int = 125  # pre-RS payload length (bytes)
+    rs_payload_bytes: int = 191  # pre-RS payload length (bytes) - updated for RS(255,191)
     interleave_depth: int = 4
     payload_seed: int = 1234
     use_fixed_payload: bool = True
@@ -88,10 +91,35 @@ class TrainConfig:
     sync_strength: float = 0.06
     mapper_seed: int = 42
 
-    # Loss weights
-    w_byte: float = 1.0
-    w_perc: float = 0.1
-    w_amp: float = 0.0
+    # Loss weights with stability loss
+    w_msg: float = 10.0  # Message loss weight
+    w_perc: float = 1.0  # Perceptual loss weight
+    w_inv: float = 1.0   # Invertibility loss weight
+    w_stab: float = 0.05  # Stability loss weight (ramps to 0.5)
+    
+    # Stability loss parameters
+    thr_step: float = 0.10  # Feature quantization step
+    stability_ramp_start: float = 0.33  # Start ramping stability loss at 1/3 epochs
+    stability_ramp_end: float = 1.0     # Finish ramping at end
+    
+    # Spectral normalization
+    sn_enable: bool = True
+    sn_target: float = 1.2
+    sn_power_iter: int = 1
+    sn_layers: List[str] = None  # Will be set in __post_init__
+    
+    # CSD (Channel Spectral Distortion) - placeholder for future implementation
+    csd_start_frac: float = 0.6
+    csd_final_scale: float = 0.7
+    csd_schedule: str = "cosine"
+    csd_feature_aware: bool = True
+    
+    # Decode precision
+    decode_precision: str = "fp32"
+    
+    def __post_init__(self):
+        if self.sn_layers is None:
+            self.sn_layers = ["affine_coupling.*/proj.*", "coupling_net.*/fc.*", ".*1x1.*"]
 
     # IO
     ckpt_every: int = 1
@@ -227,7 +255,7 @@ def build_payload_bits_and_bytes(cfg: TrainConfig) -> Tuple[torch.Tensor, bytes,
     else:
         payload = _rand_payload_bytes(cfg.rs_payload_bytes, rng)
 
-    coded = interleave_bytes(rs_encode_167_125(payload), cfg.interleave_depth)
+    coded = interleave_bytes(rs_encode_255_191(payload), cfg.interleave_depth)
     bits = _bytes_to_bits_lsb_first(coded)
     return torch.tensor(bits, dtype=torch.long), payload, coded
 
@@ -237,8 +265,106 @@ def build_payload_bits_and_bytes(cfg: TrainConfig) -> Tuple[torch.Tensor, bytes,
 # =========================
 
 def _build_model(cfg: TrainConfig) -> INNWatermarker:
-    # Match EULDriver training grid at 22.05 kHz: 882/441
+    # Match EULDriver training grid at 44.1 kHz: 882/441
     return INNWatermarker(n_blocks=8, spec_channels=2, stft_cfg={"n_fft": 882, "hop_length": 441, "win_length": 882})
+
+
+def compute_slot_stability_loss(
+    x_ref: torch.Tensor, 
+    x_wm: torch.Tensor, 
+    cfg: TrainConfig,
+    model: INNWatermarker
+) -> torch.Tensor:
+    """
+    Compute slot-stability loss using quantized allocator features.
+    
+    Args:
+        x_ref: Clean input audio [B, 1, T]
+        x_wm: Watermarked output audio [B, 1, T]
+        cfg: Training configuration
+        model: INNWatermarker model for STFT computation
+        
+    Returns:
+        Stability loss tensor
+    """
+    # Ensure correct sample rate
+    if x_ref.size(-1) != TARGET_SR:
+        resampler = Resample(orig_freq=x_ref.size(-1), new_freq=TARGET_SR)
+        x_ref = resampler(x_ref)
+        x_wm = resampler(x_wm)
+    
+    # Compute STFT with exact INN parameters
+    X_ref = model.stft(x_ref)  # [B, 2, F, T]
+    X_wm = model.stft(x_wm)    # [B, 2, F, T]
+    
+    # Compute magnitude
+    mag_ref = torch.sqrt(torch.clamp(X_ref[:, 0]**2 + X_ref[:, 1]**2, min=1e-12))
+    mag_wm = torch.sqrt(torch.clamp(X_wm[:, 0]**2 + X_wm[:, 1]**2, min=1e-12))
+    
+    # Initialize Moore-Glasberg analyzer
+    mg_analyzer = MooreGlasbergAnalyzer(
+        sample_rate=TARGET_SR,
+        n_fft=882,
+        hop_length=441,
+        n_critical_bands=24
+    )
+    
+    # Compute quantized features for both clean and watermarked
+    stability_losses = []
+    
+    for b in range(x_ref.size(0)):
+        # Get magnitude for this batch item
+        mag_ref_b = mag_ref[b].cpu().numpy()  # [F, T]
+        mag_wm_b = mag_wm[b].cpu().numpy()    # [F, T]
+        
+        # Compute band thresholds using Moore-Glasberg
+        band_thr_ref = mg_analyzer.band_thresholds(mag_ref_b)  # [BANDS, T]
+        band_thr_wm = mg_analyzer.band_thresholds(mag_wm_b)    # [BANDS, T]
+        
+        # Quantize thresholds with same step as allocator
+        quantized_thr_ref = np.floor(band_thr_ref / cfg.thr_step) * cfg.thr_step
+        quantized_thr_wm = np.floor(band_thr_wm / cfg.thr_step) * cfg.thr_step
+        
+        # Compute perceptual significance using quantized features
+        psm = PerceptualSignificanceMetric(method="inverse", use_median=True)
+        sig_ref = psm.compute(quantized_thr_ref)  # [BANDS]
+        sig_wm = psm.compute(quantized_thr_wm)    # [BANDS]
+        
+        # L1 loss between quantized features
+        stability_loss = torch.mean(torch.abs(torch.from_numpy(sig_ref - sig_wm).to(x_ref.device)))
+        stability_losses.append(stability_loss)
+    
+    return torch.stack(stability_losses).mean()
+
+
+def apply_spectral_normalization(model: INNWatermarker, cfg: TrainConfig) -> None:
+    """
+    Apply spectral normalization to gain-critical layers.
+    
+    Args:
+        model: INNWatermarker model
+        cfg: Training configuration
+    """
+    if not cfg.sn_enable:
+        return
+    
+    import re
+    from torch.nn.utils import spectral_norm
+    
+    def should_normalize(name: str) -> bool:
+        """Check if layer should be normalized based on pattern matching."""
+        for pattern in cfg.sn_layers:
+            if re.match(pattern, name):
+                return True
+        return False
+    
+    # Apply spectral normalization to matching layers
+    for name, module in model.named_modules():
+        if should_normalize(name) and isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
+            try:
+                spectral_norm(module, name='weight', n_power_iterations=cfg.sn_power_iter)
+            except Exception as e:
+                print(f"Warning: Could not apply spectral norm to {name}: {e}")
 
 
 def compute_losses_and_metrics(
@@ -246,8 +372,14 @@ def compute_losses_and_metrics(
     x_1s: torch.Tensor,
     cfg: TrainConfig,
     payload_bits: torch.Tensor,
+    epoch: float = 0.0,
 ) -> Dict:
     base_model = getattr(model, "module", model)
+
+    # STFT parameter assertions
+    assert TARGET_SR == 44100, f"TARGET_SR must be 44100, got {TARGET_SR}"
+    assert base_model.stft.n_fft == 882, f"STFT n_fft must be 882, got {base_model.stft.n_fft}"
+    assert base_model.stft.hop_length == 441, f"STFT hop_length must be 441, got {base_model.stft.hop_length}"
 
     x_1s = torch.nan_to_num(x_1s, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
     x_sync = embed_sync_marker(x_1s, cfg.sync_strength, TARGET_SR, cfg.mapper_seed)
@@ -260,6 +392,8 @@ def compute_losses_and_metrics(
         per_eul_bits_target=cfg.rs_payload_bytes * 8,
         base_symbol_amp=cfg.base_symbol_amp,
         amp_safety=cfg.amp_safety,
+        thr_step=cfg.thr_step,
+        use_anchor_seeding=True,
     )
 
     payload_bytes = _bits_to_bytes_lsb_first(payload_bits.tolist())
@@ -269,7 +403,11 @@ def compute_losses_and_metrics(
     decoded_bytes = eul_driver.decode_eul(base_model, x_wm, expected_bytes=cfg.rs_payload_bytes)
     original_payload_bytes = _bits_to_bytes_lsb_first(payload_bits.tolist())
 
-    amp_penalty = torch.tensor(0.0, device=x_1s.device)
+    # Compute stability loss
+    stability_loss = compute_slot_stability_loss(x_sync, x_wm, cfg, base_model)
+
+    # Compute invertibility loss (placeholder - would need inverse pass)
+    inv_loss = torch.tensor(0.0, device=x_1s.device)  # TODO: Implement actual invertibility loss
 
     if x_sync.dtype != torch.float32:
         x_sync_fp = x_sync.float()
@@ -292,15 +430,31 @@ def compute_losses_and_metrics(
         payload_success = 1.0 if decoded_bytes == original_payload_bytes else 0.0
         byte_loss = 1.0 - byte_acc
 
-    total = cfg.w_byte * byte_loss + cfg.w_amp * amp_penalty + cfg.w_perc * perc_total
+    # Compute stability weight with ramping
+    if epoch < cfg.stability_ramp_start:
+        w_stab = cfg.w_stab
+    elif epoch >= cfg.stability_ramp_end:
+        w_stab = 0.5  # Final stability weight
+    else:
+        # Linear ramp from start to end
+        ramp_progress = (epoch - cfg.stability_ramp_start) / (cfg.stability_ramp_end - cfg.stability_ramp_start)
+        w_stab = cfg.w_stab + ramp_progress * (0.5 - cfg.w_stab)
+
+    # Total loss with all components
+    total = (cfg.w_msg * byte_loss + 
+             cfg.w_perc * perc_total + 
+             cfg.w_inv * inv_loss + 
+             w_stab * stability_loss)
 
     return {
         "loss": total,
         "byte_loss": torch.tensor(byte_loss, device=x_1s.device, dtype=torch.float32),
-        "amp_penalty": amp_penalty,
         "perc": perc_total,
+        "inv": inv_loss,
+        "stability": stability_loss,
         "byte_acc": torch.tensor(byte_acc, device=x_1s.device, dtype=torch.float32),
         "payload_ok": torch.tensor(payload_success, device=x_1s.device, dtype=torch.float32),
+        "w_stab": torch.tensor(w_stab, device=x_1s.device, dtype=torch.float32),
         "x_wm": x_wm.detach(),
     }
 
@@ -314,18 +468,19 @@ def _make_payload_bits_tensor(cfg: TrainConfig, device: torch.device) -> torch.T
     return bits.to(device)
 
 
-def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader) -> Dict:
+def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader, epoch: float = 0.0) -> Dict:
     model.eval()
-    running = {"loss": 0.0, "byte_loss": 0.0, "perc": 0.0, "byte_acc": 0.0, "payload_ok": 0.0}
+    running = {"loss": 0.0, "byte_loss": 0.0, "perc": 0.0, "stability": 0.0, "byte_acc": 0.0, "payload_ok": 0.0}
     n = 0
     with torch.no_grad():
         for batch in loader:
             x = batch.to(cfg.device, non_blocking=True)
             bits = _make_payload_bits_tensor(cfg, x.device)
-            out = compute_losses_and_metrics(model, x, cfg, bits)
+            out = compute_losses_and_metrics(model, x, cfg, bits, epoch)
             running["loss"] += float(out["loss"].detach().item()) * x.size(0)
             running["byte_loss"] += float(out["byte_loss"].detach().item()) * x.size(0)
             running["perc"] += float(out["perc"].detach().item()) * x.size(0)
+            running["stability"] += float(out.get("stability", torch.tensor(0.0)).detach().item()) * x.size(0)
             running["byte_acc"] += float(out.get("byte_acc", torch.tensor(0.0)).detach().item()) * x.size(0)
             running["payload_ok"] += float(out.get("payload_ok", torch.tensor(0.0)).detach().item()) * x.size(0)
             n += int(x.size(0))
@@ -369,7 +524,7 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
         use_amp = cfg.mixed_precision and torch.cuda.is_available()
         if use_amp and scaler is not None:
             with torch.amp.autocast(device_type="cuda", enabled=True):
-                out = compute_losses_and_metrics(model, x, cfg, bits)
+                out = compute_losses_and_metrics(model, x, cfg, bits, epoch)
                 loss = out["loss"]
             if not torch.isfinite(loss):
                 cfg._global_step += 1
@@ -380,7 +535,7 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
             scaler.step(optimizer)
             scaler.update()
         else:
-            out = compute_losses_and_metrics(model, x, cfg, bits)
+            out = compute_losses_and_metrics(model, x, cfg, bits, epoch)
             loss = out["loss"]
             if not torch.isfinite(loss):
                 cfg._global_step += 1
@@ -392,8 +547,10 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
         running["loss"] += float(loss.detach().item()) * x.size(0)
         running["byte_loss"] += float(out["byte_loss"].detach().item()) * x.size(0)
         running["perc"] += float(out["perc"].detach().item()) * x.size(0)
+        running["stability"] += float(out.get("stability", torch.tensor(0.0)).detach().item()) * x.size(0)
         running["byte_acc"] += float(out.get("byte_acc", torch.tensor(0.0)).detach().item()) * x.size(0)
         running["payload_ok"] += float(out.get("payload_ok", torch.tensor(0.0)).detach().item()) * x.size(0)
+        running["w_stab"] += float(out.get("w_stab", torch.tensor(0.0)).detach().item()) * x.size(0)
         local_samples += int(x.size(0))
 
         if (step + 1) % cfg.log_interval == 0:
@@ -401,6 +558,8 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
                 "loss": f"{running['loss'] / ((step+1)*loader.batch_size):.4f}",
                 "byte_loss": f"{running['byte_loss'] / ((step+1)*loader.batch_size):.4f}",
                 "perc": f"{running['perc'] / ((step+1)*loader.batch_size):.4f}",
+                "stab": f"{running['stability'] / ((step+1)*loader.batch_size):.4f}",
+                "w_stab": f"{running['w_stab'] / ((step+1)*loader.batch_size):.3f}",
                 "byte_acc": f"{running['byte_acc'] / ((step+1)*loader.batch_size):.3f}",
                 "payload_ok": f"{running['payload_ok'] / ((step+1)*loader.batch_size):.3f}",
             })
@@ -464,6 +623,13 @@ def main(cfg: TrainConfig) -> None:
     )
 
     model = _build_model(cfg).to(cfg.device)
+    
+    # Apply spectral normalization to gain-critical layers
+    if cfg.sn_enable:
+        apply_spectral_normalization(model, cfg)
+        if (not is_distributed) or rank == 0:
+            log(f"Applied spectral normalization to gain-critical layers")
+    
     if is_distributed and torch.cuda.is_available():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
@@ -492,11 +658,11 @@ def main(cfg: TrainConfig) -> None:
 
         train_metrics = train_one_epoch(model, cfg, optimizer, train_loader, scaler, epoch)
         if (not is_distributed) or rank == 0:
-            log(f"train: loss={train_metrics['loss']:.4f} byte_loss={train_metrics['byte_loss']:.4f} perc={train_metrics['perc']:.4f} byte_acc={train_metrics.get('byte_acc',0.0):.3f} payload_ok={train_metrics.get('payload_ok',0.0):.3f}")
+            log(f"train: loss={train_metrics['loss']:.4f} byte_loss={train_metrics['byte_loss']:.4f} perc={train_metrics['perc']:.4f} stab={train_metrics.get('stability',0.0):.4f} w_stab={train_metrics.get('w_stab',0.0):.3f} byte_acc={train_metrics.get('byte_acc',0.0):.3f} payload_ok={train_metrics.get('payload_ok',0.0):.3f}")
 
-        val_metrics = validate(model, cfg, val_loader)
+        val_metrics = validate(model, cfg, val_loader, epoch)
         if (not is_distributed) or rank == 0:
-            log(f"val:   loss={val_metrics['loss']:.4f} byte_loss={val_metrics['byte_loss']:.4f} perc={val_metrics['perc']:.4f} byte_acc={val_metrics.get('byte_acc',0.0):.3f} payload_ok={val_metrics.get('payload_ok',0.0):.3f}")
+            log(f"val:   loss={val_metrics['loss']:.4f} byte_loss={val_metrics['byte_loss']:.4f} perc={val_metrics['perc']:.4f} stab={val_metrics.get('stability',0.0):.4f} byte_acc={val_metrics.get('byte_acc',0.0):.3f} payload_ok={val_metrics.get('payload_ok',0.0):.3f}")
 
             byte_acc_now = float(val_metrics.get("byte_acc", 0.0))
             is_best = byte_acc_now >= best_byte_acc
