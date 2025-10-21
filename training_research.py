@@ -490,14 +490,20 @@ def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader, epoch:
         for batch in loader:
             x = batch.to(cfg.device, non_blocking=True)
             bits = _make_payload_bits_tensor(cfg, x.device)
-            out = compute_losses_and_metrics(model, x, cfg, bits, epoch)
-            running["loss"] += float(out["loss"].detach().item()) * x.size(0)
-            running["byte_loss"] += float(out["byte_loss"].detach().item()) * x.size(0)
-            running["perc"] += float(out["perc"].detach().item()) * x.size(0)
-            running["stability"] += float(out.get("stability", torch.tensor(0.0)).detach().item()) * x.size(0)
-            running["byte_acc"] += float(out.get("byte_acc", torch.tensor(0.0)).detach().item()) * x.size(0)
-            running["payload_ok"] += float(out.get("payload_ok", torch.tensor(0.0)).detach().item()) * x.size(0)
-            n += int(x.size(0))
+
+            # EULDriver requires B=1; process validation batch item-by-item
+            batch_size = x.shape[0]
+            for i in range(batch_size):
+                x_item = x[i:i+1]
+                bits_item = bits[i:i+1]
+                out = compute_losses_and_metrics(model, x_item, cfg, bits_item, epoch)
+                running["loss"] += float(out["loss"].detach().item())
+                running["byte_loss"] += float(out.get("byte_loss", torch.tensor(0.0)).detach().item())
+                running["perc"] += float(out.get("perc", torch.tensor(0.0)).detach().item())
+                running["stability"] += float(out.get("stability", torch.tensor(0.0)).detach().item())
+                running["byte_acc"] += float(out.get("byte_acc", torch.tensor(0.0)).detach().item())
+                running["payload_ok"] += float(out.get("payload_ok", torch.tensor(0.0)).detach().item())
+                n += 1
     n = max(1, n)
     for k in running:
         running[k] /= n
