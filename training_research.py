@@ -4,8 +4,8 @@ Research training script for the INN encoder/decoder, aligned with the
 "Improving Payload Handling and Training for Audio Watermarking" document.
 
 Key ideas implemented:
-- 1 s segments at 22.05 kHz with a faint per-second sync marker
-- EULDriver-based end-to-end encode/decode for supervision (RS(167,125) + interleave)
+- 1 s segments at 44.1 kHz with an optional short (≈50 ms) sync marker
+- EULDriver-based end-to-end encode/decode for supervision (RS(106,64) inside driver)
 - INNWatermarker with RI-STFT front/back, invertible blocks, and message-spec embedding
 - Composite perceptual loss (MR-STFT, MFCC, SNR) + byte-level objective proxy
 
@@ -39,9 +39,6 @@ from models.inn_encoder_decoder import INNWatermarker
 from pipeline.perceptual_losses import CombinedPerceptualLoss, MFCCCosineLoss
 from pipeline.ingest_and_chunk import (
     EULDriver,
-    rs_encode_255_191,
-    deinterleave_bytes,
-    interleave_bytes,
 )
 from pipeline.moore_galsberg import MooreGlasbergAnalyzer
 from pipeline.adaptive_bit_allocation import PerceptualSignificanceMetric
@@ -81,7 +78,7 @@ class TrainConfig:
     log_interval: int = 50
 
     # Payload / RS
-    rs_payload_bytes: int = 191  # pre-RS payload length (bytes) - updated for RS(255,191)
+    rs_payload_bytes: int = 64  # raw payload length (bytes); RS applied inside EULDriver (RS(106,64))
     interleave_depth: int = 4
     payload_seed: int = 1234
     use_fixed_payload: bool = True
@@ -89,7 +86,7 @@ class TrainConfig:
     # EUL/embedding params
     base_symbol_amp: float = 0.08
     amp_safety: float = 1.0
-    sync_strength: float = 0.06
+    sync_strength: float = 0.05
     mapper_seed: int = 42
 
     # Loss weights with stability loss
@@ -203,12 +200,19 @@ class OneSecondDataset(Dataset):
 
 @torch.no_grad()
 def embed_sync_marker(x_1s: torch.Tensor, strength: float, sr: int, seed: int) -> torch.Tensor:
-    B, C, T = 1, 1, x_1s.size(-1)
-    t = torch.linspace(0, T / sr, steps=T, device=x_1s.device, dtype=x_1s.dtype)
+    """Optional short sync marker at the start of the segment (~50 ms)."""
+    if strength <= 0:
+        return x_1s
+    T = x_1s.size(-1)
+    sync_len = int(round(0.050 * sr))  # 50 ms
+    sync_len = min(sync_len, T)
+    t = torch.linspace(0, sync_len / sr, steps=sync_len, device=x_1s.device, dtype=x_1s.dtype)
     freq = 1.0
-    env = torch.hann_window(T, device=x_1s.device, dtype=x_1s.dtype)
-    sync = (torch.sin(2 * math.pi * freq * t) * env).unsqueeze(0).unsqueeze(0).to(dtype=x_1s.dtype)
-    out = (x_1s + strength * sync)
+    env = torch.hann_window(sync_len, device=x_1s.device, dtype=x_1s.dtype)
+    sync = torch.sin(2 * math.pi * freq * t) * env
+    sync = sync.view(1, 1, -1)
+    out = x_1s.clone()
+    out[..., :sync_len] = (out[..., :sync_len] + strength * sync).clamp(-1.0, 1.0)
     return torch.nan_to_num(out, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
 
 
@@ -250,15 +254,15 @@ def build_payload_bits_and_bytes(cfg: TrainConfig) -> Tuple[torch.Tensor, bytes,
             b"RESRCH",               # tag 6
             os.urandom(8),           # nonce 8
             b"v1",                  # version 2
-            bytes(125 - (4 + 6 + 8 + 2))  # pad to 125
         ]
-        payload = b"".join(fields[:3]) + fields[3] + fields[4]
+        pad_len = max(0, cfg.rs_payload_bytes - sum(len(f) for f in fields))
+        payload = b"".join(fields) + bytes(pad_len)
     else:
         payload = _rand_payload_bytes(cfg.rs_payload_bytes, rng)
 
-    coded = interleave_bytes(rs_encode_255_191(payload), cfg.interleave_depth)
-    bits = _bytes_to_bits_lsb_first(coded)
-    return torch.tensor(bits, dtype=torch.long), payload, coded
+    # No RS/interleave here; EULDriver handles RS(106,64)+interleave internally
+    bits = _bytes_to_bits_lsb_first(payload)
+    return torch.tensor(bits, dtype=torch.long), payload, payload
 
 
 # =========================
@@ -288,11 +292,7 @@ def compute_slot_stability_loss(
     Returns:
         Stability loss tensor
     """
-    # Ensure correct sample rate
-    if x_ref.size(-1) != TARGET_SR:
-        resampler = Resample(orig_freq=x_ref.size(-1), new_freq=TARGET_SR)
-        x_ref = resampler(x_ref)
-        x_wm = resampler(x_wm)
+    # Dataset enforces 44.1kHz; do not resample by tensor length
     
     # Compute STFT with exact INN parameters
     X_ref = model.stft(x_ref)  # [B, 2, F, T]
@@ -355,17 +355,26 @@ def apply_spectral_normalization(model: INNWatermarker, cfg: TrainConfig) -> Non
     def should_normalize(name: str) -> bool:
         """Check if layer should be normalized based on pattern matching."""
         for pattern in cfg.sn_layers:
-            if re.match(pattern, name):
+            if re.search(pattern, name):
                 return True
         return False
     
     # Apply spectral normalization to matching layers
+    matched = []
     for name, module in model.named_modules():
-        if should_normalize(name) and isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
+        # Light-touch targets: 1x1/proj/FC layers
+        if should_normalize(name) and isinstance(module, (nn.Linear,)):
             try:
                 spectral_norm(module, name='weight', n_power_iterations=cfg.sn_power_iter)
+                # Optional: gently scale weights toward sn_target (>1.0)
+                if hasattr(module, 'weight') and cfg.sn_target and cfg.sn_target != 1.0:
+                    with torch.no_grad():
+                        module.weight.data.mul_(float(cfg.sn_target))
+                matched.append(name)
             except Exception as e:
                 print(f"Warning: Could not apply spectral norm to {name}: {e}")
+    if matched:
+        print(f"SN attached to layers: {matched}")
 
 
 def compute_losses_and_metrics(
@@ -390,7 +399,7 @@ def compute_losses_and_metrics(
         n_fft=882,
         hop=441,
         rs_interleave=cfg.interleave_depth,
-        per_eul_bits_target=cfg.rs_payload_bytes * 8,
+        per_eul_bits_target=106 * 8,
         base_symbol_amp=cfg.base_symbol_amp,
         amp_safety=cfg.amp_safety,
         thr_step=cfg.thr_step,
@@ -401,8 +410,12 @@ def compute_losses_and_metrics(
     x_wm = eul_driver.encode_eul(base_model, x_sync, payload_bytes)
     x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
 
+    # Honor decode precision flag (float64 for QA)
+    if cfg.decode_precision == "fp64":
+        x_wm = x_wm.double()
+        # EULDriver/INN use model dtype for STFT internally; this sets decode path to fp64
     decoded_bytes = eul_driver.decode_eul(base_model, x_wm, expected_bytes=cfg.rs_payload_bytes)
-    original_payload_bytes = _bits_to_bytes_lsb_first(payload_bits.tolist())
+    original_payload_bytes = payload_bytes
 
     # Compute stability loss
     stability_loss = compute_slot_stability_loss(x_sync, x_wm, cfg, base_model)

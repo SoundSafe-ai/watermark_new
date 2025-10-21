@@ -15,13 +15,14 @@ from pipeline.moore_galsberg import MooreGlasbergAnalyzer
 class SyncAnchor:
     """
     Per-second sync anchor system for robust alignment.
-    Embeds distinctive patterns at the start of each 1s segment.
+    Embeds distinctive patterns at the start of each 1 s segment.
+    At 44.1 kHz, 1 s = 44,100 samples; a 50 ms sync = 2,205 samples ≈ 5 frames with hop=441.
     """
     
     def __init__(self, sync_length_ms: int = 50, sr: int = 44100, 
                  n_fft: int = 882, hop: int = 441, pattern_type: str = "chirp",
                  n_anchor_bands: int = 4, ranking_method: str = "median",
-                 hashing_salt: str = "soundsafe_anchor"):
+                 hashing_salt: str = "soundsafe_anchor", thr_step: float = 0.10):
         """
         Args:
             sync_length_ms: Length of sync pattern in milliseconds
@@ -41,10 +42,12 @@ class SyncAnchor:
         self.n_anchor_bands = n_anchor_bands
         self.ranking_method = ranking_method
         self.hashing_salt = hashing_salt
+        self.thr_step = thr_step
         
         # Calculate sync pattern length in samples
-        self.sync_samples = int(sync_length_ms * sr / 1000)  # ~2205 samples for 50ms @ 44.1kHz
-        self.sync_frames = int(sync_length_ms * sr / (hop * 1000))  # ~2.5 frames
+        self.sync_samples = int(round(sync_length_ms * sr / 1000))  # 50 ms @ 44.1kHz -> 2205 samples
+        # With hop=441, 2205 / 441 = 5 frames exactly
+        self.sync_frames = int(round(sync_length_ms * sr / (hop * 1000)))
         
         # Initialize Moore-Glasberg analyzer for anchor band detection
         self.mg_analyzer = MooreGlasbergAnalyzer(
@@ -249,21 +252,32 @@ class SyncAnchor:
             # Compute STFT with exact INN parameters
             X = self._compute_stft(audio_1s)  # [1, 2, F, T]
             mag = torch.sqrt(torch.clamp(X[:, 0]**2 + X[:, 1]**2, min=1e-12))[0]  # [F, T]
+            # Assert expected shapes
+            F, T = mag.shape
+            assert F == (self.n_fft // 2 + 1), f"Unexpected F={F}, expected {self.n_fft//2+1}"
             
             # Compute quantized band thresholds using Moore-Glasberg
-            band_thr_bt = self.mg_analyzer.band_thresholds(mag.cpu().numpy())  # [BANDS, T]
+            band_thr_bt = self.mg_analyzer.band_thresholds(mag.cpu().numpy(), thr_step=self.thr_step)  # [BANDS, T]
             
-            # Quantize thresholds for robustness
-            quantized_thr_bt = np.floor(band_thr_bt / 1e-6) * 1e-6  # Same quantization as allocator
-            
-            # Compute band energies using specified ranking method
-            if self.ranking_method == "median":
-                band_energies = np.median(quantized_thr_bt, axis=1)  # [BANDS]
-            else:  # mean
-                band_energies = np.mean(quantized_thr_bt, axis=1)  # [BANDS]
-            
-            # Find top N anchor bands by energy
-            top_bands = np.argsort(band_energies)[-self.n_anchor_bands:]
+            # Exclude sync region from anchor feature computation
+            start_idx = min(max(0, self.sync_frames), T)
+            feat_bt = band_thr_bt[:, start_idx:] if start_idx < T else band_thr_bt
+            T_use = feat_bt.shape[1]
+            if T_use == 0:
+                return None, 0.0
+
+            # Rank-based anchors: per-frame ranks across bands, then aggregate (median rank per band)
+            B = feat_bt.shape[0]
+            ranks_bt = np.zeros_like(feat_bt, dtype=np.int64)  # [B, T_use]
+            for t in range(T_use):
+                col = feat_bt[:, t]
+                order = np.argsort(col)        # ascending
+                rank = np.argsort(order) + 1   # 1..B
+                # Make higher values stronger by flipping
+                ranks_bt[:, t] = (B + 1) - rank
+            band_rank_med = np.median(ranks_bt, axis=1)  # [B]
+            # Find top N anchor bands by aggregated ranks
+            top_bands = np.argsort(band_rank_med)[-self.n_anchor_bands:]
             
             # Sort by center frequency to create canonical ordering
             band_center_freqs = self.mg_analyzer.band_indices  # [F] -> band_id
@@ -278,18 +292,14 @@ class SyncAnchor:
             
             # Sort by center frequency
             top_band_freqs.sort(key=lambda x: x[0])
-            canonical_bands = tuple(band for _, band in top_band_freqs)
+            canonical_bands = tuple(int(band) for _, band in top_band_freqs)
             
-            # Compute confidence based on energy separation
-            if len(band_energies) > 0:
-                sorted_energies = np.sort(band_energies)
-                if len(sorted_energies) >= 2:
-                    # Confidence based on separation between top bands and others
-                    top_energy = np.mean(sorted_energies[-self.n_anchor_bands:])
-                    other_energy = np.mean(sorted_energies[:-self.n_anchor_bands])
-                    confidence = min(1.0, (top_energy - other_energy) / (top_energy + 1e-12))
-                else:
-                    confidence = 0.5
+            # Confidence on rank space: separation of median ranks
+            if B > 1:
+                top_rank = float(np.mean(band_rank_med[top_bands]))
+                other_rank = float(np.mean(np.delete(band_rank_med, top_bands))) if B > self.n_anchor_bands else 0.0
+                denom = max(1.0, top_rank)  # floor to stabilize on quiet content
+                confidence = float(np.clip((top_rank - other_rank) / denom, 0.0, 1.0))
             else:
                 confidence = 0.0
             
@@ -297,8 +307,9 @@ class SyncAnchor:
                 return None, confidence
             
             # Create deterministic seed from anchor bands and segment length
-            segment_length = audio_1s.size(1)
-            seed_data = f"{canonical_bands}_{segment_length}_{self.hashing_salt}".encode()
+            segment_length = int(audio_1s.size(1))
+            version_salt = b"soundsafe_sync_v1"
+            seed_data = f"{canonical_bands}_{segment_length}_{self.hashing_salt}".encode() + version_salt
             seed = int(hashlib.sha256(seed_data).hexdigest()[:8], 16)
             
             return seed, confidence
@@ -352,7 +363,7 @@ class SyncDetector:
     Advanced sync pattern detector with anchor-based seeding and fallback strategies.
     """
     
-    def __init__(self, sync_anchor: SyncAnchor, model: INNWatermarker):
+    def __init__(self, sync_anchor: SyncAnchor, model: INNWatermarker, verbose: bool = False):
         """
         Args:
             sync_anchor: SyncAnchor instance
@@ -360,6 +371,7 @@ class SyncDetector:
         """
         self.sync_anchor = sync_anchor
         self.model = model
+        self.verbose = verbose
         
     def detect_with_stft(self, audio_1s: torch.Tensor, 
                         threshold: float = 0.05) -> Tuple[int, float]:
@@ -429,7 +441,8 @@ class SyncDetector:
         )
         
         if anchor_seed is not None and anchor_confidence >= anchor_threshold:
-            # Anchor-based seeding successful, no offset needed
+            if self.verbose:
+                print(f"sync: anchor OK conf={anchor_confidence:.3f}")
             return 0, anchor_confidence, anchor_seed
         
         # Fallback to sync pattern detection for severe cases
@@ -440,10 +453,53 @@ class SyncDetector:
         offset_fd, conf_fd = self.detect_with_stft(audio_1s, threshold)
         
         # Choose best sync pattern result
-        if conf_td > conf_fd:
-            return offset_td, conf_td, None
+        if conf_td >= conf_fd:
+            offset, conf = offset_td, conf_td
         else:
-            return offset_fd, conf_fd, None
+            offset, conf = offset_fd, conf_fd
+
+        if self.verbose:
+            print(f"sync: pattern used offset={offset} conf={conf:.3f}")
+
+        # Align audio and make a second attempt at anchor-based seeding
+        aligned = self.sync_anchor.align_audio(audio_1s, offset)
+        seed2, conf2 = self.sync_anchor.detect_anchor_and_seed(aligned, anchor_threshold)
+        if seed2 is not None and conf2 >= anchor_threshold:
+            if self.verbose:
+                print(f"sync: anchor OK after align conf={conf2:.3f}")
+            return offset, conf2, seed2
+
+        # Hysteresis / second chance: retry with coarser quantization
+        prev_thr = self.sync_anchor.thr_step
+        try:
+            self.sync_anchor.thr_step = max(prev_thr, 0.20)
+            seed3, conf3 = self.sync_anchor.detect_anchor_and_seed(aligned, anchor_threshold)
+            if seed3 is not None and conf3 >= anchor_threshold:
+                if self.verbose:
+                    print(f"sync: anchor OK after coarse thr_step conf={conf3:.3f}")
+                return offset, conf3, seed3
+        finally:
+            self.sync_anchor.thr_step = prev_thr
+
+        # Forced deterministic seed from rank vector (seed must be non-None downstream)
+        X = self.sync_anchor._compute_stft(aligned)
+        mag = torch.sqrt(torch.clamp(X[:, 0]**2 + X[:, 1]**2, min=1e-12))[0]
+        F, T = mag.shape
+        band_thr_bt = self.sync_anchor.mg_analyzer.band_thresholds(mag.cpu().numpy(), thr_step=self.sync_anchor.thr_step)
+        B = band_thr_bt.shape[0]
+        # Rank per frame
+        ranks_bt = np.zeros_like(band_thr_bt, dtype=np.int64)
+        for t in range(T):
+            col = band_thr_bt[:, t]
+            order = np.argsort(col)
+            rank = np.argsort(order) + 1
+            ranks_bt[:, t] = (B + 1) - rank
+        rank_med = tuple(np.median(ranks_bt, axis=1).astype(int).tolist())
+        salt = b"soundsafe_sync_v1_forced"
+        seed_forced = int(hashlib.sha256(str(rank_med).encode() + salt).hexdigest()[:8], 16)
+        if self.verbose:
+            print(f"sync: forced seed via rank tuple")
+        return offset, conf, seed_forced
     
     def detect_anchor_and_seed(self, audio_1s: torch.Tensor, 
                               confidence_threshold: float = 0.3) -> Tuple[Optional[int], float]:

@@ -50,7 +50,7 @@ class AdaptiveBitAllocator:
     allocation_strategy: str = "optimal"  # "proportional" | "threshold" | "optimal"
     min_bits_per_band: int = 0
     max_bits_per_band: int = 1_000_000
-    seed: Optional[int] = None  # For deterministic tie-breaking
+    seed: Optional[int] = None  # For deterministic tie-breaking (must be set in production)
 
     def _compute_deterministic_tie_key(self, band_idx: int, significance: int, quantized_thr: int) -> int:
         """Compute deterministic tie-breaking key for a band."""
@@ -66,6 +66,9 @@ class AdaptiveBitAllocator:
         quantized_thr_b: [BANDS] quantized thresholds for tie-breaking (optional)
         Returns: dict with 'bit_allocation' [BANDS] (integers that sum to <= total_bits)
         """
+        if self.seed is None:
+            # Enforce seed presence to avoid non-anchored determinism in production paths
+            raise ValueError("AdaptiveBitAllocator.seed must be set (anchor-derived) for production determinism")
         B = significance_b.shape[0]
         alloc = np.zeros(B, dtype=np.int32)
         
@@ -190,14 +193,21 @@ def expand_allocation_to_slots(
     for b in range(B):
         band_bins.append(np.where(band_indices_f == b)[0])
 
-    # Default per-frame weights: quantized magnitude (higher mag -> more headroom)
+    # Default per-frame weights: rank-based summary to reduce scale sensitivity
     if per_frame_weight_bt is None:
         per_frame_weight_bt = np.zeros((B, T), dtype=np.int64)
         for b in range(B):
             bins_b = band_bins[b]
             if bins_b.size == 0:
                 continue
-            per_frame_weight_bt[b] = np.median(mag_quantized[bins_b, :], axis=0) + 1
+            # Compute per-bin ranks within this band for each frame
+            ranks = np.zeros((bins_b.size, T), dtype=np.int64)
+            for t in range(T):
+                # Rank 1..K (highest magnitude gets highest rank)
+                order = np.argsort(mag_quantized[bins_b, t])  # ascending
+                ranks[:, t] = np.argsort(order) + 1           # 1..K
+            # Use median rank across bins as frame weight (higher is stronger)
+            per_frame_weight_bt[b] = np.median(ranks, axis=0).astype(np.int64) + 1
 
     def _compute_deterministic_tie_key(bin_idx: int, magnitude: int, frame: int, band: int) -> int:
         """Compute deterministic tie-breaking key for a bin."""
@@ -206,14 +216,30 @@ def expand_allocation_to_slots(
             data += f"_{seed}".encode()
         return int(hashlib.sha256(data).hexdigest()[:8], 16)
 
-    # Distribute per band
+        # Distribute per band
     for b in range(B):
         bits_b = int(bits_per_band[b])
         if bits_b <= 0:
             continue
         bins_b = band_bins[b]
         if bins_b.size == 0:
-            continue
+                # No bins available in this band; redistribute deterministically
+                # to the next bands according to tie-keys
+                # Build tie-keys for all other bands
+                other = [bb for bb in range(B) if bb != b and band_bins[bb].size > 0]
+                if len(other) == 0:
+                    continue
+                tie_keys = np.array([
+                    int(hashlib.sha256(f"redist_{bb}_{self.seed}".encode()).hexdigest()[:8], 16)
+                    for bb in other
+                ])
+                order = np.argsort(-tie_keys)
+                for i in range(bits_b):
+                    tgt = other[order[i % len(other)]]
+                    # assign one bit to frame with max weight in target band
+                    t_star = int(np.argmax(per_frame_weight_bt[tgt]))
+                    slots.append((int(np.median(band_bins[tgt]).astype(int) if band_bins[tgt].size>0 else 0), t_star))
+                continue
 
         # Integer-based frame weight distribution
         w = per_frame_weight_bt[b].astype(np.int64)
@@ -233,26 +259,23 @@ def expand_allocation_to_slots(
             for i in range(min(rem, len(idx))):
                 per_t[idx[i]] += 1
 
-        # For each frame t, pick top per_t[t] bins by quantized magnitude within band
+        # For each frame t, pick top per_t[t] bins by normalized rank within band
         for t in range(T):
             k = int(per_t[t])
             if k <= 0:
                 continue
                 
             col = mag_quantized[bins_b, t]
-            if k >= col.size:
-                # Use all bins in this band for this frame
-                top_idx = np.arange(col.size)
-            else:
-                # Use quantized magnitude for deterministic ranking
-                # Create deterministic ranking with tie-breaking
-                bin_data = [(i, int(col[i]), int(bins_b[i])) for i in range(col.size)]
-                # Sort by magnitude (descending), then by deterministic tie key
-                bin_data.sort(key=lambda x: (
-                    -x[1],  # Magnitude (descending)
-                    _compute_deterministic_tie_key(x[2], x[1], t, b)  # Tie-breaker (ascending)
-                ))
-                top_idx = np.array([x[0] for x in bin_data[:k]])
+            # Compute ranks within this frame for this band
+            order = np.argsort(col)                  # ascending
+            rank = np.argsort(order) + 1             # 1..K (higher = stronger)
+            # Build deterministic key: (-rank, tie-key)
+            bin_data = [(i, int(rank[i]), int(bins_b[i])) for i in range(col.size)]
+            bin_data.sort(key=lambda x: (
+                -x[1],  # Higher rank first
+                _compute_deterministic_tie_key(x[2], x[1], t, b)
+            ))
+            top_idx = np.array([x[0] for x in bin_data[:min(k, len(bin_data))]])
                 
             for ii in top_idx:
                 f_bin = int(bins_b[int(ii)])

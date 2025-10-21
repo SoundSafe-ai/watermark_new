@@ -15,6 +15,7 @@ class MicroChunker:
     """
     Splits 1-second audio segments into overlapping micro-chunks.
     Each micro-chunk is 10-20ms with 50% overlap for redundancy.
+    1 s at 44.1 kHz is 44,100 samples.
     """
     
     def __init__(self, window_ms: int = 15, overlap_ratio: float = 0.5, sr: int = 44100):
@@ -40,7 +41,7 @@ class MicroChunker:
         Split 1-second audio into overlapping micro-chunks.
         
         Args:
-            audio_1s: Audio tensor [1, T] where T ≈ 22050 samples
+            audio_1s: Audio tensor [1, T] where T ≈ 44100 samples
             
         Returns:
             List of micro-chunk tensors, each [1, window_samples]
@@ -138,8 +139,7 @@ class DeterministicMapper:
             List of (freq_bin, time_frame) tuples
         """
         if anchor_seed is None:
-            # Fallback to window-based seed if no anchor provided
-            anchor_seed = window_idx * 1000 + n_windows * 100
+            raise ValueError("DeterministicMapper requires non-None anchor_seed in production paths")
         
         # Create deterministic seed based on window position and anchor
         window_seed = anchor_seed + window_idx * 1000 + n_windows * 100
@@ -152,13 +152,14 @@ class DeterministicMapper:
             return self._deterministic_mapping(window_idx, n_windows, target_bits, window_seed)
     
     def _deterministic_mapping(self, window_idx: int, n_windows: int, 
-                              target_bits: int, seed: int) -> List[Tuple[int, int]]:
+                              target_bits: int, seed: int,
+                              freq_ratio: float = 0.7) -> List[Tuple[int, int]]:
         """Pure deterministic mapping based on window position."""
         rng = np.random.RandomState(seed)
         
-        # Distribute bits across frequency and time
-        freq_bits = int(target_bits * 0.7)  # 70% in frequency domain
-        time_bits = target_bits - freq_bits  # 30% in time domain
+        # Distribute bits across frequency and time (configurable ratio)
+        freq_bits = int(round(target_bits * freq_ratio))
+        time_bits = max(0, target_bits - freq_bits)
         
         slots = []
         
@@ -168,22 +169,26 @@ class DeterministicMapper:
                                     replace=False)
             for f in freq_indices:
                 # Use middle frame of window
-                t = self.window_frames // 2
+                t = 0 if self.window_frames == 1 else rng.choice(self.window_frames, size=1, replace=False)[0]
                 slots.append((int(f), int(t)))
         
         # Time slots (distributed across window frames)
         if time_bits > 0:
-            time_indices = rng.choice(self.window_frames, size=min(time_bits, self.window_frames), 
-                                    replace=False)
+            n_time_choices = max(2, self.window_frames)
+            time_indices = rng.choice(n_time_choices, size=min(time_bits, n_time_choices), replace=False)
             for t in time_indices:
-                # Use mid-frequency
-                f = self.n_freq_bins // 2
+                # Select frequency from a small neighborhood around deterministic anchors
+                band_center = self.n_freq_bins // 2
+                spread = max(1, self.n_freq_bins // 16)
+                f_candidates = np.arange(max(0, band_center - spread), min(self.n_freq_bins, band_center + spread))
+                f = int(rng.choice(f_candidates)) if f_candidates.size > 0 else int(band_center)
                 slots.append((int(f), int(t)))
         
         return slots[:target_bits]  # Ensure we don't exceed target
     
     def _content_aware_mapping(self, window_idx: int, n_windows: int, target_bits: int,
-                              audio_content: torch.Tensor, seed: int) -> List[Tuple[int, int]]:
+                              audio_content: torch.Tensor, seed: int,
+                              freq_ratio: float = 0.7, thr_step: float = 0.10) -> List[Tuple[int, int]]:
         """Content-aware mapping using quantized audio characteristics."""
         rng = np.random.RandomState(seed)
         
@@ -194,8 +199,8 @@ class DeterministicMapper:
         X = self._compute_stft(audio_content)  # [1, 2, F, T]
         mag = torch.sqrt(torch.clamp(X[:, 0]**2 + X[:, 1]**2, min=1e-12))[0]  # [F, T]
         
-        # Quantize magnitude for deterministic ranking
-        mag_quantized = (mag * 1000000).long()  # Scale and quantize
+        # Quantize magnitude for deterministic ranking using shared bucketing intent
+        mag_quantized = (torch.floor((mag / thr_step)) * thr_step * 1e6).long()
         
         # Compute per-band quantized thresholds
         band_energies = torch.median(mag_quantized, dim=1)[0]  # [F] - use median for robustness
@@ -208,8 +213,8 @@ class DeterministicMapper:
         local_rng = np.random.RandomState(seed + feature_seed)
         
         # Distribute bits across frequency and time deterministically
-        freq_bits = int(target_bits * 0.7)  # 70% in frequency domain
-        time_bits = target_bits - freq_bits  # 30% in time domain
+        freq_bits = int(round(target_bits * freq_ratio))
+        time_bits = max(0, target_bits - freq_bits)
         
         # Frequency slots (prefer top energy bands)
         if freq_bits > 0:
@@ -234,20 +239,20 @@ class DeterministicMapper:
             )
             
             for f in freq_indices:
-                # Use middle frame of window
-                t = self.window_frames // 2
+                # Spread time frames deterministically
+                t = 0 if self.window_frames == 1 else local_rng.choice(self.window_frames, size=1, replace=False)[0]
                 slots.append((int(f), int(t)))
         
         # Time slots (distributed across window frames)
         if time_bits > 0:
-            time_indices = local_rng.choice(
-                self.window_frames, 
-                size=min(time_bits, self.window_frames), 
-                replace=False
-            )
+            n_time_choices = max(2, self.window_frames)
+            time_indices = local_rng.choice(n_time_choices, size=min(time_bits, n_time_choices), replace=False)
             for t in time_indices:
-                # Use mid-frequency
-                f = self.n_freq_bins // 2
+                # Choose frequency near anchor bands deterministically
+                band_center = self.n_freq_bins // 2
+                spread = max(1, self.n_freq_bins // 16)
+                f_candidates = np.arange(max(0, band_center - spread), min(self.n_freq_bins, band_center + spread))
+                f = int(local_rng.choice(f_candidates)) if f_candidates.size > 0 else int(band_center)
                 slots.append((int(f), int(t)))
         
         return slots[:target_bits]  # Ensure we don't exceed target
@@ -416,12 +421,11 @@ def apply_psychoacoustic_gate(audio_window: torch.Tensor, slots: List[Tuple[int,
         else:
             slot_scores.append((0.0, f, t))
     
-    # Sort by score and take top slots (be less restrictive)
+    # Sort by score (descending) and take top-K deterministically
     slot_scores.sort(reverse=True)
-    
-    # Instead of taking all slots, take at least 50% or minimum 1
     min_slots = max(1, len(slots) // 2)
-    filtered_slots = [(f, t) for _, f, t in slot_scores[:max(min_slots, len(slots))]]
+    K = min_slots  # could be parameterized or tied to target bits per window
+    filtered_slots = [(f, t) for _, f, t in slot_scores[:K]]
     
     return filtered_slots
 
