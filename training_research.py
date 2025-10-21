@@ -33,6 +33,7 @@ os.environ.setdefault("TORCHAUDIO_USE_BACKEND_DISPATCHER", "0")
 import torchaudio
 from torchaudio.transforms import Resample
 from tqdm import tqdm
+import numpy as np
 
 from models.inn_encoder_decoder import INNWatermarker
 from pipeline.perceptual_losses import CombinedPerceptualLoss, MFCCCosineLoss
@@ -314,8 +315,8 @@ def compute_slot_stability_loss(
     
     for b in range(x_ref.size(0)):
         # Get magnitude for this batch item
-        mag_ref_b = mag_ref[b].cpu().numpy()  # [F, T]
-        mag_wm_b = mag_wm[b].cpu().numpy()    # [F, T]
+        mag_ref_b = mag_ref[b].detach().cpu().numpy()  # [F, T]
+        mag_wm_b = mag_wm[b].detach().cpu().numpy()    # [F, T]
         
         # Compute band thresholds using Moore-Glasberg
         band_thr_ref = mg_analyzer.band_thresholds(mag_ref_b)  # [BANDS, T]
@@ -331,7 +332,7 @@ def compute_slot_stability_loss(
         sig_wm = psm.compute(quantized_thr_wm)    # [BANDS]
         
         # L1 loss between quantized features
-        stability_loss = torch.mean(torch.abs(torch.from_numpy(sig_ref - sig_wm).to(x_ref.device)))
+        stability_loss = torch.mean(torch.abs(torch.from_numpy(sig_ref - sig_wm).float().to(x_ref.device)))
         stability_losses.append(stability_loss)
     
     return torch.stack(stability_losses).mean()
@@ -379,7 +380,7 @@ def compute_losses_and_metrics(
     # STFT parameter assertions
     assert TARGET_SR == 44100, f"TARGET_SR must be 44100, got {TARGET_SR}"
     assert base_model.stft.n_fft == 882, f"STFT n_fft must be 882, got {base_model.stft.n_fft}"
-    assert base_model.stft.hop_length == 441, f"STFT hop_length must be 441, got {base_model.stft.hop_length}"
+    assert base_model.stft.hop == 441, f"STFT hop must be 441, got {base_model.stft.hop}"
 
     x_1s = torch.nan_to_num(x_1s, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
     x_sync = embed_sync_marker(x_1s, cfg.sync_strength, TARGET_SR, cfg.mapper_seed)
@@ -492,7 +493,7 @@ def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader, epoch:
 
 def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.optim.Optimizer, loader: DataLoader, scaler, epoch: int) -> Dict:
     model.train()
-    running = {"loss": 0.0, "byte_loss": 0.0, "perc": 0.0, "byte_acc": 0.0, "payload_ok": 0.0}
+    running = {"loss": 0.0, "byte_loss": 0.0, "perc": 0.0, "stability": 0.0, "byte_acc": 0.0, "payload_ok": 0.0, "w_stab": 0.0}
     local_samples = 0
 
     steps_per_epoch = len(loader)
@@ -522,35 +523,65 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, optimizer: torch.op
                 pg["lr"] = lr_now
 
         use_amp = cfg.mixed_precision and torch.cuda.is_available()
-        if use_amp and scaler is not None:
-            with torch.amp.autocast(device_type="cuda", enabled=True):
-                out = compute_losses_and_metrics(model, x, cfg, bits, epoch)
+        
+        # Process each item in the batch individually (EULDriver requires B=1)
+        batch_size = x.shape[0]
+        total_loss = 0.0
+        all_metrics = {}
+        
+        for i in range(batch_size):
+            x_item = x[i:i+1]  # Keep batch dimension as 1
+            bits_item = bits[i:i+1]  # Keep batch dimension as 1
+            
+            if use_amp and scaler is not None:
+                with torch.amp.autocast(device_type="cuda", enabled=True):
+                    out = compute_losses_and_metrics(model, x_item, cfg, bits_item, epoch)
+                    loss = out["loss"]
+            else:
+                out = compute_losses_and_metrics(model, x_item, cfg, bits_item, epoch)
                 loss = out["loss"]
+            
             if not torch.isfinite(loss):
-                cfg._global_step += 1
                 continue
+                
+            total_loss += loss
+            # Aggregate metrics (take mean for most metrics)
+            for key, value in out.items():
+                if key != "loss" and isinstance(value, torch.Tensor):
+                    if key not in all_metrics:
+                        all_metrics[key] = []
+                    all_metrics[key].append(value.item() if value.numel() == 1 else value.mean().item())
+        
+        if total_loss == 0:
+            cfg._global_step += 1
+            continue
+            
+        # Average the loss across the batch
+        loss = total_loss / batch_size
+        
+        if use_amp and scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
-            out = compute_losses_and_metrics(model, x, cfg, bits, epoch)
-            loss = out["loss"]
-            if not torch.isfinite(loss):
-                cfg._global_step += 1
-                continue
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+        
+        # Create final metrics dict
+        out = {"loss": loss}
+        for key, values in all_metrics.items():
+            out[key] = sum(values) / len(values) if values else 0.0
 
         running["loss"] += float(loss.detach().item()) * x.size(0)
-        running["byte_loss"] += float(out["byte_loss"].detach().item()) * x.size(0)
-        running["perc"] += float(out["perc"].detach().item()) * x.size(0)
-        running["stability"] += float(out.get("stability", torch.tensor(0.0)).detach().item()) * x.size(0)
-        running["byte_acc"] += float(out.get("byte_acc", torch.tensor(0.0)).detach().item()) * x.size(0)
-        running["payload_ok"] += float(out.get("payload_ok", torch.tensor(0.0)).detach().item()) * x.size(0)
-        running["w_stab"] += float(out.get("w_stab", torch.tensor(0.0)).detach().item()) * x.size(0)
+        running["byte_loss"] += float(out["byte_loss"]) * x.size(0)
+        running["perc"] += float(out["perc"]) * x.size(0)
+        running["stability"] += float(out.get("stability", 0.0)) * x.size(0)
+        running["byte_acc"] += float(out.get("byte_acc", 0.0)) * x.size(0)
+        running["payload_ok"] += float(out.get("payload_ok", 0.0)) * x.size(0)
+        running["w_stab"] += float(out.get("w_stab", 0.0)) * x.size(0)
         local_samples += int(x.size(0))
 
         if (step + 1) % cfg.log_interval == 0:
@@ -606,7 +637,6 @@ def main(cfg: TrainConfig) -> None:
         num_workers=cfg.num_workers,
         drop_last=True,
         pin_memory=pin,
-        pin_memory_device=("cuda" if pin else "cpu"),
         persistent_workers=True if cfg.num_workers > 0 else False,
         prefetch_factor=4 if cfg.num_workers > 0 else None,
     )
@@ -617,12 +647,22 @@ def main(cfg: TrainConfig) -> None:
         sampler=val_sampler,
         num_workers=cfg.num_workers,
         pin_memory=pin,
-        pin_memory_device=("cuda" if pin else "cpu"),
         persistent_workers=True if cfg.num_workers > 0 else False,
         prefetch_factor=4 if cfg.num_workers > 0 else None,
     )
 
     model = _build_model(cfg).to(cfg.device)
+    
+    # Define log function before it's used
+    log_path = os.path.join(cfg.save_dir, cfg.log_file)
+    def log(msg: str) -> None:
+        if (not is_distributed) or rank == 0:
+            print(msg)
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except Exception:
+                pass
     
     # Apply spectral normalization to gain-critical layers
     if cfg.sn_enable:
@@ -634,18 +674,7 @@ def main(cfg: TrainConfig) -> None:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.98), weight_decay=1e-4)
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.mixed_precision and torch.cuda.is_available())
-
-    log_path = os.path.join(cfg.save_dir, cfg.log_file)
-    def log(msg: str) -> None:
-        if (not is_distributed) or rank == 0:
-            print(msg)
-            try:
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(msg + "\n")
-            except Exception:
-                pass
-
+    scaler = torch.amp.GradScaler('cuda', enabled=cfg.mixed_precision and torch.cuda.is_available())
     if (not is_distributed) or rank == 0:
         log(f"Files: train={len(train_ds)} | val={len(val_ds)} | SR={TARGET_SR}")
 
@@ -689,9 +718,9 @@ def main(cfg: TrainConfig) -> None:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="INN research training")
-    parser.add_argument("--data_dir", type=str, default=None)
-    parser.add_argument("--val_dir", type=str, default=None)
-    parser.add_argument("--save_dir", type=str, default=None)
+    parser.add_argument("--data_dir", type=str, default="data/train")
+    parser.add_argument("--val_dir", type=str, default="data/val")
+    parser.add_argument("--save_dir", type=str, default="new_run")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--max_train_files", type=int, default=None)

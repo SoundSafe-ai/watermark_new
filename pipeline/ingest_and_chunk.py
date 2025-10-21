@@ -168,7 +168,7 @@ def allocate_slots_and_amplitudes(
             for band in top_4_bands
         ])
         seed_hash = hashlib.sha256(anchor_data).digest()
-        seed = int.from_bytes(seed_hash[:8], 'big')  # 64-bit seed
+        seed = int.from_bytes(seed_hash[:4], 'big')  # 32-bit seed for numpy compatibility
         
         # Set random seed for deterministic allocation
         np.random.seed(seed)
