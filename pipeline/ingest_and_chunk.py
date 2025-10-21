@@ -156,7 +156,7 @@ def allocate_slots_and_amplitudes(
     quantized_thr_bt = np.floor(band_thr_bt / thr_step) * thr_step
     
     # Compute anchor seed if requested
-    seed = None
+    seed32 = 0
     if use_anchor_seeding:
         # Rank bands by median energy over time for stability
         band_energy_med = np.median(quantized_thr_bt, axis=1)  # [BANDS]
@@ -176,13 +176,14 @@ def allocate_slots_and_amplitudes(
         salt = b"soundsafe_anchor_seed_v1"
         seed_payload = str(canonical_bands).encode() + f"_{F}_{T}".encode() + salt
         seed_hash = hashlib.sha256(seed_payload).digest()
-        seed = int.from_bytes(seed_hash[:8], 'big')  # 64-bit seed
+        seed64 = int.from_bytes(seed_hash[:8], 'big')
+        seed32 = int(seed64 & 0xFFFFFFFF)  # Clamp to 32-bit for numpy compatibility
         
         # Set random seed for deterministic allocation
-        np.random.seed(seed)
-        torch.manual_seed(seed)
+        np.random.seed(seed32)
+        torch.manual_seed(seed32)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+            torch.cuda.manual_seed_all(seed32)
 
     # Significance & allocation using quantized thresholds
     psm = PerceptualSignificanceMetric(method="inverse", use_median=True)
@@ -190,11 +191,11 @@ def allocate_slots_and_amplitudes(
 
     # Compute quantized band thresholds for tie-breaking
     quantized_thr_b = np.median(quantized_thr_bt, axis=1).astype(np.int64)
-    
+
     allocator = AdaptiveBitAllocator(
-        total_bits=target_bits, 
+        total_bits=target_bits,
         allocation_strategy="optimal",
-        seed=seed  # Use anchor seed for deterministic allocation
+        seed=seed32  # Use anchor seed for deterministic allocation
     )
     alloc_b = allocator.allocate_bits(sig_b, quantized_thr_b)["bit_allocation"]  # [BANDS] ints
 
@@ -204,7 +205,7 @@ def allocate_slots_and_amplitudes(
         band_indices_f=band_idx_f,
         bits_per_band=alloc_b,
         per_frame_weight_bt=None,  # default: magnitude-weighted per frame
-        seed=seed,  # Use anchor seed for deterministic slot expansion
+        seed=seed32,  # Use anchor seed for deterministic slot expansion
         quantize_magnitude=True  # Use quantized magnitude for deterministic ranking
     )  # ≈ target_bits slots
 
