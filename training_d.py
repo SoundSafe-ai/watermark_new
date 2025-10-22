@@ -494,6 +494,73 @@ def forward_eul(
     }
 
 
+def plan_eul_no_encode(
+    model: INNWatermarker,
+    x_1s: torch.Tensor,
+    payload_bytes: bytes,
+    epoch_idx: int,
+    total_epochs: int,
+    base_symbol_amp: float = 0.04,
+) -> Dict:
+    """Plan per item without running encode/decode. Returns x_sync, slots, bits, and scales for batched encode/decode."""
+    base_model = getattr(model, "module", model)
+    assert x_1s.shape[0] == 1 and x_1s.shape[1] == 1
+    sync = SyncAnchor(sync_length_ms=SYNC_MS, sr=SR, n_fft=N_FFT, hop=HOP, thr_step=THR_STEP)
+    x_sync = sync.embed_sync_pattern(x_1s.squeeze(0), sync_strength=SYNC_STRENGTH).unsqueeze(0)
+
+    seed32, seed_info = compute_anchor_seed_and_features(base_model, x_sync, thr_step=THR_STEP)
+    if seed32 is None:
+        raise RuntimeError("anchor seed must be non-None")
+
+    X = base_model.stft(x_sync)
+    Fdim, Tdim = X.shape[-2], X.shape[-1]
+    assert Fdim == (N_FFT // 2 + 1)
+    mag = torch.sqrt(torch.clamp(X[:, 0]**2 + X[:, 1]**2, min=1e-12))[0].detach().cpu().numpy()
+
+    code = rs_encode_106_64(payload_bytes)
+    code = interleave_bytes(code, INTERLEAVE_DEPTH)
+    bits = []
+    for b in code:
+        for k in range(8):
+            bits.append((b >> k) & 1)
+    bits_t = torch.tensor(bits, dtype=torch.long, device=x_1s.device).unsqueeze(0)
+    target_bits = min(BITS_PER_EUL, bits_t.shape[1])
+
+    slots_alloc = allocate_and_expand_slots(mag_ft=mag, band_indices_f=seed_info["band_indices_f"], seed32=seed32, target_bits=target_bits, thr_step=THR_STEP)
+    ordered_global = microchunk_window_plan(seed32=seed32, target_bits=target_bits, n_fft=N_FFT, hop=HOP)
+    alloc_set = set((int(f), int(t)) for (f, t) in slots_alloc)
+    final_slots: List[Tuple[int, int]] = []
+    used = set()
+    for (f, t) in ordered_global:
+        if (f, t) in alloc_set and (f, t) not in used and t < Tdim and f < Fdim:
+            final_slots.append((f, t))
+            used.add((f, t))
+        if len(final_slots) >= target_bits:
+            break
+    if len(final_slots) < target_bits:
+        for (f, t) in slots_alloc:
+            if (f, t) not in used and t < Tdim and f < Fdim:
+                final_slots.append((int(f), int(t)))
+                used.add((int(f), int(t)))
+                if len(final_slots) >= target_bits:
+                    break
+
+    if len(final_slots) != target_bits:
+        raise RuntimeError(f"slots_final length {len(final_slots)} != {target_bits}")
+
+    csd_scale = cosine_ramp(CSD_LAST_FRAC, epoch_idx, total_epochs, CSD_START_SCALE, CSD_FINAL_SCALE)
+    return {
+        "x_sync": x_sync,
+        "final_slots": final_slots,
+        "bits_t": bits_t[:, :target_bits],
+        "Fdim": Fdim,
+        "Tdim": Tdim,
+        "seed": seed32,
+        "csd_scale": csd_scale,
+        "payload_bytes": payload_bytes,
+    }
+
+
 @dataclass
 class TrainConfig:
     data_dir: str = os.environ.get("DATA_DIR", "data/train")
@@ -534,7 +601,31 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader,
             pg["lr"] = lr_now
         payload = bytes([i % 256 for i in range(PAYLOAD_BYTES)])
 
-        losses = []
+        # 1) Plan on CPU per item
+        plans: List[Dict] = []
+        for i in range(x.shape[0]):
+            plans.append(plan_eul_no_encode(model, x[i:i+1], payload, epoch_idx, cfg.epochs, base_symbol_amp=cfg.base_symbol_amp))
+
+        # 2) Build batched tensors for encode
+        base_model = getattr(model, "module", model)
+        x_sync_b = torch.cat([p["x_sync"] for p in plans], dim=0).to(x.device)
+        Fdim, Tdim = plans[0]["Fdim"], plans[0]["Tdim"]
+        # Per item M_spec using fp32 island, then stack
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            M_list = []
+            for p in plans:
+                M = bits_to_message_spec(bits=p["bits_t"].to(x.device), slots=p["final_slots"], F=Fdim, T=Tdim, base_amp=cfg.base_symbol_amp * float(p["csd_scale"]))
+                M_list.append(M)
+            M_spec_b = torch.cat(M_list, dim=0)
+            x_wm_b, _ = base_model.encode(x_sync_b.float(), M_spec_b)
+        x_wm_b = torch.tanh(x_wm_b)
+
+        # 3) Decode batched once
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            M_rec_b = base_model.decode(x_wm_b.float())
+
+        # 4) Compute per-item losses and reduce
+        total_losses = []
         msg_vals = []
         perc_vals = []
         stab_vals = []
@@ -544,64 +635,78 @@ def train_one_epoch(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader,
         clamps = []
 
         for i in range(x.shape[0]):
-            x_item = x[i:i+1]
-            if use_amp and scaler is not None:
-                with torch.amp.autocast(device_type="cuda", enabled=True):
-                    out = forward_eul(model, x_item, payload, epoch_idx, cfg.epochs, base_symbol_amp=cfg.base_symbol_amp)
-                    frac = float(epoch_idx - 1) / max(1, cfg.epochs - 1)
-                    if frac < STAB_RAMP_START_FRAC:
-                        w_stab = STAB_W_START
-                    elif frac >= STAB_RAMP_END_FRAC:
-                        w_stab = STAB_W_FINAL
-                    else:
-                        p = (frac - STAB_RAMP_START_FRAC) / max(1e-9, STAB_RAMP_END_FRAC - STAB_RAMP_START_FRAC)
-                        w_stab = STAB_W_START + p * (STAB_W_FINAL - STAB_W_START)
-                    total = 10.0 * out["msg_loss"] + 1.0 * out["perc_loss"] + 1.0 * out["inv_loss"] + float(w_stab) * out["stab_loss"]
+            p = plans[i]
+            slots = p["final_slots"]
+            S = p["bits_t"].shape[1]
+            logits = []
+            targets = []
+            for s in range(S):
+                f_bin, t_idx = slots[s]
+                logits.append(M_rec_b[i, 0, f_bin, t_idx])
+                targets.append(1.0 if int(p["bits_t"][0, s].item()) == 1 else -1.0)
+            logits_t = torch.stack(logits, dim=0)
+            targets_t = torch.tensor(targets, dtype=torch.float32, device=logits_t.device)
+            msg_loss = F.softplus(-logits_t * targets_t).mean()
+
+            # Byte metric (not in loss)
+            rec_bits = message_spec_to_bits(M_rec_b[i:i+1], slots)
+            rec_bytes = _bits_to_bytes_lsb_first(rec_bits[0].tolist())
+            deintl = deinterleave_bytes(rec_bytes, INTERLEAVE_DEPTH)
+            dec_raw = rs_decode_106_64(deintl)
+            Lb = min(len(dec_raw), len(p["payload_bytes"]))
+            byte_acc = float(sum(1 for j in range(Lb) if dec_raw[j] == p["payload_bytes"][j]) / max(1, Lb))
+            payload_ok = 1.0 if (len(dec_raw) >= len(p["payload_bytes"]) and dec_raw[:len(p["payload_bytes"])] == p["payload_bytes"]) else 0.0
+
+            # Stability and invertibility per item (cheap)
+            stab = stability_regularizer(base_model, p["x_sync"].detach(), x_wm_b[i:i+1].detach(), thr_step=THR_STEP)
+            with torch.no_grad():
+                Xref = base_model.stft(p["x_sync"]) ; xrt = base_model.istft(Xref, base_model.stft.get_last_params())
+            inv = F.l1_loss(xrt, p["x_sync"])
+
+            # Perceptual per item
+            perc = CombinedPerceptualLoss(mfcc=MFCCCosineLoss(sample_rate=SR))(p["x_sync"].float(), x_wm_b[i:i+1].float())
+            perc_total = perc["total_perceptual_loss"]
+
+            frac = float(epoch_idx - 1) / max(1, cfg.epochs - 1)
+            if frac < STAB_RAMP_START_FRAC:
+                w_stab = STAB_W_START
+            elif frac >= STAB_RAMP_END_FRAC:
+                w_stab = STAB_W_FINAL
             else:
-                out = forward_eul(model, x_item, payload, epoch_idx, cfg.epochs, base_symbol_amp=cfg.base_symbol_amp)
-                frac = float(epoch_idx - 1) / max(1, cfg.epochs - 1)
-                if frac < STAB_RAMP_START_FRAC:
-                    w_stab = STAB_W_START
-                elif frac >= STAB_RAMP_END_FRAC:
-                    w_stab = STAB_W_FINAL
-                else:
-                    p = (frac - STAB_RAMP_START_FRAC) / max(1e-9, STAB_RAMP_END_FRAC - STAB_RAMP_START_FRAC)
-                    w_stab = STAB_W_START + p * (STAB_W_FINAL - STAB_W_START)
-                total = 10.0 * out["msg_loss"] + 1.0 * out["perc_loss"] + 1.0 * out["inv_loss"] + float(w_stab) * out["stab_loss"]
+                pr = (frac - STAB_RAMP_START_FRAC) / max(1e-9, STAB_RAMP_END_FRAC - STAB_RAMP_START_FRAC)
+                w_stab = STAB_W_START + pr * (STAB_W_FINAL - STAB_W_START)
+            total = 10.0 * msg_loss + 1.0 * perc_total + 1.0 * inv + float(w_stab) * stab
 
-            if torch.isfinite(total):
-                if use_amp and scaler is not None:
-                    scaler.scale(total).backward()
-                else:
-                    total.backward()
-                losses.append(total.detach())
-                msg_vals.append(out["msg_loss"].detach())
-                perc_vals.append(out["perc_loss"].detach())
-                stab_vals.append(out["stab_loss"].detach())
-                inv_vals.append(out["inv_loss"].detach())
-                byte_accs.append(out["byte_acc"].detach())
-                payload_oks.append(out["payload_ok"].detach())
-                clamps.append(out["clamp_pct"].detach())
+            total_losses.append(total)
+            msg_vals.append(msg_loss.detach())
+            perc_vals.append(perc_total.detach())
+            stab_vals.append(stab.detach())
+            inv_vals.append(inv.detach())
+            byte_accs.append(torch.tensor(byte_acc, device=x.device))
+            payload_oks.append(torch.tensor(payload_ok, device=x.device))
+            clamp_pct = float(((x_wm_b[i:i+1] <= -0.999).float().mean() + (x_wm_b[i:i+1] >= 0.999).float().mean()) / 2.0)
+            clamps.append(torch.tensor(clamp_pct, device=x.device))
 
+        # Backward on mean loss
+        loss_mean = torch.stack(total_losses).mean()
         if use_amp and scaler is not None:
+            scaler.scale(loss_mean).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
             scaler.step(optimizer); scaler.update()
         else:
+            loss_mean.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
             optimizer.step()
 
-        if losses:
-            L = torch.stack(losses).mean().item()
-            M = torch.stack(msg_vals).mean().item()
-            P = torch.stack(perc_vals).mean().item()
-            S = torch.stack(stab_vals).mean().item()
-            I = torch.stack(inv_vals).mean().item()
-            BA = torch.stack(byte_accs).mean().item()
-            PO = torch.stack(payload_oks).mean().item()
-            CP = torch.stack(clamps).mean().item()
-        else:
-            L = M = P = S = I = BA = PO = CP = 0.0
+        L = loss_mean.item()
+        M = torch.stack(msg_vals).mean().item()
+        P = torch.stack(perc_vals).mean().item()
+        S = torch.stack(stab_vals).mean().item()
+        I = torch.stack(inv_vals).mean().item()
+        BA = torch.stack(byte_accs).mean().item()
+        PO = torch.stack(payload_oks).mean().item()
+        CP = torch.stack(clamps).mean().item()
 
         running["loss"] += L * x.shape[0]
         running["msg"] += M * x.shape[0]
@@ -638,26 +743,59 @@ def validate(model: INNWatermarker, cfg: TrainConfig, loader: DataLoader, epoch_
         for batch in loader:
             x = batch.to(cfg.device, non_blocking=True)
             payload = bytes([i % 256 for i in range(PAYLOAD_BYTES)])
-            losses = []
-            msg_vals = []
-            perc_vals = []
-            stab_vals = []
-            inv_vals = []
-            byte_accs = []
-            payload_oks = []
+            # Plan per item then batch decode/encode
+            plans: List[Dict] = []
             for i in range(x.shape[0]):
-                out = forward_eul(model, x[i:i+1], payload, epoch_idx, cfg.epochs, base_symbol_amp=cfg.base_symbol_amp)
+                plans.append(plan_eul_no_encode(model, x[i:i+1], payload, epoch_idx, cfg.epochs, base_symbol_amp=cfg.base_symbol_amp))
+            base_model = getattr(model, "module", model)
+            x_sync_b = torch.cat([p["x_sync"] for p in plans], dim=0).to(x.device)
+            Fdim, Tdim = plans[0]["Fdim"], plans[0]["Tdim"]
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                M_list = []
+                for p in plans:
+                    M = bits_to_message_spec(bits=p["bits_t"].to(x.device), slots=p["final_slots"], F=Fdim, T=Tdim, base_amp=cfg.base_symbol_amp * float(p["csd_scale"]))
+                    M_list.append(M)
+                M_spec_b = torch.cat(M_list, dim=0)
+                x_wm_b, _ = base_model.encode(x_sync_b.float(), M_spec_b)
+            x_wm_b = torch.tanh(x_wm_b)
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                M_rec_b = base_model.decode(x_wm_b.float())
+
+            losses = [] ; msg_vals = [] ; perc_vals = [] ; stab_vals = [] ; inv_vals = [] ; byte_accs = [] ; payload_oks = []
+            for i in range(x.shape[0]):
+                p = plans[i]
+                slots = p["final_slots"] ; S = p["bits_t"].shape[1]
+                logits = [] ; targets = []
+                for s in range(S):
+                    f_bin, t_idx = slots[s]
+                    logits.append(M_rec_b[i, 0, f_bin, t_idx])
+                    targets.append(1.0 if int(p["bits_t"][0, s].item()) == 1 else -1.0)
+                logits_t = torch.stack(logits, dim=0)
+                targets_t = torch.tensor(targets, dtype=torch.float32, device=logits_t.device)
+                msg_loss = F.softplus(-logits_t * targets_t).mean()
+                rec_bits = message_spec_to_bits(M_rec_b[i:i+1], slots)
+                rec_bytes = _bits_to_bytes_lsb_first(rec_bits[0].tolist())
+                deintl = deinterleave_bytes(rec_bytes, INTERLEAVE_DEPTH)
+                dec_raw = rs_decode_106_64(deintl)
+                Lb = min(len(dec_raw), len(p["payload_bytes"]))
+                byte_acc = float(sum(1 for j in range(Lb) if dec_raw[j] == p["payload_bytes"][j]) / max(1, Lb))
+                payload_ok = 1.0 if (len(dec_raw) >= len(p["payload_bytes"]) and dec_raw[:len(p["payload_bytes"])] == p["payload_bytes"]) else 0.0
+                stab = stability_regularizer(base_model, p["x_sync"].detach(), x_wm_b[i:i+1].detach(), thr_step=THR_STEP)
+                with torch.no_grad():
+                    Xref = base_model.stft(p["x_sync"]) ; xrt = base_model.istft(Xref, base_model.stft.get_last_params())
+                inv = F.l1_loss(xrt, p["x_sync"])
+                perc = CombinedPerceptualLoss(mfcc=MFCCCosineLoss(sample_rate=SR))(p["x_sync"].float(), x_wm_b[i:i+1].float())
+                perc_total = perc["total_perceptual_loss"]
                 frac = float(epoch_idx - 1) / max(1, cfg.epochs - 1)
-                if frac < STAB_RAMP_START_FRAC:
-                    w_stab = STAB_W_START
-                elif frac >= STAB_RAMP_END_FRAC:
-                    w_stab = STAB_W_FINAL
+                if frac < STAB_RAMP_START_FRAC: w_stab = STAB_W_START
+                elif frac >= STAB_RAMP_END_FRAC: w_stab = STAB_W_FINAL
                 else:
-                    p = (frac - STAB_RAMP_START_FRAC) / max(1e-9, STAB_RAMP_END_FRAC - STAB_RAMP_START_FRAC)
-                    w_stab = STAB_W_START + p * (STAB_W_FINAL - STAB_W_START)
-                total = 10.0 * out["msg_loss"] + 1.0 * out["perc_loss"] + 1.0 * out["inv_loss"] + float(w_stab) * out["stab_loss"]
+                    pr = (frac - STAB_RAMP_START_FRAC) / max(1e-9, STAB_RAMP_END_FRAC - STAB_RAMP_START_FRAC)
+                    w_stab = STAB_W_START + pr * (STAB_W_FINAL - STAB_W_START)
+                total = 10.0 * msg_loss + 1.0 * perc_total + 1.0 * inv + float(w_stab) * stab
                 losses.append(total)
-                msg_vals.append(out["msg_loss"]) ; perc_vals.append(out["perc_loss"]) ; stab_vals.append(out["stab_loss"]) ; inv_vals.append(out["inv_loss"]) ; byte_accs.append(out["byte_acc"]) ; payload_oks.append(out["payload_ok"]) 
+                msg_vals.append(msg_loss) ; perc_vals.append(perc_total) ; stab_vals.append(stab) ; inv_vals.append(inv)
+                byte_accs.append(torch.tensor(byte_acc, device=x.device)) ; payload_oks.append(torch.tensor(payload_ok, device=x.device))
             if losses:
                 running["loss"] += float(torch.stack(losses).mean().item()) * x.shape[0]
                 running["msg"] += float(torch.stack(msg_vals).mean().item()) * x.shape[0]
@@ -792,6 +930,11 @@ def evaluate_batteries(model: INNWatermarker, cfg: TrainConfig, loader: DataLoad
 
 
 def main(cfg: TrainConfig) -> None:
+    # Backend perf knobs
+    try:
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
     os.makedirs(cfg.save_dir, exist_ok=True)
 
     is_distributed = False
@@ -840,6 +983,11 @@ def main(cfg: TrainConfig) -> None:
     )
 
     model = build_model().to(cfg.device)
+    # Torch compile (PyTorch 2.x) before DDP for best performance
+    try:
+        model = torch.compile(model, mode="max-autotune")
+    except Exception:
+        pass
     apply_spectral_normalization(model)
     if is_distributed and torch.cuda.is_available():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
