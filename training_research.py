@@ -84,7 +84,7 @@ class TrainConfig:
     use_fixed_payload: bool = True
 
     # EUL/embedding params
-    base_symbol_amp: float = 0.08
+    base_symbol_amp: float = 0.04
     amp_safety: float = 1.0
     sync_strength: float = 0.05
     mapper_seed: int = 42
@@ -410,8 +410,18 @@ def compute_losses_and_metrics(
     # Build coded/interleaved reference for metrics (trainer-side copy matches driver scheme RS(106,64)+interleave)
     from pipeline.ingest_and_chunk import rs_encode_106_64, interleave_bytes, deinterleave_bytes, rs_decode_106_64
     coded_ref = interleave_bytes(rs_encode_106_64(payload_bytes), cfg.interleave_depth)
-    x_wm = eul_driver.encode_eul(base_model, x_sync, payload_bytes)
-    x_wm = torch.nan_to_num(x_wm, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+    # Force writer path to run in fp32 to avoid AMP underflow/quantization of tiny amplitudes
+    with torch.amp.autocast(device_type="cuda", enabled=False):
+        x_wm = eul_driver.encode_eul(base_model, x_sync.float(), payload_bytes)
+    # Soft limiter to avoid hard saturation; still bound to [-1,1]
+    x_wm = torch.tanh(x_wm).clamp(-1.0, 1.0)
+    # Log saturation ratio for monitoring
+    try:
+        sat = float(((x_wm <= -0.999).float().mean() + (x_wm >= 0.999).float().mean()) / 2.0)
+        if sat > 0.001:
+            print(f"[writer] saturation ratio ~{sat*100:.3f}%")
+    except Exception:
+        pass
 
     # Honor decode precision flag (float64 for QA)
     if cfg.decode_precision == "fp64":
@@ -420,7 +430,9 @@ def compute_losses_and_metrics(
     decoded_bytes = eul_driver.decode_eul(base_model, x_wm, expected_bytes=cfg.rs_payload_bytes)
     original_payload_bytes = payload_bytes
     # Also compute coded-domain roundtrip for diagnostic parity
-    rec_bits = base_model.decode(x_wm)  # [1,2,F,T]
+    # Decode logits for supervision in fp32 as well
+    with torch.amp.autocast(device_type="cuda", enabled=False):
+        rec_bits = base_model.decode(x_wm.float())  # [1,2,F,T]
     # Read back bits at the same slots used during encode if available; build differentiable message loss
     slots_used = getattr(eul_driver, "_last_slots", None)
     coded_match_acc = 0.0
@@ -441,6 +453,12 @@ def compute_losses_and_metrics(
         for b in coded_ref:
             for k in range(8):
                 ref_bits.append((b >> k) & 1)
+        # Sanity check: slot/bit alignment
+        if abs(len(slots_used) - len(ref_bits)) > 2:
+            try:
+                print(f"[msg-supervision warn] slots_used={len(slots_used)} vs ref_bits={len(ref_bits)}; slots[:16]={slots_used[:16]} bits[:16]={ref_bits[:16]}")
+            except Exception:
+                pass
         S = min(len(slots_used), len(ref_bits))
         if S > 0:
             logits = []
